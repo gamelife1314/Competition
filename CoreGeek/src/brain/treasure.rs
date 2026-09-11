@@ -1,0 +1,181 @@
+//! Treasure hunt: accumulate folk legends, spend one LLM call to infer the
+//! altar (position / sacrifice items / opening day), buy the items, walk the
+//! pioneer over and `summonTreasure`. Feedback via `lastSummonTreasureResult`
+//! (2 = too early → push the day; 3 = wrong items → re-ask with feedback).
+
+use std::collections::HashSet;
+
+use crate::brain::task::truncate;
+use crate::brain::Plan;
+use crate::model::{chebyshev, Turn, Unit};
+use crate::protocol::{Pos, RoleCommand};
+use crate::state::{BotState, TreasurePhase, TreasurePlan};
+
+const ALL_ITEMS: [&str; 6] =
+    ["AcientTablet", "StarSand", "FlameBreath", "FrostPotion", "ThornAmulet", "IronWhistle"];
+
+/// Consume a fresh `llmResp` addressed to the treasure hunt.
+pub fn on_llm_resp(state: &mut BotState, resp: &str, round_no: i64) {
+    if !matches!(state.treasure.phase, TreasurePhase::AskedLlm { .. }) {
+        return;
+    }
+    match parse_plan(resp, state.current_day) {
+        Some(plan) => {
+            crate::log::event(
+                "treasure_plan",
+                serde_json::json!({"pos": plan.pos, "items": plan.items, "openDay": plan.open_day}),
+            );
+            state.treasure.plan = Some(plan);
+            state.treasure.phase = TreasurePhase::HavePlan;
+        }
+        None => {
+            crate::log::event(
+                "treasure_parse_failed",
+                serde_json::json!({"attempts": state.treasure.ask_attempts, "head": crate::log::brief(resp, 200)}),
+            );
+            state.treasure.ask_attempts = state.treasure.ask_attempts.saturating_add(1);
+            state.treasure.phase = if state.treasure.ask_attempts >= 3 {
+                TreasurePhase::Done
+            } else {
+                TreasurePhase::Idle
+            };
+        }
+    }
+    let _ = round_no;
+}
+
+/// Extract `{"pos":{"x":..,"y":..},"items":[..],"openDay":N}` from free text.
+pub fn parse_plan(resp: &str, current_day: i64) -> Option<TreasurePlan> {
+    let start = resp.find('{')?;
+    let end = resp.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let candidate = &resp[start..=end];
+    let value: serde_json::Value = serde_json::from_str(candidate).ok()?;
+    let pos_value = value.get("pos").or_else(|| value.get("altarPos"))?;
+    let x = pos_value.get("x")?.as_i64()? as i32;
+    let y = pos_value.get("y")?.as_i64()? as i32;
+    if !(0..41).contains(&x) || !(0..32).contains(&y) {
+        return None;
+    }
+    let mut items: Vec<String> = Vec::new();
+    if let Some(list) = value.get("items").and_then(|v| v.as_array()) {
+        for entry in list {
+            if let Some(name) = entry.as_str() {
+                if ALL_ITEMS.contains(&name) && !items.iter().any(|old| old == name) {
+                    items.push(name.to_string());
+                }
+            }
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let open_day = value
+        .get("openDay")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(current_day)
+        .max(current_day);
+    Some(TreasurePlan { pos: Pos { x, y }, items, open_day })
+}
+
+fn build_prompt(state: &BotState, feedback: bool) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("以下是游戏世界中逐日流传的民间传闻，其中隐藏着一个祭坛宝藏的线索。\n");
+    prompt.push_str("请推理出：宝藏祭坛坐标（地图 41x32，原点左下角）、开启所需的献祭物品组合、以及宝藏开启的游戏日。\n");
+    prompt.push_str("可用献祭物品（英文名必须原样使用）：AcientTablet(古符石板), StarSand(星辰之沙), FlameBreath(烈焰之息), FrostPotion(寒霜药剂), ThornAmulet(荆棘护符), IronWhistle(回音铁哨)。\n\n");
+    prompt.push_str("全部传闻：\n");
+    for (day, text) in &state.treasure.legends {
+        prompt.push_str(&format!("DAY{day}: {}\n", truncate(text, 400)));
+    }
+    if feedback {
+        prompt.push_str("\n注意：上次献祭的物品组合被判定错误（结果码3）。请重新审视传闻中关于物品数量与种类的全部细节，给出不同的组合。\n");
+    }
+    prompt.push_str(
+        "\n只输出一个 JSON 对象，不要输出其它内容，格式：\n{\"pos\":{\"x\":20,\"y\":16},\"items\":[\"StarSand\",\"IronWhistle\"],\"openDay\":5}\n",
+    );
+    prompt
+}
+
+/// Pioneer behaviour for the treasure hunt. Returns a movement/action command
+/// or None when the pioneer has nothing treasure-related to do this round.
+pub fn plan_pioneer(
+    turn: &Turn,
+    state: &mut BotState,
+    pioneer: &Unit,
+    claimed: &mut HashSet<Pos>,
+    plan: &mut Plan,
+) -> Option<RoleCommand> {
+    match state.treasure.phase.clone() {
+        TreasurePhase::Done => None,
+        TreasurePhase::Idle => {
+            // Ask the LLM once we have enough legends and spare budget.
+            let enough = state.treasure.legends.len() >= 2;
+            if enough && state.is_prompt_free() && plan.prompt.is_none() {
+                let feedback = state.treasure.wrong_item_rounds > 0;
+                plan.prompt = Some(build_prompt(state, feedback));
+                state.consume_prompt_budget();
+                state.treasure.phase = TreasurePhase::AskedLlm { round: turn.round_no };
+            }
+            None
+        }
+        TreasurePhase::AskedLlm { round } => {
+            // Response lost (LLM error etc.): allow a re-ask later.
+            if turn.round_no.saturating_sub(round) > 4 && state.treasure.ask_attempts < 3 {
+                state.treasure.phase = TreasurePhase::Idle;
+            }
+            None
+        }
+        TreasurePhase::HavePlan => {
+            let treasure_plan = state.treasure.plan.clone()?;
+            // 1. Collect the sacrifice items.
+            let missing: Vec<String> = treasure_plan
+                .items
+                .iter()
+                .filter(|item| pioneer.count_item(item) == 0)
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                let shops = turn.weapon_shops();
+                let stand = shops
+                    .iter()
+                    .flat_map(|shop| crate::model::neighbours(*shop))
+                    .filter(|pos| turn.is_land(*pos))
+                    .collect::<Vec<_>>();
+                if stand.iter().any(|pos| *pos == pioneer.pos) {
+                    // Buying one kind per round; gold is team-shared.
+                    let first = &missing[0];
+                    let price = turn.weapon_shop.get(first).copied().unwrap_or(15);
+                    if turn.gold >= price {
+                        return Some(RoleCommand::buy(first, 1));
+                    }
+                    return None; // wait for gold
+                }
+                return crate::brain::walk_toward(turn, pioneer, &stand, claimed);
+            }
+            // 2. Head to the altar; summon when open day arrived.
+            let altar = treasure_plan.pos;
+            let stands = crate::model::neighbours(altar)
+                .iter()
+                .copied()
+                .filter(|pos| turn.is_land(*pos))
+                .collect::<Vec<_>>();
+            let adjacent = chebyshev(pioneer.pos, altar) <= 1;
+            if turn.day >= treasure_plan.open_day {
+                if adjacent {
+                    state.treasure.summon_attempts = state.treasure.summon_attempts.saturating_add(1);
+                    let items: Vec<String> = treasure_plan.items.clone();
+                    return Some(RoleCommand::summon_treasure(altar, items));
+                }
+                return crate::brain::walk_toward(turn, pioneer, &stands, claimed);
+            }
+            // Early: wait nearby (within 3 cells) so we can act on the day.
+            if chebyshev(pioneer.pos, altar) > 3 {
+                return crate::brain::walk_toward(turn, pioneer, &stands, claimed);
+            }
+            None
+        }
+    }
+}
+

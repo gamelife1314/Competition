@@ -1,0 +1,23 @@
+[package]
+name = "coregeek"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.72"
+description = "Future War competition bot (Rust 1.72)"
+
+# Exact pins: cargo 1.72 has no MSRV-aware resolver, and modern releases of
+# these crates (or their transitive deps, e.g. hashbrown 0.17 / edition 2024)
+# no longer compile on Rust 1.72. Keep the lock file committed.
+[dependencies]
+serde = { version = "=1.0.193", features = ["derive"] }
+serde_json = "=1.0.108"
+tokio = { version = "=1.35.1", features = ["rt", "net", "macros"] }
+hyper = { version = "=1.1.0", features = ["server", "http1"] }
+hyper-util = { version = "=0.1.3", features = ["tokio"] }
+http-body-util = "=0.1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+# NOTE: never set panic="abort" here — the judger does NOT restart a crashed
+# process; unwinding keeps panics confined to a single connection task.
