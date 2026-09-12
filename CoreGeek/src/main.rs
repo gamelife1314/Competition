@@ -39,6 +39,9 @@ fn main() {
             "rustc": option_env!("RUSTC_VERSION").unwrap_or("unknown"),
             "profile": "release",
             "edition": "2021",
+            "opt_level": 3,
+            "lto": true,
+            "codegen_units": 1,
         }),
     );
     let local_set = tokio::task::LocalSet::new();
