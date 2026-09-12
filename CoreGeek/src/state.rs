@@ -127,6 +127,14 @@ pub struct BotState {
     pub seen_cmd_result: String,
     /// bombs/dizzy bought tracker can be derived from backpacks; kept simple
     pub harass_done_today: bool,
+
+    /// Stable controller↔tower pairings, computed once per night and reused
+    /// until a tower is built/destroyed or a new night starts. Without this,
+    /// greedy re-pairing every round causes controllers to oscillate and
+    /// weapons go unoperated.
+    pub night_pairs: Vec<(i64, i64)>,
+    pub night_pair_day: i64,
+    pub night_pair_tower_ids: Vec<i64>,
 }
 
 impl BotState {

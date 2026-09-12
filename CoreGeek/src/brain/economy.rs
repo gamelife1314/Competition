@@ -39,14 +39,22 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     let gold = (turn.gold - reserve).max(0);
 
     // Weapon upgrade vouchers: biggest defensive win per gold.
-    for tower in turn.towers() {
-        let (voucher, ok) = match tower.level {
-            1 => ("WeaponUpgradeVoucher1", true),
-            2 => ("WeaponUpgradeVoucher2", true),
-            _ => ("", false),
-        };
-        if ok && stock_of(turn, voucher) == 0 {
-            needs.push(Need { name: voucher.into(), num: 1, priority: 1 });
+    // Buy enough vouchers for ALL towers that need upgrading, not just one.
+    for voucher in ["WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2"] {
+        let want_level = if voucher.ends_with('1') { 1 } else { 2 };
+        let need_count = turn
+            .towers()
+            .iter()
+            .filter(|tower| tower.level == want_level)
+            .count() as i64;
+        let have_count = stock_of(turn, voucher);
+        let deficit = (need_count - have_count).max(0);
+        if deficit > 0 {
+            needs.push(Need {
+                name: voucher.into(),
+                num: deficit,
+                priority: 1,
+            });
         }
     }
     // Station upgrade: survival score.
@@ -104,9 +112,10 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         needs.push(Need { name: "BossRobotSummonOrder".into(), num: 1, priority: 9 });
     }
 
-    // Gold filter, cheapest-first within priority is unnecessary: keep order,
-    // accumulate cost.
-    let mut remaining = gold;
+    // Gold filter. Two budgets: upgrade vouchers are defensive infrastructure
+    // and may spend the full gold hoard; everything else (consumables) must
+    // leave `reserve` untouched so the tower build-out never stalls.
+    let mut remaining = turn.gold;
     let mut out = Vec::new();
     needs.sort_by_key(|need| need.priority);
     for need in needs {
@@ -114,13 +123,23 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             continue;
         }
         let price = turn.weapon_shop.get(&need.name).copied().unwrap_or(i64::MAX);
+        if price == i64::MAX {
+            continue;
+        }
         let cost = price.saturating_mul(need.num);
-        if cost <= remaining && price != i64::MAX {
+        let floor = if is_upgrade(&need.name) { 0 } else { reserve };
+        if cost <= remaining && remaining.saturating_sub(cost) >= floor {
             remaining -= cost;
             out.push(need);
         }
     }
     out
+}
+
+/// Upgrade vouchers (weapon/station/wall) are infrastructure, not
+/// consumables — the build reserve must not block them.
+fn is_upgrade(name: &str) -> bool {
+    name.contains("Voucher")
 }
 
 /// Find a building the voucher in `role`'s backpack can upgrade.

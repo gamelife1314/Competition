@@ -26,20 +26,28 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let build_reserve = tower_gaps.len() as i64 * WEAPON_BUILD_COST;
     let shopping = economy::shopping_list(turn, state, build_reserve);
 
-    // Buyer assignment: the pioneer only when it will not be consumed by a
-    // task (active task, or a task point ready to accept), else a worker.
-    let task_wants_pioneer = state.task.active
-        || turn.player_tasks.iter().any(|task| task.is_valid && task.cooldown_rounds == 0);
+    // Buyer assignment: a dedicated WORKER so voucher purchases are never
+    // preempted by a task accept or the treasure hunt. The pioneer stays free
+    // for tasks/treasure.
     let workers = turn.workers();
     let buyer_id: Option<i64> = if shopping.is_empty() {
         None
-    } else if !task_wants_pioneer && turn.pioneer().is_some() {
-        turn.pioneer().map(|unit| unit.id)
     } else {
         workers.last().map(|unit| unit.id)
     };
+    if !shopping.is_empty() {
+        crate::log::event(
+            "shopping",
+            serde_json::json!({
+                "buyer": buyer_id,
+                "gold": turn.gold,
+                "reserve": build_reserve,
+                "needs": shopping.iter().map(|need| need.name.as_str()).collect::<Vec<_>>(),
+            }),
+        );
+    }
 
-    let pairs = night::pairing(turn, state);
+    let pairs = night::stable_pairs(turn, state);
 
     for worker in &workers {
         worker_day(
@@ -58,16 +66,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     }
 
     if let Some(pioneer) = turn.pioneer() {
-        pioneer_day(
-            turn,
-            state,
-            pioneer,
-            &shopping,
-            buyer_id,
-            &pairs,
-            &mut claimed,
-            &mut plan,
-        );
+        pioneer_day(turn, state, pioneer, &pairs, &mut claimed, &mut plan);
     }
 
     plan
@@ -94,7 +93,7 @@ fn worker_day(
     }
     // 2. Shopping mission.
     if buyer_id == Some(role.id) && !shopping.is_empty() {
-        if let Some(cmd) = buyer_flow(turn, state, role, shopping, claimed) {
+        if let Some(cmd) = buyer_flow(turn, role, shopping, claimed) {
             plan.push(role.id, cmd);
             return;
         }
@@ -148,6 +147,12 @@ fn worker_day(
             }
         }
     }
+    // 5b. Burn a carried robot-summon order (enemy harassment) once build
+    //     duties are done — buying and building are never delayed by it.
+    if let Some(cmd) = burn_summon_order(state, role) {
+        plan.push(role.id, cmd);
+        return;
+    }
     // 6. Late day: pre-position at the assigned tower.
     if turn.in_day_round >= PREPOSITION_ROUND {
         if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == role.id).map(|(_, tower)| *tower) {
@@ -170,8 +175,6 @@ fn pioneer_day(
     turn: &Turn,
     state: &mut BotState,
     pioneer: &Unit,
-    shopping: &[economy::Need],
-    buyer_id: Option<i64>,
     pairs: &[(i64, i64)],
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
@@ -194,24 +197,17 @@ fn pioneer_day(
         plan.push(pioneer.id, cmd);
         return;
     }
-    // 4. Shopping mission.
-    if buyer_id == Some(pioneer.id) && !shopping.is_empty() {
-        if let Some(cmd) = buyer_flow(turn, state, pioneer, shopping, claimed) {
-            plan.push(pioneer.id, cmd);
-            return;
-        }
-    }
-    // 5. Vouchers in the backpack.
+    // 4. Vouchers in the backpack.
     if let Some(cmd) = voucher_flow(turn, pioneer, claimed) {
         plan.push(pioneer.id, cmd);
         return;
     }
-    // 6. Treasure hunt.
+    // 5. Treasure hunt.
     if let Some(cmd) = treasure::plan_pioneer(turn, state, pioneer, claimed, plan) {
         plan.push(pioneer.id, cmd);
         return;
     }
-    // 7. Late day: pre-position at the assigned tower.
+    // 6. Late day: pre-position at the assigned tower.
     if turn.in_day_round >= PREPOSITION_ROUND {
         if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == pioneer.id).map(|(_, tower)| *tower) {
             if let Some(tower) = turn.role_by_id(tower_id) {
@@ -225,7 +221,7 @@ fn pioneer_day(
             }
         }
     }
-    // 8. Loiter next to a task point so we catch refreshes immediately.
+    // 7. Loiter next to a task point so we catch refreshes immediately.
     loiter_at_task_point(turn, pioneer, claimed, plan);
 }
 
@@ -290,15 +286,41 @@ fn use_medicine(role: &Unit) -> Option<RoleCommand> {
     None
 }
 
-/// Buy the first needed item: walk to the weapon shop, then buy. Also burns
-/// robot summon orders we already carry (harassment).
+/// Buy the first needed item: walk to the weapon shop, then buy. Buying is
+/// the buyer's sole job — a carried summon order must never preempt a voucher,
+/// upgrade or repair purchase.
 fn buyer_flow(
     turn: &Turn,
-    state: &mut BotState,
     role: &Unit,
     shopping: &[economy::Need],
     claimed: &mut HashSet<Pos>,
 ) -> Option<RoleCommand> {
+    let need = shopping.first()?;
+    let mut stands: Vec<Pos> = Vec::new();
+    for shop in turn.weapon_shops() {
+        stands.extend(stand_cells(turn, shop));
+    }
+    if stands.is_empty() {
+        return None;
+    }
+    if stands.iter().any(|pos| *pos == role.pos) {
+        let price = turn.weapon_shop.get(&need.name).copied().unwrap_or(i64::MAX);
+        if price.saturating_mul(need.num) <= turn.gold {
+            crate::log::event(
+                "buy",
+                serde_json::json!({"role": role.id, "name": need.name, "num": need.num, "gold": turn.gold}),
+            );
+            return Some(RoleCommand::buy(&need.name, need.num));
+        }
+        return None; // wait for gold
+    }
+    walk_toward(turn, role, &stands, claimed)
+}
+
+/// Use a carried robot-summon order against the enemy (harassment), one per
+/// round, capped by the daily summon budget. Kept out of `buyer_flow` so a
+/// voucher purchase is never delayed by it.
+fn burn_summon_order(state: &mut BotState, role: &Unit) -> Option<RoleCommand> {
     const ORDERS: [&str; 4] = [
         "BossRobotSummonOrder",
         "LargeRobotSummonOrder",
@@ -312,22 +334,7 @@ fn buyer_flow(
             return Some(RoleCommand::use_item(order));
         }
     }
-    let need = shopping.first()?;
-    let mut stands: Vec<Pos> = Vec::new();
-    for shop in turn.weapon_shops() {
-        stands.extend(stand_cells(turn, shop));
-    }
-    if stands.is_empty() {
-        return None;
-    }
-    if stands.iter().any(|pos| *pos == role.pos) {
-        let price = turn.weapon_shop.get(&need.name).copied().unwrap_or(i64::MAX);
-        if price.saturating_mul(need.num) <= turn.gold {
-            return Some(RoleCommand::buy(&need.name, need.num));
-        }
-        return None;
-    }
-    walk_toward(turn, role, &stands, claimed)
+    None
 }
 
 /// Walk to a building matching a carried voucher and apply it.

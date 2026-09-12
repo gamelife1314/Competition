@@ -229,3 +229,178 @@ fn partial_requests_never_crash() {
         assert_eq!(value.get("executeCmd").and_then(Value::as_str), Some(""));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Problem 1: night weapons must be operated, controllers must walk to them
+// ---------------------------------------------------------------------------
+
+fn worker(id: i64, x: i32, y: i32) -> Value {
+    json!({
+        "id": id, "pos": {"x": x, "y": y}, "roleType": "worker",
+        "health": 220, "attackPower": 0, "attackRange": 0,
+        "backPackCapability": 100, "backpack": []
+    })
+}
+
+fn zone(x: i32, y: i32, kind: &str) -> Value {
+    json!({"pos": {"x": x, "y": y}, "neutralType": kind})
+}
+
+fn world_zones(our_roles: Vec<Value>, robots: Vec<Value>, zones: Vec<Value>) -> Value {
+    json!({
+        "roundNo": 85, // night
+        "mapInfo": {"width": 41, "height": 32, "zones": zones},
+        "teamOur": {
+            "type": "challenger", "goldNum": 0, "totalScore": 0,
+            "playerTasks": [], "roles": our_roles
+        },
+        "teamEnemy": {"roles": []},
+        "robot": {"roles": robots},
+    })
+}
+
+#[test]
+fn every_tower_gets_an_operator_at_night() {
+    let turn = turn_from(world(
+        vec![
+            gatling(10020, 10, 10, 1),
+            gatling(10021, 12, 10, 1),
+            worker(10010, 11, 10), // adjacent to 10020
+            worker(10011, 13, 10), // adjacent to 10021
+            worker(10012, 10, 8),  // spare
+        ],
+        vec![robot(30001, 11, 9, 40, "challenger")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    for tower_id in [10020i64, 10021] {
+        let cmd = plan.commands.get(&tower_id).expect("tower fires");
+        assert_eq!(cmd.action, "attack", "tower {tower_id} is operated");
+    }
+}
+
+#[test]
+fn paired_controller_walks_to_weapon_not_economy() {
+    // One tower, one far worker, with mines right next to the worker: the
+    // worker must walk toward its tower, never collect the mine.
+    let turn = turn_from(world_zones(
+        vec![gatling(10020, 5, 5, 1), worker(10010, 20, 20)],
+        vec![],
+        vec![zone(20, 21, "stone"), zone(21, 20, "iron")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("worker acts");
+    assert_eq!(cmd.action, "move", "paired controller walks to its tower, not the mine");
+}
+
+#[test]
+fn stable_pairs_do_not_oscillate_between_rounds() {
+    let turn = turn_from(world(
+        vec![
+            gatling(10020, 5, 5, 1),
+            worker(10010, 4, 5),
+            worker(10011, 10, 10),
+        ],
+        vec![],
+    ));
+    let mut state = BotState::default();
+    let first = coregeek::brain::night::stable_pairs(&turn, &mut state);
+    let second = coregeek::brain::night::stable_pairs(&turn, &mut state);
+    assert_eq!(first, second, "pairings stay fixed within a night");
+}
+
+// ---------------------------------------------------------------------------
+// Problem 2: weapon upgrades are bought and applied with priority
+// ---------------------------------------------------------------------------
+
+fn station(x: i32, y: i32, level: i64) -> Value {
+    json!({
+        "id": 10000, "pos": {"x": x, "y": y}, "roleType": "station",
+        "health": 10000, "attackPower": 0, "attackRange": 0,
+        "level": level, "backPackCapability": 0, "backpack": []
+    })
+}
+
+fn day_world(our_roles: Vec<Value>, gold: i64, shop_items: Vec<Value>, zones: Vec<Value>) -> Value {
+    json!({
+        "roundNo": 5, // day
+        "mapInfo": {"width": 41, "height": 32, "zones": zones},
+        "teamOur": {
+            "type": "challenger", "goldNum": gold, "totalScore": 0,
+            "playerTasks": [], "roles": our_roles
+        },
+        "teamEnemy": {"roles": []},
+        "robot": {"roles": []},
+        "vendorShopList": [],
+        "weaponShopList": shop_items,
+    })
+}
+
+#[test]
+fn shopping_list_prioritizes_weapon_upgrade_voucher() {
+    let turn = turn_from(day_world(
+        vec![station(10, 20, 1), gatling(10020, 10, 10, 1), worker(10010, 5, 5)],
+        75,
+        vec![
+            json!({"name": "WeaponUpgradeVoucher1", "price": 50}),
+            json!({"name": "StationUpgradeVoucher1", "price": 50}),
+        ],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let state = BotState::default();
+    let gaps = coregeek::brain::day::tower_gaps(&turn, &state);
+    let reserve = gaps.len() as i64 * coregeek::model::WEAPON_BUILD_COST;
+    let list = coregeek::brain::economy::shopping_list(&turn, &state, reserve);
+    assert_eq!(
+        list.first().map(|need| need.name.as_str()),
+        Some("WeaponUpgradeVoucher1"),
+        "weapon upgrade outranks the station voucher and consumes the reserve"
+    );
+}
+
+#[test]
+fn buyer_worker_buys_voucher_at_shop() {
+    let turn = turn_from(day_world(
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker(10010, 1, 0), // adjacent to the shop at (0,0)
+        ],
+        75,
+        vec![json!({"name": "WeaponUpgradeVoucher1", "price": 50})],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("dedicated buyer acts");
+    assert_eq!(cmd.action, "buy");
+    assert_eq!(cmd.name.as_deref(), Some("WeaponUpgradeVoucher1"));
+}
+
+#[test]
+fn carried_voucher_upgrades_l1_tower() {
+    let turn = turn_from(day_world(
+        vec![
+            gatling(10020, 10, 10, 1),
+            json!({
+                "id": 10010, "pos": {"x": 9, "y": 10}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100, "backpack": ["WeaponUpgradeVoucher1"]
+            }),
+        ],
+        0,
+        vec![],
+        vec![],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("worker upgrades");
+    assert_eq!(cmd.action, "use");
+    assert_eq!(cmd.name.as_deref(), Some("WeaponUpgradeVoucher1"));
+    assert_eq!(
+        cmd.targetPos.as_ref().and_then(|list| list.first()).copied(),
+        Some(Pos { x: 10, y: 10 }),
+        "voucher applied to the L1 tower"
+    );
+}

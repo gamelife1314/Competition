@@ -14,9 +14,11 @@ const MINE_SAFETY_RADIUS: i32 = 6;
 
 /// Greedy pairing: every living tower gets the closest free controller.
 /// A pioneer busy with a self-evolution task must stay at the task point and
-/// is therefore excluded.
+/// is therefore excluded. Towers under the heaviest pressure pair first so a
+/// long walk never starves the position that matters most.
 pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
-    let towers = turn.towers();
+    let mut towers = turn.towers();
+    towers.sort_by_cached_key(|tower| std::cmp::Reverse(combat::threat_load(turn, tower)));
     let mut controllers: Vec<&Unit> = turn
         .controllable()
         .into_iter()
@@ -42,11 +44,58 @@ pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
     pairs
 }
 
+/// Stable controller↔tower pairings: computed once per night (or when
+/// towers change), reused across rounds so controllers actually reach
+/// their assigned weapon instead of oscillating between targets.
+pub fn stable_pairs(turn: &Turn, state: &mut BotState) -> Vec<(i64, i64)> {
+    let tower_ids: Vec<i64> = turn
+        .towers()
+        .iter()
+        .filter(|tower| tower.alive())
+        .map(|tower| tower.id)
+        .collect();
+
+    // Recompute if: first night, day changed, or tower set changed.
+    let needs_recompute = state.night_pairs.is_empty()
+        || state.night_pair_day != turn.day
+        || state.night_pair_tower_ids != tower_ids;
+
+    if needs_recompute {
+        let towers = turn.towers();
+        let mut controllers: Vec<&Unit> = turn
+            .controllable()
+            .into_iter()
+            .filter(|role| !(state.task.active && role.kind == UnitKind::Pioneer))
+            .collect();
+        let mut pairs: Vec<(i64, i64)> = Vec::new();
+        for tower in towers {
+            if controllers.is_empty() || !tower.alive() {
+                break;
+            }
+            let mut best_index = 0usize;
+            let mut best_dist = i32::MAX;
+            for (index, role) in controllers.iter().enumerate() {
+                let dist = chebyshev(role.pos, tower.pos);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_index = index;
+                }
+            }
+            let role = controllers.remove(best_index);
+            pairs.push((role.id, tower.id));
+        }
+        state.night_pairs = pairs;
+        state.night_pair_day = turn.day;
+        state.night_pair_tower_ids = tower_ids;
+    }
+    state.night_pairs.clone()
+}
+
 pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let mut plan = Plan::default();
     let mut claimed: HashSet<Pos> = HashSet::new();
 
-    let mut pairs = pairing(turn, state);
+    let mut pairs = stable_pairs(turn, state);
     // Fire the towers under the heaviest pressure first: they get first pick
     // of the shared per-round damage simulation (avoids cross-tower overkill).
     pairs.sort_by_cached_key(|(_controller_id, tower_id)| {
@@ -60,12 +109,14 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let mut sim = combat::init_sim(turn);
 
     for (controller_id, tower_id) in &pairs {
-        paired.insert(*controller_id);
         let (Some(tower), Some(controller)) = (turn.role_by_id(*tower_id), turn.role_by_id(*controller_id))
         else { continue };
         if !tower.alive() || !controller.alive() {
             continue;
         }
+        // Claim only a valid, able controller — an unusable one falls through
+        // to spare duties instead of idling next to a dead tower all night.
+        paired.insert(*controller_id);
         if chebyshev(controller.pos, tower.pos) <= 1 {
             // Man the tower: attack commands are keyed by the TOWER's id.
             if tower.cooldown == 0 {
@@ -76,8 +127,17 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             // The controller holds position (no command) to stay adjacent.
         } else {
             let stands = stand_cells(turn, tower.pos);
+            // Try walking while respecting claimed cells (soft preference).
             if let Some(cmd) = walk_toward(turn, controller, &stands, &mut claimed) {
                 plan.push(controller.id, cmd);
+            } else {
+                // Fallback: ignore claimed cells, take any reachable step.
+                // This prevents controllers getting stuck when a teammate's
+                // committed step blocks the only available path.
+                let mut ignored = HashSet::new();
+                if let Some(cmd) = walk_toward(turn, controller, &stands, &mut ignored) {
+                    plan.push(controller.id, cmd);
+                }
             }
         }
     }
