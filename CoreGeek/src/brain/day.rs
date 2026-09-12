@@ -91,7 +91,7 @@ fn worker_day(
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
 ) {
-    // 1. Self-heal.
+    // 1. Self-heal — a dead worker builds nothing, so this outranks all else.
     if let Some(cmd) = use_medicine(role) {
         plan.push(role.id, cmd);
         return;
@@ -103,49 +103,10 @@ fn worker_day(
         plan.push(role.id, cmd);
         return;
     }
-    // 3. Shopping mission (dedicated buyer).
-    if buyer_id == Some(role.id) && !shopping.is_empty() {
-        if let Some(cmd) = buyer_flow(turn, role, shopping, claimed) {
-            plan.push(role.id, cmd);
-            return;
-        }
-    }
-    // 4. Pre-position at the assigned tower so the first night round is spent
-    //    firing, not walking. Deadline is distance-aware: a worker far from
-    //    its tower starts early enough to make it.
-    if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == role.id).map(|(_, tower)| *tower) {
-        if let Some(tower) = turn.role_by_id(tower_id) {
-            let dist = chebyshev(role.pos, tower.pos);
-            if dist > 1 && turn.in_day_round >= preposition_round(dist) {
-                let stands = stand_cells(turn, tower.pos);
-                if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
-                    plan.push(role.id, cmd);
-                    return;
-                }
-            }
-        }
-    }
-    // 5. Repair walls damaged during the night (cheap: 10g per fix).
-    if let Some(wall_pos) = crate::brain::combat::repair_target(turn, role, 0) {
-        plan.push(role.id, RoleCommand::use_item_at("WallFixer", wall_pos));
-        return;
-    }
-    // 6. Build towers (gold) — highest defensive value.
-    if turn.gold >= WEAPON_BUILD_COST {
-        for (site, kind) in tower_gaps {
-            if claimed.contains(site) {
-                continue;
-            }
-            if let Some(cmd) = build_or_walk(turn, role, *site, kind, claimed) {
-                claimed.insert(*site);
-                plan.push(role.id, cmd);
-                return;
-            }
-        }
-    }
-    // 7. Build walls (stone). Build immediately when already standing next
-    //    to a gap; otherwise batch stones before committing to a long walk.
+    // 3. Build walls (stone) BEFORE weapons: the wall ring protects the base
+    //    and the roles standing behind it.
     if role.count_item(STONE) > 0 && !wall_gaps.is_empty() {
+        // Build immediately when already standing next to a gap.
         let adjacent_site = wall_gaps
             .iter()
             .find(|site| !claimed.contains(site) && chebyshev(role.pos, **site) == 1)
@@ -155,6 +116,7 @@ fn worker_day(
             plan.push(role.id, RoleCommand::build(site, "wall"));
             return;
         }
+        // Otherwise commit to the wall line once we carry a batch of stone.
         let batch = STONE_BATCH.min(wall_gaps.len() as i64).max(1);
         if role.count_item(STONE) as i64 >= batch {
             for site in wall_gaps {
@@ -169,14 +131,65 @@ fn worker_day(
             }
         }
     }
-    // 8. Burn a carried robot-summon order (enemy harassment) once build
-    //    duties are done — buying and building are never delayed by it.
-    if let Some(cmd) = burn_summon_order(state, role) {
-        plan.push(role.id, cmd);
+    // 4. Build weapons (gold) once the wall line is underway.
+    if turn.gold >= WEAPON_BUILD_COST {
+        for (site, kind) in tower_gaps {
+            if claimed.contains(site) {
+                continue;
+            }
+            if let Some(cmd) = build_or_walk(turn, role, *site, kind, claimed) {
+                claimed.insert(*site);
+                plan.push(role.id, cmd);
+                return;
+            }
+        }
+    }
+    // 5. Shopping (dedicated buyer) — upgrades come after survival.
+    if buyer_id == Some(role.id) && !shopping.is_empty() {
+        if let Some(cmd) = buyer_flow(turn, role, shopping, claimed) {
+            plan.push(role.id, cmd);
+            return;
+        }
+    }
+    // 6. Mine the nearest ore (stone first while walls are wanted). Mining
+    //    pauses during dusk so the ore we hold is converted to gold instead.
+    if turn.in_day_round < economy::DUSK_ROUND && !role.backpack_full() {
+        if let Some(cmd) = mine_flow(turn, state, role, stone_demand, claimed) {
+            plan.push(role.id, cmd);
+            return;
+        }
+    }
+    // 7. Sell ore for gold.
+    if economy::should_sell(turn, state, role, stone_demand) {
+        if let Some(cmd) = sell_flow(turn, state, role, stone_demand, claimed) {
+            plan.push(role.id, cmd);
+            return;
+        }
+    }
+    // 8. Pre-position near the assigned tower only in the final rounds, so
+    //    the first night round is spent firing instead of walking.
+    if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == role.id).map(|(_, tower)| *tower) {
+        if let Some(tower) = turn.role_by_id(tower_id) {
+            let dist = chebyshev(role.pos, tower.pos);
+            if dist > 1 && turn.in_day_round >= preposition_round(dist) {
+                let stands = stand_cells(turn, tower.pos);
+                if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
+                    plan.push(role.id, cmd);
+                    return;
+                }
+            }
+        }
+    }
+    // 9. Repair walls damaged overnight (cheap: 10g per fix) when standing
+    //    next to one — keeps the ring standing.
+    if let Some(wall_pos) = crate::brain::combat::repair_target(turn, role, 0) {
+        plan.push(role.id, RoleCommand::use_item_at("WallFixer", wall_pos));
         return;
     }
-    // 9. Economy loop: sell / mine (mining stops during dusk).
-    economy_flow(turn, state, role, stone_demand, claimed, plan);
+    // 10. Burn a carried robot-summon order only when everything else is done.
+    if let Some(cmd) = burn_summon_order(state, role) {
+        plan.push(role.id, cmd);
+    }
 }
 
 fn pioneer_day(
@@ -282,13 +295,15 @@ fn loiter_at_task_point(turn: &Turn, pioneer: &Unit, claimed: &mut HashSet<Pos>,
     }
 }
 
-fn use_medicine(role: &Unit) -> Option<RoleCommand> {
+/// Heal when badly hurt. A dead controller builds nothing and mans nothing,
+/// so this outranks every other action. Threshold: below 30% HP.
+pub(crate) fn use_medicine(role: &Unit) -> Option<RoleCommand> {
     let max_hp = match role.kind {
         crate::model::UnitKind::Worker => 220,
         crate::model::UnitKind::Pioneer => 200,
         _ => return None,
     };
-    if role.health * 2 < max_hp && role.count_item("Medicine") > 0 {
+    if role.health * 10 < max_hp * 3 && role.count_item("Medicine") > 0 {
         return Some(RoleCommand::use_item("Medicine"));
     }
     None
@@ -374,52 +389,46 @@ fn build_or_walk(
     walk_toward(turn, role, &stands, claimed)
 }
 
-fn economy_flow(
+/// Walk to the nearest mine and collect. Stone is preferred while the wall
+/// line needs it; distance always beats ore value.
+fn mine_flow(
     turn: &Turn,
     state: &BotState,
     role: &Unit,
     stone_demand: i64,
     claimed: &mut HashSet<Pos>,
-    plan: &mut Plan,
-) {
-    // Sell first when the backpack is heavy, a price spiked, or dusk is near.
-    if economy::should_sell(turn, state, role, stone_demand) {
-        let mut stands: Vec<Pos> = Vec::new();
-        for vendor in turn.vendors() {
-            stands.extend(stand_cells(turn, vendor));
-        }
-        if stands.iter().any(|pos| *pos == role.pos) {
-            if let Some(cmd) = economy::sell_command(turn, state, role, stone_demand) {
-                plan.push(role.id, cmd);
-                return;
-            }
-        } else if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
-            plan.push(role.id, cmd);
-            return;
-        }
+) -> Option<RoleCommand> {
+    let (mine, ore) = economy::choose_mine(turn, state, role.pos, stone_demand, claimed)?;
+    // Collect an adjacent mine of the preferred ore directly.
+    if let Some(mine_pos) = nearest_adjacent_mine(turn, role, &ore, claimed) {
+        claimed.insert(mine_pos);
+        return Some(RoleCommand::collect(mine_pos));
     }
-    // Dusk: no more mining — the ore we hold must become gold, not more ore.
-    if turn.in_day_round >= economy::DUSK_ROUND {
-        return;
+    let stands = stand_cells(turn, mine);
+    let cmd = walk_toward(turn, role, &stands, claimed)?;
+    claimed.insert(mine);
+    Some(cmd)
+}
+
+/// Walk to a vendor and sell the most valuable ore stack.
+fn sell_flow(
+    turn: &Turn,
+    state: &BotState,
+    role: &Unit,
+    stone_demand: i64,
+    claimed: &mut HashSet<Pos>,
+) -> Option<RoleCommand> {
+    let mut stands: Vec<Pos> = Vec::new();
+    for vendor in turn.vendors() {
+        stands.extend(stand_cells(turn, vendor));
     }
-    if role.backpack_full() {
-        return; // nothing more to do this round
+    if stands.is_empty() {
+        return None;
     }
-    // Mine: reserve distinct mines per worker via `claimed`.
-    if let Some((mine, ore)) = economy::choose_mine(turn, state, stone_demand, claimed) {
-        // Walk to any stand cell adjacent to the mine; collect when there.
-        let adjacent_mine = nearest_adjacent_mine(turn, role, &ore, claimed);
-        if let Some(mine_pos) = adjacent_mine {
-            claimed.insert(mine_pos);
-            plan.push(role.id, RoleCommand::collect(mine_pos));
-            return;
-        }
-        let stands = stand_cells(turn, mine);
-        if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
-            claimed.insert(mine);
-            plan.push(role.id, cmd);
-        }
+    if stands.iter().any(|pos| *pos == role.pos) {
+        return economy::sell_command(turn, state, role, stone_demand);
     }
+    walk_toward(turn, role, &stands, claimed)
 }
 
 /// A mine of the preferred ore (or any valuable ore) we already stand next to.

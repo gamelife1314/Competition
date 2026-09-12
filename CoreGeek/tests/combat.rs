@@ -24,6 +24,22 @@ fn gatling(id: i64, x: i32, y: i32, level: i64) -> Value {
     })
 }
 
+fn railgun(id: i64, x: i32, y: i32, level: i64) -> Value {
+    json!({
+        "id": id, "pos": {"x": x, "y": y}, "roleType": "railgun",
+        "health": 1000, "attackPower": 10, "attackRange": 7,
+        "level": level, "backPackCapability": 0, "backpack": []
+    })
+}
+
+fn rocket(id: i64, x: i32, y: i32, level: i64) -> Value {
+    json!({
+        "id": id, "pos": {"x": x, "y": y}, "roleType": "rocket",
+        "health": 1000, "attackPower": 20, "attackRange": 15,
+        "level": level, "backPackCapability": 0, "backpack": []
+    })
+}
+
 fn robot(id: i64, x: i32, y: i32, hp: i64, team: &str) -> Value {
     json!({
         "id": id, "pos": {"x": x, "y": y}, "roleType": "smallRobot",
@@ -369,10 +385,14 @@ fn shopping_list_prioritizes_weapon_upgrade_voucher() {
 
 #[test]
 fn buyer_worker_buys_voucher_at_shop() {
+    // All three tower slots are filled (no build gaps left), so the buyer's
+    // only remaining job is shopping — building weapons now outranks it.
     let turn = turn_from(day_world(
         vec![
             station(10, 20, 1),
             gatling(10020, 10, 10, 1),
+            railgun(10030, 12, 10, 2),
+            rocket(10040, 14, 10, 2),
             worker(10010, 1, 0), // adjacent to the shop at (0,0)
         ],
         75,
@@ -552,4 +572,132 @@ fn night_round_one_response_contains_attack_commands() {
             "tower {tower_id} must fire through the full response path"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Problem 3: day economy + fortification survival strategy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worker_builds_wall_before_weapon() {
+    // Compute a wall gap first, then place a stone-carrying worker next to it.
+    // Even with enough gold for a tower, the stone wall must win — the ring
+    // protects the base and roles before the weapons do.
+    let probe = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
+    let state = BotState::default();
+    let gaps = coregeek::brain::day::wall_gaps(&probe, &state);
+    let first = *gaps.first().expect("wall gaps exist");
+    let turn = turn_from(day_world_at(
+        5,
+        vec![
+            station(10, 20, 1),
+            json!({
+                "id": 10010, "pos": {"x": first.x + 1, "y": first.y},
+                "roleType": "worker", "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100,
+                "backpack": ["stone", "stone", "stone", "stone", "stone", "stone"]
+            }),
+        ],
+        100,
+        vec![],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("worker acts");
+    assert_eq!(cmd.action, "build");
+    assert_eq!(cmd.name.as_deref(), Some("wall"), "wall before weapon despite 100 gold");
+}
+
+#[test]
+fn choose_mine_prefers_nearest_not_most_valuable() {
+    // Near iron vs far copper: distance beats value — a short walk keeps the
+    // build loop moving faster than a high-value ore on the far side.
+    let turn = turn_from(day_world_at(
+        5,
+        vec![worker(10010, 5, 5)],
+        0,
+        vec![],
+        vec![zone(5, 6, "iron"), zone(30, 30, "copper")],
+    ));
+    let state = BotState::default();
+    let mine = coregeek::brain::economy::choose_mine(
+        &turn,
+        &state,
+        Pos { x: 5, y: 5 },
+        0,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        mine.map(|(pos, _)| pos),
+        Some(Pos { x: 5, y: 6 }),
+        "nearest mine wins even though copper is more valuable"
+    );
+}
+
+#[test]
+fn choose_mine_prefers_stone_when_walls_needed() {
+    // Walls first: with stone demand unmet, a stone mine beats a nearer iron.
+    let turn = turn_from(day_world_at(
+        5,
+        vec![worker(10010, 10, 10)],
+        0,
+        vec![],
+        vec![zone(9, 10, "iron"), zone(10, 11, "stone"), zone(20, 20, "stone")],
+    ));
+    let state = BotState::default();
+    let mine = coregeek::brain::economy::choose_mine(
+        &turn,
+        &state,
+        Pos { x: 10, y: 10 },
+        5,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(mine.map(|(pos, _)| pos), Some(Pos { x: 10, y: 11 }), "stone for the wall line wins");
+}
+
+#[test]
+fn night_spare_worker_shelters_not_mine() {
+    // A spare worker far from base with a mine right next to it must walk
+    // toward the base — night is for manning weapons and sheltering, never
+    // for mining outside the walls.
+    let turn = turn_from(world_zones(
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 9, 20, 1),
+            worker(10011, 11, 20), // paired: nearest to the tower
+            worker(10010, 30, 30), // spare, far away
+        ],
+        vec![],
+        vec![zone(30, 31, "iron")], // adjacent to the spare
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("spare worker acts");
+    assert_eq!(cmd.action, "move", "spare worker shelters instead of mining");
+}
+
+#[test]
+fn dying_worker_heals_first() {
+    // 40/220 HP with a Medicine in the backpack: healing outranks every other
+    // daytime duty — a dead worker builds nothing.
+    let turn = turn_from(day_world_at(
+        5,
+        vec![
+            station(10, 20, 1),
+            json!({
+                "id": 10010, "pos": {"x": 5, "y": 5}, "roleType": "worker",
+                "health": 40, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100, "backpack": ["Medicine"]
+            }),
+        ],
+        0,
+        vec![],
+        vec![zone(5, 6, "iron")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("worker acts");
+    assert_eq!(cmd.action, "use");
+    assert_eq!(cmd.name.as_deref(), Some("Medicine"), "dying worker heals first");
 }

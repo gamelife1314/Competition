@@ -1,16 +1,12 @@
 //! Nighttime planning (60 rounds): pair controllers with towers, man them,
-//! and shoot; spare controllers use items, keep a safe economy running or
-//! shelter near the base.
+//! and shoot; spare controllers use items or shelter near the base.
 
 use std::collections::HashSet;
 
-use crate::brain::{combat, economy, stand_cells, task, walk_toward, Plan};
-use crate::model::{chebyshev, Turn, Unit, UnitKind, STONE};
+use crate::brain::{combat, stand_cells, task, walk_toward, Plan};
+use crate::model::{chebyshev, Turn, Unit, UnitKind};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
-
-/// Robots within this distance of a mine make night collection unsafe.
-const MINE_SAFETY_RADIUS: i32 = 6;
 
 /// Greedy pairing: every living tower gets the closest free controller.
 /// A pioneer busy with a self-evolution task must stay at the task point and
@@ -121,7 +117,11 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         let adjacent = dist <= 1;
         let mut targets_count: usize = 0;
         let mut fired = false;
-        if adjacent {
+        // Survival first: a badly hurt operator heals instead of firing or
+        // walking this round — a dead controller mans nothing.
+        if let Some(cmd) = crate::brain::day::use_medicine(controller) {
+            plan.push(controller.id, cmd);
+        } else if adjacent {
             // Man the tower: attack commands are keyed by the TOWER's id.
             if tower.cooldown == 0 {
                 if let Some(targets) = combat::choose_attack(turn, tower, &mut sim) {
@@ -190,10 +190,9 @@ fn spare_night(
         }
         return;
     }
-    // Self-heal.
-    let max_hp = if role.kind == UnitKind::Worker { 220 } else { 200 };
-    if role.health * 2 < max_hp && role.count_item("Medicine") > 0 {
-        plan.push(role.id, RoleCommand::use_item("Medicine"));
+    // Self-heal — survival outranks every other spare duty.
+    if let Some(cmd) = crate::brain::day::use_medicine(role) {
+        plan.push(role.id, cmd);
         return;
     }
     // Burn summon orders (harassment works at night too).
@@ -240,58 +239,9 @@ fn spare_night(
             return;
         }
     }
-    // Safe night economy for workers: sell / collect only away from robots.
-    if role.kind == UnitKind::Worker {
-        if night_economy(turn, state, role, claimed, plan) {
-            return;
-        }
-    }
-    // Otherwise shelter next to the base.
+    // No night mining: every spare role shelters next to the base. Mining at
+    // night drags a worker outside the walls where it can die.
     shelter(turn, role, claimed, plan);
-}
-
-fn night_economy(
-    turn: &Turn,
-    state: &mut BotState,
-    role: &Unit,
-    _claimed: &mut HashSet<Pos>,
-    plan: &mut Plan,
-) -> bool {
-    let robot_positions: Vec<Pos> = turn.robots.iter().filter(|robot| robot.health > 0).map(|robot| robot.pos).collect();
-    let safe = |pos: Pos| {
-        robot_positions.iter().all(|robot| chebyshev(*robot, pos) >= MINE_SAFETY_RADIUS)
-    };
-    // Sell if standing at the vendor with a full-ish pack.
-    let at_vendor = turn.vendors().iter().any(|vendor| chebyshev(*vendor, role.pos) <= 1);
-    if at_vendor && safe(role.pos) {
-        if let Some(cmd) = economy::sell_command(turn, state, role, 0) {
-            plan.push(role.id, cmd);
-            return true;
-        }
-    }
-    // Collect from an adjacent, safe mine (prefer stones, then value).
-    if !role.backpack_full() {
-        let mut best: Option<((i64, i64), Pos)> = None;
-        for (mine, ore) in turn.all_mines() {
-            if chebyshev(mine, role.pos) != 1 || !safe(mine) {
-                continue;
-            }
-            if state.ore_on_outage(&ore, turn.day) {
-                continue;
-            }
-            let value = if ore == STONE { 1000 } else { turn.vendor_prices.get(&ore).copied().unwrap_or(1) };
-            // Coordinate tiebreak: HashMap iteration order must not decide.
-            let key = (value, -(mine.x as i64 + mine.y as i64));
-            if best.map(|(v, _)| key > v).unwrap_or(true) {
-                best = Some((key, mine));
-            }
-        }
-        if let Some((_, mine)) = best {
-            plan.push(role.id, RoleCommand::collect(mine));
-            return true;
-        }
-    }
-    false
 }
 
 fn shelter(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) {

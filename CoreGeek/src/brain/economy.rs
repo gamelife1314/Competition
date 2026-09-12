@@ -240,11 +240,14 @@ pub fn sell_command(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i6
     best.map(|(_, ore, count)| RoleCommand::sell(ore, count))
 }
 
-/// Pick a mine for this worker: stones first while wall demand unmet,
-/// otherwise the highest-value ore that is not on outage.
+/// Pick the nearest mine for this worker: stones first while wall demand is
+/// unmet, otherwise the closest mine of any ore. Distance always beats value
+/// — a short walk keeps the build loop moving faster than a high-value ore
+/// on the far side of the map.
 pub fn choose_mine(
     turn: &Turn,
     state: &BotState,
+    role_pos: Pos,
     stone_demand: i64,
     claimed: &HashSet<Pos>,
 ) -> Option<(Pos, String)> {
@@ -261,22 +264,24 @@ pub fn choose_mine(
     if options.is_empty() {
         return None;
     }
+    // Stones for the wall line: nearest stone mine wins (coordinate tiebreak
+    // keeps the pick deterministic across HashMap iteration order). When no
+    // stone is reachable, fall back to the nearest mine of any ore rather
+    // than idling.
     if stone_demand > 0 {
-        // Deterministic pick (zones live in a HashMap): lowest coordinate
-        // wins so workers do not flip-flop between equal stone mines.
         if let Some((pos, ore)) = options
             .iter()
             .filter(|(_pos, ore)| ore == STONE)
-            .min_by_key(|(pos, _ore)| (pos.x, pos.y))
+            .min_by_key(|(pos, _ore)| (chebyshev(role_pos, *pos), pos.x, pos.y))
         {
             return Some((*pos, ore.clone()));
         }
     }
-    // Highest vendor value first; coordinate tiebreak keeps it stable.
+    // Nearest mine first; equal distance broken by higher vendor value.
     options
         .into_iter()
-        .max_by_key(|(pos, ore)| {
+        .min_by_key(|(pos, ore)| {
             let price = turn.vendor_prices.get(ore).copied().unwrap_or(1);
-            (price, -(pos.x as i64 + pos.y as i64), -(pos.x as i64))
+            (chebyshev(role_pos, *pos), std::cmp::Reverse(price), pos.x, pos.y)
         })
 }
