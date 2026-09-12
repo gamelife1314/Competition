@@ -65,7 +65,10 @@ fn the_command_waits_out_the_round_the_llm_answers() {
     state.task.stage = TaskStage::Planning;
     state.task.llm_request_round = Some(5);
 
-    let turn = turn_from(llm_world(6, "```bash\nls /tmp/selfEvolutionTask | wc -l\n```"));
+    let turn = turn_from(llm_world(
+        6,
+        "```bash\nls /tmp/selfEvolutionTask | wc -l\n```",
+    ));
     state.observe(&turn);
     assert!(
         matches!(state.task.stage, TaskStage::HavePlan { .. }),

@@ -791,6 +791,85 @@ fn night_spare_worker_shelters_not_mine() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #18/#19: night survivability — a focused controller dies inside the
+// round it is shot in, and the gun it manned goes silent with it.
+// ---------------------------------------------------------------------------
+
+fn worker_hp(id: i64, x: i32, y: i32, hp: i64) -> Value {
+    json!({
+        "id": id, "pos": {"x": x, "y": y}, "roleType": "worker",
+        "health": hp, "attackPower": 0, "attackRange": 0,
+        "backPackCapability": 100, "backpack": ["Medicine"]
+    })
+}
+
+#[test]
+fn night_controller_heals_at_the_night_threshold_not_the_day_one() {
+    // 121/220 HP = 55%. The day rule (`day::use_medicine`, 30%) would let this
+    // role keep working; at night a robot two cells away is one volley from
+    // deleting it, and the tower it operates dies with it. Issue #18 lost
+    // 20011 over six rounds and 20010 in two; issue #19 lost all three
+    // operators on D2 night and the base fell to 105 HP behind them.
+    let turn = turn_from(world(
+        vec![gatling(10020, 10, 10, 1), worker_hp(10010, 11, 10, 121)],
+        vec![robot(30001, 13, 10, 40, "challenger")], // chebyshev 2 from the operator
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("operator acts");
+    assert_eq!(cmd.action, "use");
+    assert_eq!(
+        cmd.name.as_deref(),
+        Some("Medicine"),
+        "an operator under fire heals at 55%, not at 30%"
+    );
+    assert!(
+        !plan.commands.contains_key(&10020),
+        "the gun stays silent for the one round the operator spends healing"
+    );
+}
+
+#[test]
+fn night_threshold_does_not_fire_without_a_robot_in_reach() {
+    // Same 55%, nobody within the 3-cell threat radius: a scratch at 3 a.m. can
+    // wait, and the 10 gold potion is not spent for nothing.
+    let turn = turn_from(world(
+        vec![gatling(10020, 10, 10, 1), worker_hp(10010, 11, 10, 121)],
+        vec![robot(30001, 20, 20, 40, "challenger")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    let healed = plan
+        .commands
+        .get(&10010)
+        .map(|cmd| cmd.name.as_deref() == Some("Medicine"))
+        .unwrap_or(false);
+    assert!(
+        !healed,
+        "no threat in reach ⇒ the day threshold still applies"
+    );
+}
+
+#[test]
+fn a_healthy_operator_keeps_the_gun_firing() {
+    // 170/220 = 77% is above both thresholds: the potion is not burned and the
+    // tower shoots, so the heal never costs firepower it did not have to.
+    let turn = turn_from(world(
+        vec![gatling(10020, 10, 10, 1), worker_hp(10010, 11, 10, 170)],
+        vec![robot(30001, 13, 10, 40, "challenger")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    assert_eq!(
+        plan.commands.get(&10010).map(|cmd| cmd.action.as_str()),
+        None,
+        "a healthy operator holds position"
+    );
+    let fired = plan.commands.get(&10020).expect("tower fires");
+    assert_eq!(fired.action, "attack");
+}
+
 #[test]
 fn dying_worker_heals_first() {
     // 40/220 HP with a Medicine in the backpack: healing outranks every other

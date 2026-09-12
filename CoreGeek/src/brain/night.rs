@@ -252,7 +252,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         } else {
             // Adjacent: a badly hurt operator heals first (a dead one mans
             // nothing), otherwise man the tower.
-            if let Some(cmd) = crate::brain::day::use_medicine(controller) {
+            if let Some(cmd) = night_medicine(turn, controller) {
                 idle_reason = "controller_healing";
                 plan.push(controller.id, cmd);
             } else if tower.cooldown == 0 {
@@ -322,7 +322,7 @@ fn spare_night(
         return;
     }
     // Self-heal — survival outranks every other spare duty.
-    if let Some(cmd) = crate::brain::day::use_medicine(role) {
+    if let Some(cmd) = night_medicine(turn, role) {
         plan.push(role.id, cmd);
         return;
     }
@@ -381,6 +381,41 @@ fn spare_night(
     }
     // (Shelter already ran above; reaching here means the role is inside the
     // ring and has nothing else to throw at the robots.)
+}
+
+/// Heal at night, while the role is still worth saving.
+///
+/// `day::use_medicine` waits for 30% health, which is tuned for the day: a role
+/// that takes a hit at noon has hours to walk it off, and a potion spent early
+/// is 10 gold never coming back. At night there is no walking it off — a
+/// focused controller goes from 30% to dead inside the round it is shot in, and
+/// the tower it was manning goes silent with it. Issue #18 lost 20011 in six
+/// rounds (HP 200→0) and 20010 in TWO (HP 220→0); issue #19 lost all three on
+/// D2 night and the base fell from 1500 to 105 HP behind them. Medicine
+/// restores FULL health, so a potion spent at 60% buys a gun that fires all
+/// night and a survival score that keeps paying — the potion saved buys
+/// nothing.
+///
+/// Below the threat radius (no robot close enough to finish the job this
+/// round) the day threshold still applies: a scratch at 3 a.m. can wait.
+fn night_medicine(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
+    if role.count_item("Medicine") < 1 {
+        return None;
+    }
+    let max_hp = match role.kind {
+        UnitKind::Worker => 220,
+        UnitKind::Pioneer => 200,
+        _ => return None,
+    };
+    let threatened = turn
+        .robots
+        .iter()
+        .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= 3);
+    let threshold = if threatened { 7 } else { 3 };
+    if role.health * 10 < max_hp * threshold {
+        return Some(RoleCommand::use_item("Medicine"));
+    }
+    None
 }
 
 /// Move a spare role inside the wall ring, right next to the station. Returns
