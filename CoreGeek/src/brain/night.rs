@@ -8,6 +8,14 @@ use crate::model::{chebyshev, footprint_distance, Turn, Unit, UnitKind};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
 
+/// A robot inside this many cells of a role can reach it this round or the
+/// next: the radius at which a wound stops being an inconvenience.
+const THREAT_RADIUS: i32 = 3;
+/// Max HP in tenths below which a controller with no Medicine breaks contact
+/// instead of holding its post (3 = the 30% the day rule heals at, so the two
+/// agree on what "critically wounded" means).
+const WITHDRAW_HEALTH_TENTHS: i64 = 3;
+
 /// Greedy pairing: every living tower gets the closest free controller that
 /// can actually REACH it. A pioneer busy with a self-evolution task must stay
 /// at the task point and is therefore excluded. Towers under the heaviest
@@ -205,7 +213,29 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         // pk575098 / pk575557), so each idle tower now carries its own reason.
         let mut idle_reason = "fired";
 
-        if !adjacent {
+        // SURVIVAL OUTRANKS THE POST. A controller that is about to die on its
+        // own operating cell (or on the way to it) mans nothing: the gun goes
+        // silent either way, and it takes a surviving role — and the score that
+        // comes with it — down with the tower. Breaking contact is checked
+        // before both the recall and the trigger so the two never alternate:
+        // the predicate is about the wound and the robots, not about where the
+        // controller is standing, so a withdrawn controller is never walked
+        // back out and a controller whose wound has stopped being an emergency
+        // is recalled again the same round it becomes one.
+        if night_withdraw(turn, controller, &mut claimed, &mut plan) {
+            idle_reason = "controller_withdrawn";
+            crate::log::event(
+                "night_withdraw",
+                serde_json::json!({
+                    "round": turn.round_no,
+                    "controller": controller.id,
+                    "tower": tower.id,
+                    "health": controller.health,
+                    "pos": controller.pos,
+                    "dist": dist,
+                }),
+            );
+        } else if !adjacent {
             // NIGHT RECALL (recurring defect): a controller not adjacent to its
             // tower MUST move there, outranking every other night duty (heal,
             // items, shelter, economy). Battle pk575098 / pk575557 left towers
@@ -410,12 +440,60 @@ fn night_medicine(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
     let threatened = turn
         .robots
         .iter()
-        .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= 3);
+        .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= THREAT_RADIUS);
     let threshold = if threatened { 7 } else { 3 };
     if role.health * 10 < max_hp * threshold {
         return Some(RoleCommand::use_item("Medicine"));
     }
     None
+}
+
+/// Break contact with a controller that has run out of ways to survive.
+///
+/// Issue #20: 20010 manned tower 20020 through D1 night while robots that had
+/// already breached the ring hit it round after round — HP 220 → 30 with no
+/// move command anywhere in the log. It was still firing on the round it died,
+/// and the tower went silent for the rest of the night regardless. The recall
+/// below is unconditional by design (an unmanned gun is the defect it exists to
+/// prevent), but a recall that walks a dying controller back onto the cell it
+/// is being shot on is not manning the gun, it is feeding the robots: the same
+/// gun falls silent one round later, minus the operator and its score.
+///
+/// So: below [`WITHDRAW_HEALTH_TENTHS`] of max HP with no Medicine to undo it
+/// and robots inside the threat radius, the controller goes behind the ring
+/// instead of holding or taking its post. Medicine is checked first because a
+/// potion is strictly better than a retreat — it restores FULL health, which
+/// puts the gun back in action instead of losing it. Everything else about the
+/// night is unchanged: this only ever fires on a controller that is one volley
+/// from death.
+///
+/// Returns true when the survival rule owns this controller's round.
+fn night_withdraw(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) -> bool {
+    if role.count_item("Medicine") > 0 {
+        return false;
+    }
+    let max_hp = match role.kind {
+        UnitKind::Worker => 220,
+        UnitKind::Pioneer => 200,
+        _ => return false,
+    };
+    if role.health * 10 >= max_hp * WITHDRAW_HEALTH_TENTHS {
+        return false;
+    }
+    let under_fire = turn
+        .robots
+        .iter()
+        .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= THREAT_RADIUS);
+    if !under_fire {
+        return false; // hurt but unthreatened: the post is still the best place
+    }
+    if crate::brain::interior_cells(turn).contains(&role.pos) {
+        return true; // already behind the ring: hold, do not walk back out
+    }
+    // `shelter` moves it one step inside; if it cannot move at all it returns
+    // false and the controller falls through to the normal night duty rather
+    // than standing frozen — a role that cannot retreat should still shoot.
+    shelter(turn, role, claimed, plan)
 }
 
 /// Move a spare role inside the wall ring, right next to the station. Returns

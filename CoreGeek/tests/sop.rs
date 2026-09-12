@@ -154,6 +154,95 @@ fn a_command_the_sandbox_ran_is_reused_even_when_its_answer_was_rejected() {
     );
 }
 
+#[test]
+fn a_script_that_says_it_failed_has_not_answered() {
+    // Issue #20: eight sessions, 0 points, every one of them with a script the
+    // sandbox ran to completion (exit=0) and an answer read back as `xxx` or
+    // `failed_to_extract` — the sentinel the model's own error path prints when
+    // it cannot find or parse the task input. `ANSWER:` marks the RESULT, so a
+    // marker carrying a sentinel is a failed run: it must re-plan (the sentinel
+    // rides into the next prompt's failure context), and it must not be
+    // recorded, because what is recorded is what the deadline submits and what
+    // the SOP cache learns.
+    for sentinel in [
+        "xxx",
+        "failed_to_extract",
+        "extract_failed",
+        "TODO",
+        "unknown",
+        "N/A",
+        "无",
+        "提取失败",
+        "failed",
+    ] {
+        let mut state = BotState::default();
+        state.task.active = true;
+        state.task.session_id = 1;
+        state.task.task_type = "自进化类1".into();
+        state.task.description = "统计 /tmp/selfEvolutionTask 下的文件数量".into();
+        state.task.cmd_history = vec!["ls /tmp/selfEvolutionTask | wc -l".into()];
+        state.task.stage = TaskStage::WaitingCmdResult { attempts: 0 };
+        state.task.cmd_request_round = Some(4);
+        coregeek::brain::task::on_cmd_result(
+            &mut state,
+            &format!("[exitCode:0]\nANSWER: {sentinel}"),
+        );
+        assert!(
+            matches!(state.task.stage, TaskStage::Planning),
+            "`{sentinel}` is a failed run, not an answer"
+        );
+        assert!(
+            state.task.best_answer.is_empty(),
+            "`{sentinel}` must never become the recorded answer"
+        );
+        assert!(
+            state.task.sop_cmd.is_none(),
+            "a script whose answer is a sentinel is not worth caching"
+        );
+        state.finish_task(false, "timeout");
+        assert!(
+            state.sop_cache.is_empty(),
+            "`{sentinel}` must not teach the SOP cache"
+        );
+    }
+}
+
+#[test]
+fn a_real_answer_is_still_an_answer() {
+    // The other half of the sentinel rule: it is a whole-answer match, so a
+    // result that merely contains one of those words survives, and a plain
+    // scalar is untouched. Over-filtering here would be worse than the bug.
+    use coregeek::brain::task::is_failure_answer;
+    for real in [
+        "41",
+        "0",
+        "/tmp/selfEvolutionTask/task_1.md",
+        "failed_to_extract.log",
+        "error_count=7",
+        r#"{"files":41,"lines":812}"#,
+        "提取失败的原因有三点",
+    ] {
+        assert!(
+            !is_failure_answer(real),
+            "`{real}` is a result, not a sentinel"
+        );
+    }
+    for sentinel in ["xxx", " failed_to_extract。", "\"N/A\"", "  TODO  "] {
+        assert!(is_failure_answer(sentinel), "`{sentinel}` is a sentinel");
+    }
+
+    // And the timeout guard: a session whose only "answer" was a sentinel
+    // submits nothing rather than a guaranteed zero.
+    let mut state = BotState::default();
+    state.task.best_answer = "failed_to_extract".into();
+    state.task.result_history = vec!["[exitCode:0]\nANSWER: failed_to_extract".into()];
+    assert_eq!(
+        partial_answer(&state),
+        None,
+        "a sentinel is not a partial answer either"
+    );
+}
+
 fn sop(task_type: &str, keywords: &[&str], template: &str) -> SopEntry {
     SopEntry {
         task_type: task_type.into(),

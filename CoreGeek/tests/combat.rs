@@ -797,10 +797,14 @@ fn night_spare_worker_shelters_not_mine() {
 // ---------------------------------------------------------------------------
 
 fn worker_hp(id: i64, x: i32, y: i32, hp: i64) -> Value {
+    worker_hp_items(id, x, y, hp, vec!["Medicine"])
+}
+
+fn worker_hp_items(id: i64, x: i32, y: i32, hp: i64, items: Vec<&str>) -> Value {
     json!({
         "id": id, "pos": {"x": x, "y": y}, "roleType": "worker",
         "health": hp, "attackPower": 0, "attackRange": 0,
-        "backPackCapability": 100, "backpack": ["Medicine"]
+        "backPackCapability": 100, "backpack": items
     })
 }
 
@@ -868,6 +872,131 @@ fn a_healthy_operator_keeps_the_gun_firing() {
     );
     let fired = plan.commands.get(&10020).expect("tower fires");
     assert_eq!(fired.action, "attack");
+}
+
+#[test]
+fn a_critically_wounded_operator_breaks_contact_instead_of_dying_at_its_post() {
+    // Issue #20: 20010 manned tower 20020 from HP 220 down to 30 across D1 night
+    // (R105-R115) with robots already inside the ring, and never once had a move
+    // command — it was still firing on the round it died, and the gun went
+    // silent anyway. 30/220 = 13% with no Medicine in the backpack and a robot
+    // two cells away: the post is a grave, the ring is a plan.
+    let turn = turn_from(world_zones(
+        vec![
+            station(20, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker_hp_items(10010, 11, 10, 30, vec![]),
+        ],
+        vec![robot(30001, 13, 10, 40, "challenger")],
+        vec![],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("the operator acts");
+    assert_eq!(cmd.action, "move", "a dying operator breaks contact");
+    let destination = cmd
+        .targetPos
+        .as_ref()
+        .and_then(|targets| targets.first())
+        .copied()
+        .expect("a move carries a destination");
+    assert!(
+        coregeek::model::chebyshev(destination, Pos { x: 20, y: 20 })
+            < coregeek::model::chebyshev(Pos { x: 11, y: 10 }, Pos { x: 20, y: 20 }),
+        "and walks toward the ring, not deeper into the fight"
+    );
+    assert!(
+        !plan.commands.contains_key(&10020),
+        "the gun it cannot survive manning stays silent this round"
+    );
+}
+
+#[test]
+fn a_wounded_operator_with_a_potion_fights_on() {
+    // The same 30 HP, but with a Medicine in hand: the potion restores FULL
+    // health and puts the gun back in action, which beats losing the post for
+    // the rest of the night. Retreat is the fallback, never the first answer.
+    let turn = turn_from(world_zones(
+        vec![
+            station(20, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker_hp(10010, 11, 10, 30),
+        ],
+        vec![robot(30001, 13, 10, 40, "challenger")],
+        vec![],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("the operator acts");
+    assert_eq!(cmd.action, "use");
+    assert_eq!(
+        cmd.name.as_deref(),
+        Some("Medicine"),
+        "a potion outranks the retreat it would make unnecessary"
+    );
+}
+
+#[test]
+fn a_wounded_controller_out_of_position_never_walks_back_into_the_robots() {
+    // Out of position AND bleeding out with nothing to heal with: the recall
+    // must not drag it back across the map through the robots that are shooting
+    // it. Same predicate as the adjacent case, so the two never alternate.
+    let turn = turn_from(world_zones(
+        vec![
+            station(20, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker_hp_items(10010, 18, 20, 30, vec![]),
+        ],
+        vec![robot(30001, 20, 21, 40, "challenger")],
+        vec![],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("the operator acts");
+    assert_eq!(cmd.action, "move");
+    let destination = cmd
+        .targetPos
+        .as_ref()
+        .and_then(|targets| targets.first())
+        .copied()
+        .expect("a move carries a destination");
+    assert!(
+        coregeek::model::chebyshev(destination, Pos { x: 20, y: 20 })
+            < coregeek::model::chebyshev(Pos { x: 18, y: 20 }, Pos { x: 20, y: 20 }),
+        "it steps toward the ring, not back toward its tower"
+    );
+}
+
+#[test]
+fn a_wounded_controller_with_nobody_nearby_is_still_recalled() {
+    // The recall stays unconditional for every controller that is not in
+    // immediate danger: 30 HP with the nearest robot ten cells away is a wound
+    // the post can wait out, and an unmanned tower is the defect the recall
+    // exists to prevent.
+    let turn = turn_from(world_zones(
+        vec![
+            station(20, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker_hp_items(10010, 14, 10, 30, vec![]),
+        ],
+        vec![robot(30001, 14, 20, 40, "challenger")],
+        vec![],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("the operator acts");
+    assert_eq!(cmd.action, "move");
+    let destination = cmd
+        .targetPos
+        .as_ref()
+        .and_then(|targets| targets.first())
+        .copied()
+        .expect("a move carries a destination");
+    assert!(
+        coregeek::model::chebyshev(destination, Pos { x: 10, y: 10 })
+            < coregeek::model::chebyshev(Pos { x: 14, y: 10 }, Pos { x: 10, y: 10 }),
+        "an unthreatened controller walks to its tower as usual"
+    );
 }
 
 #[test]
@@ -2543,6 +2672,49 @@ fn economy_worker_digs_ore_the_vendor_buys_not_the_ring_stone() {
         (crew.action.as_str(), first_target(crew)),
         ("collect", Some(Pos { x: 6, y: 5 })),
         "the wall crew must not follow the economy worker onto the iron"
+    );
+}
+
+#[test]
+fn the_gold_loop_actually_sells_at_the_vendor() {
+    // Issue #20: 180 shopping events, 0 sells, gold frozen at 1 from R162 on —
+    // the crew mined, built and bought nothing, because the worker that was
+    // supposed to keep the money moving followed the wall crew onto stone
+    // instead. The stash is only worth what the vendor pays for it, so the
+    // designated economy worker walks its load to the vendor and SELLS, on the
+    // map where the ring is still asking for stone. This is the invariant the
+    // keep-list protects; everything else about the day may bend around it.
+    let turn = turn_from(day_world_at(
+        135,
+        vec![
+            station(10, 20, 1),
+            json!({
+                "id": 10010, "pos": {"x": 30, "y": 30}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100, "backpack": []
+            }),
+            json!({
+                "id": 10011, "pos": {"x": 1, "y": 0}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100, "backpack": ["iron", "iron", "iron", "iron"]
+            }),
+        ],
+        0,
+        vec![],
+        vec![zone(20, 20, "stone"), zone(0, 0, "vendor")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10011).expect("economy worker acts");
+    assert_eq!(cmd.action, "sell", "the loop must actually sell");
+    assert_eq!(
+        cmd.name.as_deref(),
+        Some("iron"),
+        "and sell the load it is carrying"
+    );
+    assert!(
+        cmd.num.unwrap_or(0) > 0,
+        "a sell of nothing is still a frozen economy"
     );
 }
 

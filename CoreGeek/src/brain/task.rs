@@ -84,6 +84,19 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
             state.task.stage = TaskStage::Planning;
             return;
         }
+        if is_failure_answer(&answer) {
+            // The script ran and told us it could not do the task. That is a
+            // failed RUN, not an answer: re-plan (the sentinel goes into
+            // `result_history` and thus into the next prompt's failure
+            // context), and never record it as `best_answer` — a recorded
+            // sentinel is what the deadline guard would submit.
+            crate::log::event(
+                "task_answer_sentinel",
+                serde_json::json!({"exit": code, "answer": truncate(&answer, 60)}),
+            );
+            state.task.stage = TaskStage::Planning;
+            return;
+        }
         // An explicit ANSWER marker is trusted even when the exit code is
         // non-zero (trailing cleanup may fail after the answer was printed);
         // a wrong verdict comes back as errorCode 2 and re-triggers Planning.
@@ -275,6 +288,7 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
     prompt.push_str("2. 脚本最后一行必须打印 `ANSWER: <最终答案>`，多字段答案用 JSON 表示。\n");
     prompt.push_str("3. 脚本要可复用：把可变参数（如城市名、文件名、数量）写成 `{{参数名}}` 占位符，参数名必须与任务描述里出现的字段名完全一致（例如描述里的“城市名”就用 `{{城市名}}`），脚本中不要写死具体取值；同一类任务下次会复用这段脚本并按新描述自动填参。\n");
     prompt.push_str("4. 尽量在一个脚本内完成全部步骤（find 找文件 → cat 读取 → 计算 → 打印 ANSWER），不要分多轮试探；只有带 `ANSWER:` 标记的输出才会被当作答案提交。\n");
+    prompt.push_str("5. `ANSWER:` 后面必须是真实结果（数字/字符串/JSON）。找不到文件或算不出来时，**不要**打印 ANSWER 行，也不要用 `xxx`、`failed_to_extract`、`TODO`、`unknown`、`N/A` 之类的占位符占位——那会被判错并浪费一整轮；直接把报错信息打印到 stderr 即可，脚本会带着错误重试。\n");
     if !state.task.result_history.is_empty() {
         prompt.push_str("\n上次执行输出（请修正错误）：\n");
         let start = state.task.result_history.len().saturating_sub(2);
@@ -446,6 +460,69 @@ pub fn is_meta_answer(answer: &str) -> bool {
         || (lower.contains("\"status\"") && lower.contains("parsed"))
 }
 
+/// True when the `ANSWER:` marker carries the script's own failure notice
+/// instead of a result.
+///
+/// Issue #20's eight sessions all died on this: the sandbox ran the script
+/// (exit=0), and the answer read back was `xxx` / `failed_to_extract` — the
+/// sentinel the model's error path prints when it cannot find or parse the
+/// task's input. `ANSWER:` is a marker for the RESULT, so a marker holding a
+/// sentinel is not an answer: submitting it scores zero, it parks the session
+/// in `HaveAnswer` until the timeout expires instead of re-planning, it hides
+/// every real partial field from `partial_answer`'s merge, and since a script
+/// that produced an answer is now cached (`sop_cmd`), it teaches the SOP cache
+/// a script whose entire purpose is to fail.
+///
+/// Only a whole-answer match counts. A real result that merely contains one of
+/// these words — a path, a JSON field, a line of prose — is left alone.
+pub fn is_failure_answer(answer: &str) -> bool {
+    const SENTINELS: [&str; 34] = [
+        "xxx",
+        "xx",
+        "x",
+        "?",
+        "??",
+        "???",
+        "todo",
+        "tbd",
+        "n/a",
+        "na",
+        "nil",
+        "unknown",
+        "undefined",
+        "placeholder",
+        "failed",
+        "failure",
+        "error",
+        "exception",
+        "failed_to_extract",
+        "failed_to_parse",
+        "failed-extract",
+        "extract_failed",
+        "extraction_failed",
+        "parse_failed",
+        "no_answer",
+        "noanswer",
+        "not_found",
+        "notfound",
+        "无",
+        "空",
+        "未知",
+        "暂无",
+        "待补充",
+        "提取失败",
+    ];
+    let trimmed = answer
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '。' || c == '.')
+        .trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_lowercase();
+    SENTINELS.iter().any(|sentinel| lower == *sentinel)
+}
+
 /// Return the strongest structured result seen so far. Only explicit answer
 /// markers qualify; raw listings, tracebacks and task prose remain excluded.
 ///
@@ -453,7 +530,10 @@ pub fn is_meta_answer(answer: &str) -> bool {
 /// merged field-by-field so a run that only printed part of the result still
 /// earns its pass rate instead of submitting nothing.
 pub fn partial_answer(state: &BotState) -> Option<String> {
-    if !state.task.best_answer.is_empty() && !is_meta_answer(&state.task.best_answer) {
+    if !state.task.best_answer.is_empty()
+        && !is_meta_answer(&state.task.best_answer)
+        && !is_failure_answer(&state.task.best_answer)
+    {
         return Some(state.task.best_answer.clone());
     }
     let answers: Vec<String> = state
@@ -461,7 +541,7 @@ pub fn partial_answer(state: &BotState) -> Option<String> {
         .result_history
         .iter()
         .filter_map(|result| extract_answer(strip_status_line(result)))
-        .filter(|answer| !is_meta_answer(answer))
+        .filter(|answer| !is_meta_answer(answer) && !is_failure_answer(answer))
         .collect();
     let best = answers.last()?.clone();
     Some(merge_json_fields(&answers).unwrap_or(best))
