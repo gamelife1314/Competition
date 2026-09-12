@@ -29,6 +29,13 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
     let output = strip_status_line(result);
     let code = exit_code(result);
     if let Some(answer) = extract_answer(output) {
+        if is_meta_answer(&answer) {
+            // A meta-description of the parsing step ({"status":"parsed",...})
+            // is not the task's result: treat it as a failed run and re-plan.
+            crate::log::event("task_answer_meta", serde_json::json!({"exit": code}));
+            state.task.stage = TaskStage::Planning;
+            return;
+        }
         // An explicit ANSWER marker is trusted even when the exit code is
         // non-zero (trailing cleanup may fail after the answer was printed);
         // a wrong verdict comes back as errorCode 2 and re-triggers Planning.
@@ -38,8 +45,6 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
         );
         state.task.best_answer = answer.clone();
         state.task.stage = TaskStage::HaveAnswer { answer };
-        // Cache the working command immediately so the next task reuses it.
-        state.cache_sop();
     } else {
         // No answer found: ask the LLM again with the failure context
         // (result_history carries it into the next prompt).
@@ -133,7 +138,7 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
     let mut prompt = String::new();
     prompt.push_str("你在一个隔离沙盒中执行任务，沙盒可运行基础 shell 与 python3（无外网）。\n");
     prompt.push_str("环境说明：任务相关文件（如 task_X.md、输入数据）都放在 /tmp/selfEvolutionTask/ 目录下。\n");
-    prompt.push_str("请先用 `find /tmp/selfEvolutionTask/ -maxdepth 3` 或 `ls -R /tmp/selfEvolutionTask/` 查看有哪些文件，再 `cat /tmp/selfEvolutionTask/<对应文件名>` 读取内容；不要直接 `cat task_X.md`（根目录没有该文件）。\n");
+    prompt.push_str("请先用 `find /tmp/selfEvolutionTask/ -maxdepth 4` 或 `ls -R /tmp/selfEvolutionTask/` 查看有哪些文件；任务文件可能在多层子目录里（如 1-fixed-step/2-engineering-fix/task_X.md）。必须用 `find`/`ls` 输出的【真实完整路径】去 `cat`，不要假设文件在根目录、不要直接 `cat task_X.md`。\n");
     prompt.push_str("任务描述：\n");
     prompt.push_str(&state.task.description);
     prompt.push_str("\n\n要求：\n");
@@ -256,6 +261,17 @@ pub fn extract_answer(output: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// True when the answer describes the parsing step instead of the result —
+/// e.g. `{"status":"parsed","content_length":534}`. Submitting these scores
+/// nothing, so they are filtered out before submission.
+pub fn is_meta_answer(answer: &str) -> bool {
+    let lower = answer.to_lowercase();
+    lower.contains("content_length")
+        || lower.contains("contentlength")
+        || lower.contains("content-length")
+        || (lower.contains("\"status\"") && lower.contains("parsed"))
 }
 
 fn guess_from_description(description: &str) -> String {

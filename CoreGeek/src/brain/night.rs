@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use crate::brain::{combat, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan};
+use crate::brain::{combat, stand_cells, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan};
 use crate::model::{chebyshev, Turn, Unit, UnitKind};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
@@ -117,13 +117,52 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         let adjacent = dist <= 1;
         let mut targets_count: usize = 0;
         let mut fired = false;
-        // Survival first: a badly hurt operator heals instead of firing or
-        // walking this round — a dead controller mans nothing.
-        if let Some(cmd) = crate::brain::day::use_medicine(controller) {
-            plan.push(controller.id, cmd);
-        } else if adjacent {
-            // Man the tower: attack commands are keyed by the TOWER's id.
-            if tower.cooldown == 0 {
+
+        if !adjacent {
+            // NIGHT RECALL (recurring defect): a controller not adjacent to its
+            // tower MUST move there, outranking every other night duty (heal,
+            // items, shelter, economy). Battle pk575098 / pk575557 left towers
+            // idle all night because their operators were never recalled — this
+            // runs every round until the controller is adjacent.
+            let stands = tower_stand_cells(turn, tower.pos);
+            let mut moved = false;
+            if let Some(cmd) = walk_or_remove_wall(turn, controller, &stands, &mut claimed) {
+                plan.push(controller.id, cmd);
+                moved = true;
+            } else {
+                // Fallback: ignore claimed cells, take any reachable step so a
+                // teammate's committed move never freezes the recall.
+                let mut ignored = HashSet::new();
+                if let Some(cmd) = walk_or_remove_wall(turn, controller, &stands, &mut ignored) {
+                    plan.push(controller.id, cmd);
+                    moved = true;
+                }
+            }
+            // Last resort: if the inner stand cells are walled over, any
+            // walkable cell adjacent to the tower still lets the operator fire.
+            if !moved {
+                let any_stands = stand_cells(turn, tower.pos);
+                if let Some(cmd) = walk_or_remove_wall(turn, controller, &any_stands, &mut claimed) {
+                    plan.push(controller.id, cmd);
+                    moved = true;
+                }
+            }
+            crate::log::event(
+                "night_recall",
+                serde_json::json!({
+                    "round": turn.round_no,
+                    "controller": controller.id,
+                    "tower": tower.id,
+                    "dist": dist,
+                    "moved": moved,
+                }),
+            );
+        } else {
+            // Adjacent: a badly hurt operator heals first (a dead one mans
+            // nothing), otherwise man the tower.
+            if let Some(cmd) = crate::brain::day::use_medicine(controller) {
+                plan.push(controller.id, cmd);
+            } else if tower.cooldown == 0 {
                 if let Some(targets) = combat::choose_attack(turn, tower, &mut sim) {
                     targets_count = targets.len();
                     fired = true;
@@ -131,20 +170,6 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 }
             }
             // The controller holds position (no command) to stay adjacent.
-        } else {
-            let stands = tower_stand_cells(turn, tower.pos);
-            // Try walking while respecting claimed cells (soft preference).
-            if let Some(cmd) = walk_or_remove_wall(turn, controller, &stands, &mut claimed) {
-                plan.push(controller.id, cmd);
-            } else {
-                // Fallback: ignore claimed cells, take any reachable step.
-                // This prevents controllers getting stuck when a teammate's
-                // committed step blocks the only available path.
-                let mut ignored = HashSet::new();
-                if let Some(cmd) = walk_or_remove_wall(turn, controller, &stands, &mut ignored) {
-                    plan.push(controller.id, cmd);
-                }
-            }
         }
         // One diagnostic line per pair per round: makes "weapon unoperated"
         // failures visible in the stdout JSONL log without a debugger.

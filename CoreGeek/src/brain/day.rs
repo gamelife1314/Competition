@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use crate::brain::{economy, night, stand_cells, task, tower_stand_cells, treasure, walk_or_remove_wall, walk_toward, Plan};
-use crate::model::{chebyshev, footprint_distance, station_footprint, Turn, Unit, STONE, WEAPON_BUILD_COST};
+use crate::model::{chebyshev, footprint_distance, station_footprint, Turn, Unit, DAY_ROUNDS, STONE, WEAPON_BUILD_COST};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::{BotState, TaskSession};
 
@@ -25,6 +25,13 @@ const STONE_BATCH: i64 = 6;
 /// spending the whole day on the wall line.
 const WALL_DAILY_CAP: i64 = 6;
 
+/// Gold reserved for tower builds. We build 1-2 towers first and keep the
+/// rest for wall repair kits, medicine and upgrades — never all three slots
+/// at once (battle pk575557 spent 75g on three towers and had nothing left).
+pub fn tower_build_reserve(tower_count: usize, gap_count: usize) -> i64 {
+    ((2 - tower_count as i64).max(0)).min(gap_count as i64) * WEAPON_BUILD_COST
+}
+
 pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let mut plan = Plan::default();
     let mut claimed: HashSet<Pos> = HashSet::new();
@@ -36,8 +43,9 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let wall_demand = (wall_gaps.len() as i64).min(WALL_DAILY_CAP);
     let stone_demand = (wall_demand - economy::team_ores(turn, STONE)).max(0);
     // Gold reserved for finishing the tower build-out is untouchable by the
-    // shopping list — defenses come before consumables.
-    let build_reserve = tower_gaps.len() as i64 * WEAPON_BUILD_COST;
+    // shopping list — defenses come before consumables, but only for the 1-2
+    // towers we actually build (never all three slots at once).
+    let build_reserve = tower_build_reserve(turn.towers().len(), tower_gaps.len());
     let shopping = economy::shopping_list(turn, state, build_reserve);
 
     // Buyer assignment: a dedicated WORKER so voucher purchases are never
@@ -126,7 +134,16 @@ fn worker_day(
     if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == role.id).map(|(_, tower)| *tower) {
         if let Some(tower) = turn.role_by_id(tower_id) {
             let dist = chebyshev(role.pos, tower.pos);
-            if turn.in_day_round >= preposition_round(dist) {
+            // The dedicated economy worker keeps the collect→sell→buy loop
+            // running until the last day rounds (so gold never freezes during
+            // tasks); everyone else retreats by dusk. The unconditional night
+            // recall still guarantees arrival even if this lands late.
+            let deadline = if Some(role.id) == economy_id {
+                (DAY_ROUNDS - 1 - dist as i64).max(0)
+            } else {
+                preposition_round(dist)
+            };
+            if turn.in_day_round >= deadline {
                 if dist > 1 {
                     let stands = tower_stand_cells(turn, tower.pos);
                     if let Some(cmd) = walk_or_remove_wall(turn, role, &stands, claimed) {
@@ -620,15 +637,15 @@ pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
         Pos { x: xmax + 2, y: ymin - 1 },
         Pos { x: xmax + 3, y: ymin - 1 },
     ];
-    let mut cells: Vec<Pos> = ring_cells(&footprint, 3);
-    cells.extend(ring_cells(&footprint, 2));
-    // U-shaped build order: furthest-from-the-gate cells go up first (the far
-    // wall and the two flanks of the U), the cells nearest the gate last — the
-    // entrance corridor is the last thing a closing U would block, so roles
-    // can always return. A deterministic tiebreak (x then y) keeps the flanks
-    // growing together instead of one side racing ahead.
+    let mut cells: Vec<Pos> = ring_cells(&footprint, 2); // inner box first: a tight enclosure around the base
+    cells.extend(ring_cells(&footprint, 3)); // outer ring second
+    // Box-first build order: the inner ring (a tight 2-cell box around the
+    // base) closes before the outer ring scatters far away; within each ring,
+    // furthest-from-the-gate goes up first so the entrance corridor is the last
+    // thing to close. A deterministic (x,y) tiebreak keeps the flanks together.
     cells.sort_by_key(|pos| {
-        (std::cmp::Reverse(chebyshev(*pos, gate[0])), pos.x, pos.y)
+        let ring = footprint_distance(*pos, &footprint);
+        (ring, std::cmp::Reverse(chebyshev(*pos, gate[0])), pos.x, pos.y)
     });
 
     let existing_walls: HashSet<Pos> = turn.walls().iter().map(|wall| wall.pos).collect();

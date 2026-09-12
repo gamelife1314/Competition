@@ -109,20 +109,21 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         .iter()
         .filter(|wall| wall.health < crate::brain::combat::wall_max_hp(wall.level))
         .count() as i64;
-    if damaged_walls > 0 && stock_of(turn, "WallFixer") < damaged_walls.min(4) {
+    if damaged_walls > 0 && stock_of(turn, "WallFixer") < damaged_walls.min(6) {
         needs.push(Need {
             name: "WallFixer".into(),
-            num: (damaged_walls.min(4) - stock_of(turn, "WallFixer")).min(gold / 10),
+            num: (damaged_walls.min(6) - stock_of(turn, "WallFixer")).min(gold / 10),
             priority: 3,
         });
     }
-    // Medicine only when someone is actually hurt.
+    // Medicine only when someone is actually hurt (keep a spare so a second
+    // injury doesn't force a fresh 10g trip).
     let injured = turn.controllable().iter().any(|role| {
         let max_hp = if role.kind == UnitKind::Worker { 220 } else { 200 };
         role.health * 10 < max_hp * 8
     });
-    if injured && stock_of(turn, "Medicine") < 1 {
-        needs.push(Need { name: "Medicine".into(), num: 1, priority: 2 });
+    if injured && stock_of(turn, "Medicine") < 2 {
+        needs.push(Need { name: "Medicine".into(), num: 2 - stock_of(turn, "Medicine"), priority: 2 });
     }
     // (Treasure sacrifice items are bought exclusively by the pioneer inside
     // treasure.rs — summonTreasure requires the items in the pioneer's pack.)

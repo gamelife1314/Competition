@@ -297,6 +297,10 @@ impl BotState {
         if just_submitted && turn.error_codes.iter().any(|code| *code == 2) {
             self.task.wrong_answers = self.task.wrong_answers.saturating_add(1);
             self.task.stage = TaskStage::Planning;
+            // The rejected answer's script must not be reused by the next task
+            // of the same type (instant re-accept with stale state).
+            let failed_type = self.task.task_type.clone();
+            self.drop_sop_for(&failed_type);
         }
     }
 
@@ -341,10 +345,12 @@ impl BotState {
                 }),
             );
         }
-        // Cache the working command as an SOP (if any) so the next task reuses
-        // it. The immediate success path already cached it via `cache_sop`;
-        // this also covers a task that timed out right after producing an answer.
-        self.cache_sop();
+        // Cache the working command as an SOP only if its answer was never
+        // rejected — a wrong-answer script would poison the next task of the
+        // same type (the "re-accept same type with stale state" loop).
+        if self.task.wrong_answers == 0 {
+            self.cache_sop();
+        }
         self.task = TaskSession::default();
     }
 
@@ -361,9 +367,8 @@ impl BotState {
     }
 
     /// Cache the last executed task command as an SOP (deduped) once it has
-    /// produced an answer. Called both on success and at task end, so a
-    /// working script immediately helps the NEXT task instead of only being
-    /// remembered after the task formally finishes.
+    /// produced an answer. Called at task end (only for answers that were never
+    /// rejected), so the NEXT task of the same type can reuse the script.
     pub fn cache_sop(&mut self) {
         if self.task.best_answer.is_empty() {
             return; // the command never produced an answer: don't cache it
@@ -400,6 +405,19 @@ impl BotState {
             .max_by_key(|entry| {
                 entry.keywords.iter().filter(|kw| keywords.contains(*kw)).count()
             })
+    }
+
+    /// Drop every cached SOP for a task type whose answer was just rejected, so
+    /// the next task of that type does not instantly reuse the broken script.
+    pub fn drop_sop_for(&mut self, task_type: &str) {
+        if task_type.is_empty() {
+            return;
+        }
+        let before = self.sop_cache.len();
+        self.sop_cache.retain(|entry| entry.task_type != task_type);
+        if self.sop_cache.len() != before {
+            crate::log::event("sop_dropped", serde_json::json!({"taskType": task_type}));
+        }
     }
 
     fn absorb_treasure_events(&mut self, turn: &Turn) {

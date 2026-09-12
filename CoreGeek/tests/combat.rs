@@ -707,10 +707,10 @@ fn dying_worker_heals_first() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn wall_gaps_builds_outer_ring_first_and_leaves_gate_open() {
-    // Two-cell-thick ring: the entrance corridor (one cell per ring) is never
-    // built, and the FURTHEST cells (outer ring) come first so the gate stays
-    // open until every role has retreated inside.
+fn wall_gaps_builds_inner_box_first_and_leaves_gate_open() {
+    // A tight box (the distance-2 inner ring) must close around the base before
+    // the outer ring scatters far away — battle pk575557 left walls scattered
+    // with no enclosure. The entrance corridor stays open either way.
     let probe = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
     let state = BotState::default();
     let gaps = coregeek::brain::day::wall_gaps(&probe, &state);
@@ -720,8 +720,8 @@ fn wall_gaps_builds_outer_ring_first_and_leaves_gate_open() {
     let footprint = coregeek::model::station_footprint(Pos { x: 10, y: 20 });
     assert_eq!(
         coregeek::model::footprint_distance(gaps[0], &footprint),
-        3,
-        "furthest (outer) ring builds before the inner ring"
+        2,
+        "inner box (distance 2) builds before the outer ring"
     );
 }
 
@@ -919,6 +919,7 @@ fn build_prompt_includes_task_environment_path() {
     let prompt = coregeek::brain::task::build_prompt(&state, &turn);
     assert!(prompt.contains("/tmp/selfEvolutionTask/"), "prompt names the task directory");
     assert!(prompt.contains("find /tmp/selfEvolutionTask/"), "prompt suggests listing files first");
+    assert!(prompt.contains("maxdepth 4"), "prompt searches nested subdirectories");
     assert!(prompt.contains(&state.task.description), "prompt still carries the task description");
 }
 
@@ -983,4 +984,136 @@ fn exploratory_cmd_output_is_not_an_answer() {
         "find/ls output must not be treated as an answer"
     );
     assert!(state.task.best_answer.is_empty(), "no answer was extracted");
+}
+
+// ---------------------------------------------------------------------------
+// Issues #10/#11: unconditional night recall, meta-answer filtering, task
+// retry/reset, and economy reserve/wall-box fixes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn night_recall_outranks_heal() {
+    // A badly hurt operator with a Medicine in hand must still walk to its
+    // tower instead of healing — the recall outranks every other night duty.
+    // Battle pk575098 / pk575557 left towers idle all night because healing
+    // (and other duties) swallowed the recall round.
+    let hurt_worker = json!({
+        "id": 10010, "pos": {"x": 20, "y": 20}, "roleType": "worker",
+        "health": 50, "attackPower": 0, "attackRange": 0,
+        "backPackCapability": 100, "backpack": ["Medicine"]
+    });
+    let turn = turn_from(world(vec![gatling(10020, 5, 5, 1), hurt_worker], vec![]));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("operator acts");
+    assert_eq!(cmd.action, "move", "recall outranks healing");
+}
+
+#[test]
+fn night_recall_moves_every_round_until_adjacent() {
+    // A controller 2 cells away gets a move; once adjacent it stops being
+    // issued moves — the recall runs every round until it lands.
+    let turn_far = turn_from(world(vec![gatling(10020, 5, 5, 1), worker(10010, 7, 7)], vec![]));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn_far, &mut state);
+    let cmd = plan.commands.get(&10010).expect("far operator acts");
+    assert_eq!(cmd.action, "move", "controller 2+ cells away walks toward its tower");
+
+    let turn_near = turn_from(world(vec![gatling(10020, 5, 5, 1), worker(10010, 6, 5)], vec![]));
+    let mut state2 = BotState::default();
+    let plan2 = coregeek::brain::night::plan(&turn_near, &mut state2);
+    assert!(
+        !matches!(plan2.commands.get(&10010).map(|c| c.action.as_str()), Some("move")),
+        "adjacent controller is not issued a move"
+    );
+}
+
+#[test]
+fn is_meta_answer_detects_parsing_descriptions() {
+    assert!(coregeek::brain::task::is_meta_answer("{\"status\":\"parsed\",\"content_length\":534}"));
+    assert!(coregeek::brain::task::is_meta_answer("contentLength 123"));
+    assert!(!coregeek::brain::task::is_meta_answer("{\"city\":\"Beijing\",\"count\":3}"));
+}
+
+#[test]
+fn meta_answer_is_not_submitted() {
+    // The LLM echoes a parsing step ({"status":"parsed","content_length":...})
+    // instead of the answer. It must NOT be submitted: the task re-plans.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.stage = coregeek::state::TaskStage::WaitingCmdResult { attempts: 0 };
+    coregeek::brain::task::on_cmd_result(
+        &mut state,
+        "[exitCode:0]\nANSWER: {\"status\":\"parsed\",\"content_length\":534}",
+    );
+    assert!(
+        matches!(state.task.stage, coregeek::state::TaskStage::Planning),
+        "meta answer is filtered, task re-plans"
+    );
+    assert!(state.task.best_answer.is_empty(), "no answer is kept");
+}
+
+#[test]
+fn finish_task_does_not_cache_rejected_answer() {
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "count files in directory".into();
+    state.task.best_answer = "42".into();
+    state.task.cmd_history = vec!["ls | wc -l".into()];
+    state.task.wrong_answers = 1;
+    state.finish_task();
+    assert!(!state.task.active, "task is reset");
+    assert!(state.sop_cache.is_empty(), "rejected answer is never cached");
+}
+
+#[test]
+fn finish_task_caches_unrejected_answer() {
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "count files in directory".into();
+    state.task.best_answer = "42".into();
+    state.task.cmd_history = vec!["ls | wc -l".into()];
+    state.finish_task();
+    assert!(!state.task.active, "task is reset");
+    assert!(!state.sop_cache.is_empty(), "working answer is cached for reuse");
+}
+
+#[test]
+fn rejected_answer_drops_cached_sop_and_keeps_task_active() {
+    // A cached SOP for a task type whose answer was just rejected must be
+    // dropped, and the task must stay active for a retry (the "instant
+    // re-accept same type with stale state" loop).
+    let mut state = BotState::default();
+    state.sop_cache.push(coregeek::state::SopEntry {
+        task_type: "自进化类1".into(),
+        keywords: vec!["count".into(), "files".into()],
+        script: "ls | wc -l".into(),
+    });
+    state.task.active = true;
+    state.task.accepted_round = 5;
+    state.task.timeout_round = 300;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "count files".into();
+    state.task.stage = coregeek::state::TaskStage::WaitingSubmit { attempts: 0 };
+
+    let mut payload = day_world_at(6, vec![pioneer_with(vec![])], 0, vec![], vec![]);
+    payload["errors"] = json!([{"errorCode": 2}]);
+    let turn = turn_from(payload);
+    state.observe(&turn);
+
+    assert!(state.task.active, "rejected task stays active for retry");
+    assert_eq!(state.task.wrong_answers, 1, "wrong-answer counter increments");
+    assert!(matches!(state.task.stage, coregeek::state::TaskStage::Planning), "re-plan after rejection");
+    assert!(state.sop_cache.is_empty(), "rejected type's SOP is dropped");
+}
+
+#[test]
+fn tower_build_reserve_covers_two_towers_not_three() {
+    // Battle pk575557 all-in'd 75g on three towers and starved every consumable.
+    // The reserve must cover only the 1-2 towers we actually build.
+    assert_eq!(coregeek::brain::day::tower_build_reserve(0, 3), 50);
+    assert_eq!(coregeek::brain::day::tower_build_reserve(1, 2), 25);
+    assert_eq!(coregeek::brain::day::tower_build_reserve(2, 1), 0, "no third tower until an upgrade");
 }
