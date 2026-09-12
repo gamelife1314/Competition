@@ -10,7 +10,7 @@ pub mod treasure;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{neighbours, Turn, Unit};
+use crate::model::{chebyshev, neighbours, Turn, Unit};
 use crate::protocol::{Pos, Request, Response, RoleCommand};
 use crate::state::{BotState, IssuedCmd};
 
@@ -154,6 +154,8 @@ fn log_round(
             "cmds": cmds,
             "failures": failures,
             "errors": turn.error_codes,
+            "phaseTask": crate::log::brief(&turn.phase_task, 160),
+            "lastCmdResult": crate::log::brief(&turn.last_cmd_result, 160),
             "promptChars": prompt.as_ref().map(String::len).unwrap_or(0),
             "execChars": execute_cmd.as_ref().map(String::len).unwrap_or(0),
             "llmToday": state.llm_used_today,
@@ -202,4 +204,52 @@ pub fn walk_toward(
     let step = crate::path::step_toward_stands(turn, role.pos, &usable, &blocked)?;
     claimed.insert(step);
     Some(RoleCommand::move_to(step))
+}
+
+/// Walkable cells from which a controller can OPERATE a tower, restricted to
+/// the inside of the wall ring. Plain `stand_cells` would also return the
+/// tower's outer neighbours (footprint distance 2) — those sit exactly on the
+/// wall ring and get walled over, which is what trapped workers outside. The
+/// wall layout leaves at least two inner cells per tower, so a weapon can
+/// never be fully enclosed.
+pub fn tower_stand_cells(turn: &Turn, tower_pos: Pos) -> Vec<Pos> {
+    let all = stand_cells(turn, tower_pos);
+    let Some(station) = turn.station() else { return all };
+    let footprint = station.footprint();
+    let inner: Vec<Pos> = all
+        .iter()
+        .copied()
+        .filter(|pos| crate::model::footprint_distance(*pos, &footprint) <= 1)
+        .collect();
+    if inner.len() >= 2 {
+        inner
+    } else {
+        all
+    }
+}
+
+/// Walk toward `stands`; when the pathfinder finds no route (our own wall
+/// ring has sealed us out), demolish an adjacent wall of ours to reopen the
+/// way. A role already standing on a usable cell returns None (no movement
+/// needed) rather than tearing down a wall needlessly.
+pub fn walk_or_remove_wall(
+    turn: &Turn,
+    role: &Unit,
+    stands: &[Pos],
+    claimed: &mut HashSet<Pos>,
+) -> Option<RoleCommand> {
+    if stands.iter().any(|stand| *stand == role.pos) {
+        return None;
+    }
+    if let Some(cmd) = walk_toward(turn, role, stands, claimed) {
+        return Some(cmd);
+    }
+    turn.walls()
+        .into_iter()
+        .map(|wall| wall.pos)
+        .filter(|pos| chebyshev(role.pos, *pos) == 1)
+        .min_by_key(|pos| {
+            stands.iter().map(|stand| chebyshev(*pos, *stand)).min().unwrap_or(i32::MAX)
+        })
+        .map(|pos| RoleCommand::remove(pos))
 }

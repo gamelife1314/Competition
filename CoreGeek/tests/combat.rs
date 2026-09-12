@@ -701,3 +701,135 @@ fn dying_worker_heals_first() {
     assert_eq!(cmd.action, "use");
     assert_eq!(cmd.name.as_deref(), Some("Medicine"), "dying worker heals first");
 }
+
+// ---------------------------------------------------------------------------
+// Problem 4 (Issue #3): workers trapped outside the wall ring + economy stall
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wall_gaps_builds_outer_ring_first_and_leaves_gate_open() {
+    // Two-cell-thick ring: the entrance corridor (one cell per ring) is never
+    // built, and the FURTHEST cells (outer ring) come first so the gate stays
+    // open until every role has retreated inside.
+    let probe = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
+    let state = BotState::default();
+    let gaps = coregeek::brain::day::wall_gaps(&probe, &state);
+    assert!(!gaps.is_empty(), "wall gaps exist");
+    let gate = [Pos { x: 13, y: 18 }, Pos { x: 14, y: 18 }];
+    assert!(gate.iter().all(|cell| !gaps.contains(cell)), "gate cells stay open");
+    let footprint = coregeek::model::station_footprint(Pos { x: 10, y: 20 });
+    assert_eq!(
+        coregeek::model::footprint_distance(gaps[0], &footprint),
+        3,
+        "furthest (outer) ring builds before the inner ring"
+    );
+}
+
+#[test]
+fn trapped_worker_removes_wall_to_escape() {
+    // A worker sealed into a one-cell pocket by its own wall cannot pathfind
+    // out — walk_or_remove_wall must fall back to demolishing the wall.
+    let wall_unit = json!({
+        "id": 10050, "pos": {"x": 3, "y": 2}, "roleType": "wall",
+        "health": 1000, "attackPower": 0, "attackRange": 0,
+        "level": 1, "backPackCapability": 0, "backpack": []
+    });
+    let mut zones = Vec::new();
+    for (zx, zy) in [(1, 1), (2, 1), (3, 1), (1, 2), (1, 3), (2, 3), (3, 3)] {
+        zones.push(zone(zx, zy, "iron"));
+    }
+    let turn = turn_from(world_zones(vec![worker(10010, 2, 2), wall_unit], vec![], zones));
+    let role = turn.role_by_id(10010).unwrap();
+    let stands = vec![Pos { x: 4, y: 2 }];
+    let mut claimed = std::collections::HashSet::new();
+    let cmd = coregeek::brain::walk_or_remove_wall(&turn, role, &stands, &mut claimed)
+        .expect("worker demolishes the wall");
+    assert_eq!(cmd.action, "remove");
+    assert_eq!(
+        cmd.targetPos.as_ref().and_then(|list| list.first()).copied(),
+        Some(Pos { x: 3, y: 2 }),
+        "the blocking wall is the demolition target"
+    );
+}
+
+#[test]
+fn task_description_persists_when_phase_task_clears() {
+    // The judger sometimes stops echoing phaseTask while the task is still
+    // live. A cleared field must NOT end the task or erase the description —
+    // that was the 97 acceptTask / 0 submitAnswer spin.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.description = "请实现一个排序函数".into();
+    state.task.description_round = 5;
+    state.task.accepted_round = 5;
+    state.task.timeout_round = 300;
+    state.task.stage = coregeek::state::TaskStage::Planning;
+
+    let turn = turn_from(day_world_at(20, vec![station(10, 20, 1)], 0, vec![], vec![]));
+    state.observe(&turn);
+
+    assert!(state.task.active, "cleared phaseTask must not end the task");
+    assert_eq!(state.task.description, "请实现一个排序函数", "description must persist");
+}
+
+#[test]
+fn economy_holds_gold_reserve_for_main_weapon_upgrade() {
+    let no_tower = turn_from(day_world_at(5, vec![station(10, 20, 1)], 25, vec![], vec![]));
+    assert!(coregeek::brain::economy::may_build_weapon(&no_tower), "first weapon builds with 25g");
+
+    let one_tower = turn_from(day_world_at(
+        5,
+        vec![station(10, 20, 1), gatling(10020, 10, 10, 1)],
+        25,
+        vec![],
+        vec![],
+    ));
+    assert!(coregeek::brain::economy::may_build_weapon(&one_tower), "second weapon builds with 25g");
+
+    // Two level-1 weapons: the gold must be reserved for the main weapon's
+    // WeaponUpgradeVoucher1 instead of a third level-1 weapon.
+    let two_l1 = turn_from(day_world_at(
+        5,
+        vec![station(10, 20, 1), gatling(10020, 10, 10, 1), railgun(10030, 12, 10, 1)],
+        25,
+        vec![],
+        vec![],
+    ));
+    assert!(!coregeek::brain::economy::may_build_weapon(&two_l1), "reserve held for upgrade voucher");
+
+    // Once the main weapon is level 2, more weapons may be built while gold
+    // still leaves the 25g reserve untouched.
+    let two_with_l2 = turn_from(day_world_at(
+        5,
+        vec![station(10, 20, 1), gatling(10020, 10, 10, 2), railgun(10030, 12, 10, 1)],
+        50,
+        vec![],
+        vec![],
+    ));
+    assert!(coregeek::brain::economy::may_build_weapon(&two_with_l2), "level-2 main weapon unlocks more builds");
+}
+
+#[test]
+fn worker_keeps_gold_reserve_for_weapon_upgrade() {
+    // Two level-1 weapons + 25g, with a worker standing right next to the open
+    // rocket slot: the gold must be held for the main weapon's upgrade voucher,
+    // so the worker must NOT build a third level-1 weapon.
+    let turn = turn_from(day_world_at(
+        5,
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 5, 5, 1),
+            railgun(10030, 7, 7, 1),
+            worker(10010, 12, 19), // adjacent to the rocket gap at (12,18)
+        ],
+        25,
+        vec![],
+        vec![],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    assert!(
+        plan.commands.values().all(|cmd| cmd.action != "build"),
+        "gold reserved for the upgrade: no third level-1 weapon"
+    );
+}

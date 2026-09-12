@@ -2,16 +2,22 @@
 
 use std::collections::HashSet;
 
-use crate::model::{chebyshev, Unit, UnitKind, Turn, ORES, STONE};
+use crate::model::{chebyshev, Unit, UnitKind, Turn, ORES, STONE, WEAPON_BUILD_COST};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
 
-pub const SELL_BATCH: i64 = 20;
+/// Sell a stack once this many ore accumulate — small enough that gold flows
+/// every few rounds instead of sitting in a full backpack until dusk.
+pub const SELL_BATCH: i64 = 8;
 pub const STONE_BUFFER: i64 = 2;
 
 /// First day round (in_day_round) of the "dusk" window: mining stops and every
 /// ore is converted to gold so the night is spent upgrading, not digging.
 pub const DUSK_ROUND: i64 = 55;
+
+/// Gold kept out of new weapon builds so the main weapon's level-2 upgrade
+/// (WeaponUpgradeVoucher1, 100g) is never starved by a third level-1 weapon.
+pub const WEAPON_UPGRADE_RESERVE: i64 = 25;
 
 #[derive(Debug, Clone)]
 pub struct Need {
@@ -35,6 +41,18 @@ pub fn team_ores(turn: &Turn, ore: &str) -> i64 {
     turn.controllable().iter().map(|role| role.count_item(ore) as i64).sum()
 }
 
+/// Whether we may spend 25g building another weapon this round. Build 1-2
+/// weapons first (a gold reserve must survive), then stop until the main
+/// weapon reaches level 2 — a level-2 weapon out-values a third level-1
+/// weapon, and the gold is better spent on WeaponUpgradeVoucher1.
+pub fn may_build_weapon(turn: &Turn) -> bool {
+    let towers = turn.towers();
+    if towers.len() < 2 {
+        return turn.gold >= WEAPON_BUILD_COST;
+    }
+    towers.iter().any(|tower| tower.level >= 2) && turn.gold >= WEAPON_BUILD_COST + WEAPON_UPGRADE_RESERVE
+}
+
 /// What we should buy right now, ordered by priority and filtered by gold.
 /// `reserve` is gold set aside for tower builds (25/each) — spending it on
 /// consumables would stall the defense build-out.
@@ -42,8 +60,8 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     let mut needs: Vec<Need> = Vec::new();
     let gold = (turn.gold - reserve).max(0);
 
-    // Weapon upgrade vouchers: biggest defensive win per gold.
-    // Buy enough vouchers for ALL towers that need upgrading, not just one.
+    // Weapon upgrade vouchers: biggest defensive win per gold. One at a time —
+    // upgrade the main weapon first, then reassess.
     for voucher in ["WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2"] {
         let want_level = if voucher.ends_with('1') { 1 } else { 2 };
         let need_count = turn
@@ -52,7 +70,7 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             .filter(|tower| tower.level == want_level)
             .count() as i64;
         let have_count = stock_of(turn, voucher);
-        let deficit = (need_count - have_count).max(0);
+        let deficit = (need_count - have_count).max(0).min(1);
         if deficit > 0 {
             needs.push(Need {
                 name: voucher.into(),
@@ -188,6 +206,21 @@ pub fn should_sell(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i64
     let ores = total_ores(role);
     if ores == 0 {
         return false;
+    }
+    // Already at the vendor: never walk away with a half-sold backpack —
+    // convert every sellable ore before leaving (stones stay held for walls).
+    let at_vendor = turn.vendors().iter().any(|vendor| chebyshev(role.pos, *vendor) == 1);
+    if at_vendor {
+        for ore in ORES {
+            if role.count_item(ore) == 0 {
+                continue;
+            }
+            if ore == STONE && team_ores(turn, STONE) <= stone_demand + STONE_BUFFER {
+                continue;
+            }
+            return true;
+        }
+        return false; // only held-back stone remains: nothing to sell here
     }
     // Dusk: stop stockpiling — convert every ore to gold before nightfall.
     if turn.in_day_round >= DUSK_ROUND {

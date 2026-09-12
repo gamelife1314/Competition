@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use crate::brain::{combat, stand_cells, task, walk_toward, Plan};
+use crate::brain::{combat, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan};
 use crate::model::{chebyshev, Turn, Unit, UnitKind};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
@@ -132,16 +132,16 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             }
             // The controller holds position (no command) to stay adjacent.
         } else {
-            let stands = stand_cells(turn, tower.pos);
+            let stands = tower_stand_cells(turn, tower.pos);
             // Try walking while respecting claimed cells (soft preference).
-            if let Some(cmd) = walk_toward(turn, controller, &stands, &mut claimed) {
+            if let Some(cmd) = walk_or_remove_wall(turn, controller, &stands, &mut claimed) {
                 plan.push(controller.id, cmd);
             } else {
                 // Fallback: ignore claimed cells, take any reachable step.
                 // This prevents controllers getting stuck when a teammate's
                 // committed step blocks the only available path.
                 let mut ignored = HashSet::new();
-                if let Some(cmd) = walk_toward(turn, controller, &stands, &mut ignored) {
+                if let Some(cmd) = walk_or_remove_wall(turn, controller, &stands, &mut ignored) {
                     plan.push(controller.id, cmd);
                 }
             }
@@ -159,6 +159,8 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 "attack_targets": targets_count,
                 "tower_id": *tower_id,
                 "controller_id": *controller_id,
+                "controller_pos": controller.pos,
+                "tower_pos": tower.pos,
                 "fired": fired,
             }),
         );

@@ -4,17 +4,17 @@
 
 use std::collections::HashSet;
 
-use crate::brain::{economy, night, stand_cells, task, treasure, walk_toward, Plan};
+use crate::brain::{economy, night, stand_cells, task, tower_stand_cells, treasure, walk_or_remove_wall, walk_toward, Plan};
 use crate::model::{chebyshev, footprint_distance, station_footprint, Turn, Unit, DAY_ROUNDS, STONE, WEAPON_BUILD_COST};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::{BotState, TaskSession};
 
 /// First day round (in_day_round) when a controller must drop everything and
 /// walk to its tower, so it arrives adjacent (chebyshev <= 1) by the first
-/// night round. `dist - 1` moves are needed (one per round) plus two rounds of
-/// slack for blocked cells and detours.
+/// night round. `dist - 1` moves are needed (one per round) plus three rounds
+/// of slack for blocked cells, detours and the now-thicker wall line.
 fn preposition_round(dist: i32) -> i64 {
-    (DAY_ROUNDS - 1 - dist as i64).max(0)
+    (DAY_ROUNDS - 1 - dist as i64 - 3).max(0)
 }
 /// Stones to carry before walking out to the wall line (same as the demo).
 const STONE_BATCH: i64 = 6;
@@ -104,15 +104,25 @@ fn worker_day(
         return;
     }
     // 3. Build walls (stone) BEFORE weapons: the wall ring protects the base
-    //    and the roles standing behind it.
-    if role.count_item(STONE) > 0 && !wall_gaps.is_empty() {
-        // Build immediately when already standing next to a gap.
+    //    and the roles standing behind it. Building stops the moment any role
+    //    could no longer reach its night weapon — the gate stays open until
+    //    everyone has retreated inside, so we never wall ourselves out.
+    if role.count_item(STONE) > 0 && !wall_gaps.is_empty() && roles_can_reach(turn, pairs) {
+        // Build immediately when already standing next to a safe gap.
         let adjacent_site = wall_gaps
             .iter()
-            .find(|site| !claimed.contains(site) && chebyshev(role.pos, **site) == 1)
+            .find(|site| {
+                !claimed.contains(site)
+                    && chebyshev(role.pos, **site) == 1
+                    && !wall_would_trap(turn, pairs, **site)
+            })
             .copied();
         if let Some(site) = adjacent_site {
             claimed.insert(site);
+            crate::log::event(
+                "wall_build",
+                serde_json::json!({"role": role.id, "target": site, "stone": role.count_item(STONE)}),
+            );
             plan.push(role.id, RoleCommand::build(site, "wall"));
             return;
         }
@@ -120,19 +130,24 @@ fn worker_day(
         let batch = STONE_BATCH.min(wall_gaps.len() as i64).max(1);
         if role.count_item(STONE) as i64 >= batch {
             for site in wall_gaps {
-                if claimed.contains(site) {
+                if claimed.contains(site) || wall_would_trap(turn, pairs, *site) {
                     continue;
                 }
                 if let Some(cmd) = build_or_walk(turn, role, *site, "wall", claimed) {
                     claimed.insert(*site);
+                    crate::log::event(
+                        "wall_build",
+                        serde_json::json!({"role": role.id, "target": *site, "stone": role.count_item(STONE)}),
+                    );
                     plan.push(role.id, cmd);
                     return;
                 }
             }
         }
     }
-    // 4. Build weapons (gold) once the wall line is underway.
-    if turn.gold >= WEAPON_BUILD_COST {
+    // 4. Build weapons (gold) once the wall line is underway — but keep a
+    //    gold reserve so the main weapon's level-2 upgrade is never starved.
+    if economy::may_build_weapon(turn) {
         for (site, kind) in tower_gaps {
             if claimed.contains(site) {
                 continue;
@@ -167,13 +182,15 @@ fn worker_day(
         }
     }
     // 8. Pre-position near the assigned tower only in the final rounds, so
-    //    the first night round is spent firing instead of walking.
+    //    the first night round is spent firing instead of walking. Use the
+    //    inner stand cells (never walled over) and demolish a wall of ours if
+    //    the ring has already sealed us out.
     if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == role.id).map(|(_, tower)| *tower) {
         if let Some(tower) = turn.role_by_id(tower_id) {
             let dist = chebyshev(role.pos, tower.pos);
             if dist > 1 && turn.in_day_round >= preposition_round(dist) {
-                let stands = stand_cells(turn, tower.pos);
-                if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
+                let stands = tower_stand_cells(turn, tower.pos);
+                if let Some(cmd) = walk_or_remove_wall(turn, role, &stands, claimed) {
                     plan.push(role.id, cmd);
                     return;
                 }
@@ -229,12 +246,13 @@ fn pioneer_day(
         return;
     }
     // 6. Pre-position at the assigned tower (distance-aware deadline) so the
-    //    first night round is spent firing, not walking.
+    //    first night round is spent firing, not walking. The pioneer uses the
+    //    inner stand cells (never walled over); wall demolition stays worker-only.
     if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == pioneer.id).map(|(_, tower)| *tower) {
         if let Some(tower) = turn.role_by_id(tower_id) {
             let dist = chebyshev(pioneer.pos, tower.pos);
             if dist > 1 && turn.in_day_round >= preposition_round(dist) {
-                let stands = stand_cells(turn, tower.pos);
+                let stands = tower_stand_cells(turn, tower.pos);
                 if let Some(cmd) = walk_toward(turn, pioneer, &stands, claimed) {
                     plan.push(pioneer.id, cmd);
                     return;
@@ -389,6 +407,56 @@ fn build_or_walk(
     walk_toward(turn, role, &stands, claimed)
 }
 
+/// Is there a walkable route from `start` to any of `stands`? A role already
+/// standing on a stand cell counts as reachable (no move needed).
+fn can_reach(turn: &Turn, start: Pos, stands: &[Pos]) -> bool {
+    if stands.iter().any(|stand| *stand == start) {
+        return true;
+    }
+    let blocked = turn.blocked_for(-1);
+    crate::path::step_toward_stands(turn, start, stands, &blocked).is_some()
+}
+
+/// Stand cells of the tower a role is paired with for the coming night.
+fn night_goal(turn: &Turn, pairs: &[(i64, i64)], role_id: i64) -> Option<Vec<Pos>> {
+    let tower_id = pairs.iter().find(|(controller, _)| *controller == role_id).map(|(_, tower)| *tower)?;
+    let tower = turn.role_by_id(tower_id)?;
+    Some(tower_stand_cells(turn, tower.pos))
+}
+
+/// Every controllable role must still be able to reach its night weapon. If
+/// any can't, wall building must stop — the gate stays open until everyone is
+/// inside, so we never seal a role outside the ring.
+fn roles_can_reach(turn: &Turn, pairs: &[(i64, i64)]) -> bool {
+    for role in turn.controllable() {
+        if let Some(stands) = night_goal(turn, pairs, role.id) {
+            if !can_reach(turn, role.pos, &stands) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Would placing a wall at `site` cut any role off from its weapon? Simulate
+/// the wall and re-run the reachability check. Together with the
+/// far-side-first build order, this guarantees the ring is only ever closed
+/// after everyone has retreated inside.
+fn wall_would_trap(turn: &Turn, pairs: &[(i64, i64)], site: Pos) -> bool {
+    let mut blocked = turn.blocked_for(-1);
+    blocked.insert(site);
+    for role in turn.controllable() {
+        let Some(stands) = night_goal(turn, pairs, role.id) else { continue };
+        if stands.iter().any(|stand| *stand == role.pos) {
+            continue; // already at the weapon: nothing to trap
+        }
+        if crate::path::step_toward_stands(turn, role.pos, &stands, &blocked).is_none() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Walk to the nearest mine and collect. Stone is preferred while the wall
 /// line needs it; distance always beats ore value.
 fn mine_flow(
@@ -494,38 +562,38 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
     gaps
 }
 
-/// Desired wall cells: the ring at distance 2 from the station footprint in
-/// defensive order (bottom → left → top → right), leaving one entrance gap.
+/// Desired wall cells: a two-cell-thick ring (distance 3 outer + distance 2
+/// inner) ordered FURTHEST-from-the-gate first, so the far side builds up
+/// while the corridor stays open for the roles still outside. The two gate
+/// cells span both rings and are never built — the reachability guards in
+/// `worker_day` seal the ring only once every role is already inside.
 pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
     let Some(station) = turn.station() else { return Vec::new() };
     let footprint = station_footprint(station.pos);
     let xs: Vec<i32> = footprint.iter().map(|pos| pos.x).collect();
     let ys: Vec<i32> = footprint.iter().map(|pos| pos.y).collect();
-    let (xmin, xmax) = (*xs.iter().min().unwrap_or(&0), *xs.iter().max().unwrap_or(&0));
-    let (ymin, ymax) = (*ys.iter().min().unwrap_or(&0), *ys.iter().max().unwrap_or(&0));
+    let xmax = *xs.iter().max().unwrap_or(&0);
+    let ymin = *ys.iter().min().unwrap_or(&0);
 
-    let mut order: Vec<Pos> = Vec::new();
-    for x in (xmin - 2..=xmax + 2).rev() {
-        order.push(Pos { x, y: ymin - 2 });
-    }
-    for y in ymin - 1..=ymax + 1 {
-        order.push(Pos { x: xmin - 2, y });
-    }
-    for x in xmin - 2..=xmax + 2 {
-        order.push(Pos { x, y: ymax + 2 });
-    }
-    for y in (ymin - 1..=ymax + 1).rev() {
-        order.push(Pos { x: xmax + 2, y });
-    }
-    let entrance = Pos { x: xmax + 2, y: ymin - 1 };
+    // Two gate cells: one per ring, so the entrance corridor is two cells wide
+    // (a single-cell gate would still leave a wall between the two rings).
+    let gate: [Pos; 2] = [
+        Pos { x: xmax + 2, y: ymin - 1 },
+        Pos { x: xmax + 3, y: ymin - 1 },
+    ];
+    let mut cells: Vec<Pos> = ring_cells(&footprint, 3);
+    cells.extend(ring_cells(&footprint, 2));
+    // Furthest from the gate first: the open corridor is the LAST thing a
+    // closing ring would block, so this order keeps roles able to return.
+    cells.sort_by_key(|pos| std::cmp::Reverse(chebyshev(*pos, gate[0])));
 
     let existing_walls: HashSet<Pos> = turn.walls().iter().map(|wall| wall.pos).collect();
     let occupied: HashSet<Pos> =
         turn.ours.iter().flat_map(|unit| unit.footprint()).collect();
     let mut seen: HashSet<Pos> = HashSet::new();
-    order
+    cells
         .into_iter()
-        .filter(|pos| *pos != entrance && seen.insert(*pos))
+        .filter(|pos| !gate.contains(pos) && seen.insert(*pos))
         .filter(|pos| {
             turn.is_land(*pos)
                 && !existing_walls.contains(pos)

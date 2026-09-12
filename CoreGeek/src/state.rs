@@ -313,13 +313,13 @@ impl BotState {
                 }),
             );
         }
-        // Task ended: description was known but phaseTask cleared, or timeout
-        // error reported.
-        let ended_by_field = !self.task.description.is_empty()
-            && turn.phase_task.is_empty()
-            && turn.round_no > self.task.description_round;
+        // Task ended: only an explicit timeout (error code 1) or passing our
+        // own deadline ends the task. `phaseTask` clearing is NOT a signal —
+        // the judger sometimes stops echoing it while the task is still live,
+        // and treating it as "ended" caused the 97 acceptTask / 0 submitAnswer
+        // spin. The description stays cached so a cleared field never erases it.
         let ended_by_timeout = turn.error_codes.iter().any(|code| *code == 1);
-        if ended_by_field || ended_by_timeout || turn.round_no >= self.task.timeout_round {
+        if ended_by_timeout || turn.round_no >= self.task.timeout_round {
             self.finish_task();
         }
     }
