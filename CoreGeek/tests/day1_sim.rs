@@ -116,6 +116,8 @@ struct World {
     commands: Vec<(i64, i64, String)>,
     /// Ore sold per round, so a frozen economy is visible.
     gold_track: Vec<(i64, i64)>,
+    /// Every vein the planner dug this match, with the round it was dug from.
+    collects: Vec<(i64, Pos)>,
     /// Role id -> (round, position, backpack size), for diagnosing stalls.
     positions: HashMap<i64, Vec<(i64, Pos, i64)>>,
     /// This match's own cross-round memory. Private on purpose: the planner's
@@ -126,14 +128,21 @@ struct World {
 
 impl World {
     fn new() -> Self {
-        let mut zones: HashMap<Pos, String> = HashMap::new();
         // Stone close to the base (the wall line's food), iron/copper further
         // out so the economy has to choose, vendor and shop on the far side.
+        Self::with_stone(&[(16, 24), (16, 27), (18, 21), (20, 28)])
+    }
+
+    /// The same opening with the stone vein somewhere else. Issue #17 ran a
+    /// board where the mine was far enough that the day ended before the wall
+    /// crew ever reached it (14 collects, 0 walls, gold frozen at the 75 it
+    /// started with), so where the stone is cannot be a detail of the harness.
+    fn with_stone(stone: &[(i32, i32)]) -> Self {
+        let mut zones: HashMap<Pos, String> = HashMap::new();
+        for (x, y) in stone {
+            zones.insert(Pos { x: *x, y: *y }, "stone".to_string());
+        }
         for (x, y, kind) in [
-            (16, 24, "stone"),
-            (16, 27, "stone"),
-            (18, 21, "stone"),
-            (20, 28, "stone"),
             (22, 19, "iron"),
             (24, 30, "iron"),
             (26, 17, "copper"),
@@ -190,6 +199,7 @@ impl World {
             idle_rounds: HashMap::new(),
             commands: vec![],
             gold_track: vec![],
+            collects: vec![],
             positions: HashMap::new(),
             state: coregeek::state::BotState::default(),
         }
@@ -367,6 +377,7 @@ impl World {
                 let Some(ore) = self.zones.get(&target).cloned() else {
                     return;
                 };
+                self.collects.push((self.round, target));
                 if let Some(unit) = self.units.iter_mut().find(|unit| unit.id == id) {
                     if unit.backpack.len() as i64 >= unit.capacity {
                         return;
@@ -798,6 +809,97 @@ fn no_controller_is_ever_marooned_from_its_gun() {
                     .unwrap_or_default()
             ))
             .collect::<Vec<_>>()
+    );
+}
+
+/// A board whose stone is eight cells out instead of three: far enough that the
+/// wall crew has to commit to a trip, close enough that the trip can still pay
+/// for itself before dusk.
+fn stone_eight_cells_out() -> World {
+    World::with_stone(&[(21, 24), (21, 28), (19, 29), (23, 30)])
+}
+
+/// A board whose stone is on the far side of the map — twenty-two cells from
+/// the spawn, with the retreat deadline sixteen rounds closer than that. Issue
+/// #17 played on a board like this one: 0 walls, 14 collects, and a purse that
+/// never saw a coin.
+fn stone_out_of_reach() -> World {
+    World::with_stone(&[(36, 28), (37, 20), (38, 25), (35, 30)])
+}
+
+#[test]
+fn a_distant_stone_vein_still_puts_the_ring_up_before_nightfall() {
+    // Issue #17: "城墙体系彻底缺失（0 墙 vs 对手 101 次建墙）". The day-1 wall rule
+    // is a batch rule — `load_complete` wants RING_BATCH (20) stone in hand, or
+    // the team's stone to cover every gap, before a single wall goes down — and
+    // the batch is what makes a distant vein expensive: the whole trip (walk
+    // out, dig, walk back, place) has to finish before the crew must be at its
+    // guns, or the stone arrives after the night has already started. Here it
+    // does: the same opening with the vein eight cells further still walls the
+    // ring before dusk.
+    let mut world = stone_eight_cells_out();
+    while world.round <= DAY_END {
+        world.step();
+    }
+    report("distant stone", &world);
+    let ring = world.ring().len();
+    assert!(
+        world.wall_count() * 2 >= ring,
+        "the stone in the packs never became wall: {} collects, {} walls (ring {ring})",
+        world.collects.len(),
+        world.wall_count()
+    );
+    let closed = world
+        .ring_closed_round()
+        .expect("not one ring cell was ever walled");
+    assert!(
+        closed <= coregeek::brain::economy::DUSK_ROUND + 8,
+        "the last ring wall went up at R{closed}, after the night had started"
+    );
+}
+
+#[test]
+fn stone_out_of_reach_becomes_a_day_of_ore_that_sells() {
+    // The other half of issue #17: "我方仅 14 次 collect，金币峰值仅 75（初始值），
+    // 从未通过采矿获得增量收入". When the ring's stone cannot be brought home in
+    // time, the day is not a wall day — and the one thing it must not be is a
+    // march to the far side of the map. `stone_trip_fits` measures the trip
+    // against this role's own gun deadline: walk out, dig a load, walk back,
+    // and still be at the gun. A vein that fails that test is not a wall this
+    // day, so the crew mines ore that sells instead of stone that cannot.
+    let mut world = stone_out_of_reach();
+    let start = world.gold;
+    while world.round <= DAY_END {
+        world.step();
+    }
+    report("stone out of reach", &world);
+    let peak = world
+        .gold_track
+        .iter()
+        .map(|(_, gold)| *gold)
+        .max()
+        .unwrap_or(start);
+    assert!(
+        peak > start,
+        "day 1 never earned a coin: gold peaked at {peak}, the opening purse was {start}"
+    );
+    assert!(
+        world.commands.iter().any(|(_, _, a)| a == "sell"),
+        "the collect→sell→buy loop never ran; saw {:?}",
+        world.commands.iter().map(|(_, _, a)| a).collect::<Vec<_>>()
+    );
+    // No carrier walks to a vein it cannot come back from. The far veins sit 22
+    // to 25 cells from the spawn; the iron and copper it is worth digging sit
+    // inside 16.
+    let far: Vec<(i64, Pos)> = world
+        .collects
+        .iter()
+        .copied()
+        .filter(|(_, pos)| chebyshev(*pos, Pos { x: 10, y: 24 }) > 18)
+        .collect();
+    assert!(
+        far.is_empty(),
+        "the crew marched out to veins it could not carry home from: {far:?}"
     );
 }
 

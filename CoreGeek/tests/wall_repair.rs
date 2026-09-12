@@ -88,6 +88,7 @@ fn world(round_no: i64, roles: Vec<Value>, gold: i64) -> Value {
             "zones": [
                 {"pos": {"x": 38, "y": 3}, "neutralType": "weaponShop"},
                 {"pos": {"x": 2, "y": 3}, "neutralType": "stone"},
+                {"pos": {"x": 5, "y": 28}, "neutralType": "vendor"},
             ],
         },
         "teamOur": {
@@ -229,6 +230,58 @@ fn a_carried_wall_fixer_is_an_errand_not_a_coincidence() {
     assert!(
         chebyshev(step, vein) >= chebyshev(Pos { x: 9, y: 21 }, vein),
         "the step {step:?} is a mining step, not a repair errand"
+    );
+}
+
+#[test]
+fn the_economy_worker_sells_before_it_mends() {
+    // Two workers, and the higher id is the dedicated economy worker — the same
+    // rule `plan` uses to pick the buyer. That role is the collect→sell→buy
+    // loop, and it is also the role that walks to the shop and therefore ends up
+    // holding the kits; the repair has to yield to the sale rather than replace
+    // it, or the fix for issue #16 would spend the very loop that pays for it.
+    // The other worker takes the errand this round.
+    let damaged = Pos { x: 12, y: 22 };
+    let vendor = Pos { x: 5, y: 28 };
+    let turn = turn_from(world(
+        round_of(2, 5),
+        vec![
+            station(),
+            wall(20001, damaged, 1, 300),
+            worker(10010, 9, 21, vec!["WallFixer"]),
+            worker(
+                10011,
+                8,
+                21,
+                vec!["WallFixer", "iron", "iron", "iron", "iron"],
+            ),
+        ],
+        0,
+    ));
+    let mut state = BotState::default();
+    let plan = day_plan(&turn, &mut state);
+
+    let mend = plan.commands.get(&10010).expect("the free worker acts");
+    assert_eq!(mend.action, "move");
+    let step = mend.targetPos.as_ref().expect("move has a target")[0];
+    assert!(
+        chebyshev(step, damaged) < chebyshev(Pos { x: 9, y: 21 }, damaged),
+        "the free worker walks to the damaged wall, got {step:?}"
+    );
+
+    let economy = plan.commands.get(&10011).expect("the economy worker acts");
+    let step = economy
+        .targetPos
+        .as_ref()
+        .expect("its command has a target")[0];
+    assert!(
+        chebyshev(step, damaged) > chebyshev(Pos { x: 8, y: 21 }, damaged),
+        "the economy worker must not be pulled off its load toward the wall, \
+         got {step:?}"
+    );
+    assert!(
+        chebyshev(step, vendor) < chebyshev(Pos { x: 8, y: 21 }, vendor),
+        "…it is walking its load to the vendor instead, got {step:?}"
     );
 }
 

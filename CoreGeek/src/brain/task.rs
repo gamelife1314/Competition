@@ -9,6 +9,15 @@ use crate::model::{Turn, Unit};
 use crate::protocol::RoleCommand;
 use crate::state::{BotState, TaskStage};
 
+/// Consecutive "`executeCmd` is not available" verdicts that end a session.
+const MAX_WINDOW_ERRORS: i32 = 2;
+
+/// The last `roundNo` of the day `round_no` falls in.
+fn turn_end_of_day(round_no: i64) -> i64 {
+    let round_no = round_no.max(1);
+    ((round_no - 1) / crate::model::ROUNDS_PER_DAY + 1) * crate::model::ROUNDS_PER_DAY
+}
+
 /// Feed a fresh `llmResp` into the task state machine.
 pub fn on_llm_resp(state: &mut BotState, resp: &str) {
     if !matches!(state.task.stage, TaskStage::Planning) {
@@ -20,11 +29,50 @@ pub fn on_llm_resp(state: &mut BotState, resp: &str) {
     // If extraction fails we stay in Planning and re-prompt next round.
 }
 
+/// Is this verdict the judger saying the task's execution window is shut?
+///
+/// The interface doc scopes the field — "`executeCmd` … 仅在执行任务期间才能
+/// 使用" — and the judger answers a command sent outside that window with
+/// `[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用`. That is not a script
+/// that failed: no re-plan can make the command legal, and issue #17's two
+/// sessions proved it, firing four commands and then one into the same closed
+/// window until both timeouts expired at zero points.
+pub fn window_closed(result: &str) -> bool {
+    result.starts_with("[JUDGER_ERROR]") && result.contains("executeCmd")
+}
+
 /// Feed a fresh `lastCmdResult` into the task state machine.
 pub fn on_cmd_result(state: &mut BotState, result: &str) {
     if !matches!(state.task.stage, TaskStage::WaitingCmdResult { .. }) {
         return;
     }
+    if window_closed(result) {
+        state.task.judger_window_errors = state.task.judger_window_errors.saturating_add(1);
+        crate::log::event(
+            "task_window_error",
+            serde_json::json!({
+                "session": state.task.session_id,
+                "count": state.task.judger_window_errors,
+                "reason": truncate(strip_status_line(result), 120),
+            }),
+        );
+        // One refusal can be a transient sandbox fault; a second one to the
+        // same command is the window itself. Abandoning the session is what
+        // frees the pioneer for the wall line and the economy — the rounds the
+        // issue lost were worth more than a task that cannot be answered.
+        if state.task.judger_window_errors >= MAX_WINDOW_ERRORS {
+            if let Some(point) = state.task.point {
+                state
+                    .task_refusals
+                    .insert(point, turn_end_of_day(state.task.accepted_round));
+            }
+            state.finish_task(false, "judger_window_closed");
+        } else {
+            state.task.stage = TaskStage::Planning;
+        }
+        return;
+    }
+    state.task.judger_window_errors = 0;
     state.task.result_history.push(truncate(result, 1200));
     let output = strip_status_line(result);
     let code = exit_code(result);

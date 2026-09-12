@@ -81,6 +81,12 @@ pub struct TaskSession {
     /// Fields the task text asked for that the produced answer did not carry.
     /// Fed back into the next prompt so the retry can close the gap.
     pub schema_gaps: Vec<String>,
+    /// Consecutive `[JUDGER_ERROR]` verdicts that name `executeCmd` as
+    /// unavailable. That error is the judger telling us the task's execution
+    /// window is shut — issue #17's two sessions fired four and one command
+    /// into it and burned both timeouts to zero points — so two in a row end
+    /// the session locally instead of re-planning into the same closed door.
+    pub judger_window_errors: i32,
 }
 
 /// A cached, parameterised script for one task fingerprint. The body keeps
@@ -241,6 +247,15 @@ pub struct BotState {
     pub blacklisted_builds: HashSet<(Pos, String)>,
 
     pub task: TaskSession,
+    /// Task point -> last round we will not accept it on.
+    ///
+    /// Abandoning a session is only half a fix: the pioneer is standing in the
+    /// point's neighbourhood, the point still reads valid, and the next round
+    /// `next_task_point` walks straight back into the window the judger just
+    /// refused — accept, plan, refuse, abandon, for the rest of the day. A
+    /// refusal is a property of the point, so it is remembered against the
+    /// point, through the end of the day it was learned on.
+    pub task_refusals: HashMap<Pos, i64>,
     /// Last allocated task session identifier. Preserved across half resets so
     /// session IDs remain monotonic for the lifetime of this bot process.
     pub task_session_seq: u64,

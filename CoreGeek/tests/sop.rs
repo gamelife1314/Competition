@@ -415,3 +415,143 @@ fn a_repeatedly_rejected_answer_abandons_the_task() {
          burning the rest of the timeout"
     );
 }
+
+/// A world whose `lastCmdResult` is the judger refusing `executeCmd`.
+fn refused_command(round_no: i64, result: &str) -> Turn {
+    turn_from(json!({
+        "roundNo": round_no,
+        "mapInfo": {"width": 41, "height": 32, "zones": []},
+        "teamOur": {
+            "type": "challenger", "goldNum": 0, "totalScore": 0,
+            "playerTasks": [{
+                "taskType": "自进化类1", "taskPosition": {"x": 14, "y": 14},
+                "isValid": true, "coldDownRounds": 0, "timeoutRounds": 100,
+                "scoreReward": 10, "goldReward": 10,
+            }],
+            "roles": [{
+                "id": 10011, "pos": {"x": 14, "y": 14}, "roleType": "pioneer",
+                "health": 200, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 40, "backpack": []
+            }]
+        },
+        "teamEnemy": {"roles": []},
+        "robot": {"roles": []},
+        "lastCmdResult": result,
+    }))
+}
+
+/// Put the session in the state a sent `executeCmd` leaves behind: waiting for
+/// the verdict of round `request_round`.
+fn awaiting_verdict(state: &mut BotState, request_round: i64) {
+    state.task.stage = TaskStage::WaitingCmdResult { attempts: 0 };
+    state.task.cmd_request_round = Some(request_round);
+    state.task.cmd_consumed_request_round = None;
+}
+
+#[test]
+fn a_closed_execution_window_ends_the_session_instead_of_looping() {
+    use coregeek::brain::task::window_closed;
+
+    // Issue #17: the judger answered our `executeCmd` with
+    // "[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用" four times in one
+    // session and once in the next, and both sessions ran out their timeouts at
+    // zero task points. Every one of those rounds went back to Planning, asked
+    // the LLM for another script and fired it into the same shut window — the
+    // script was never the problem, so no amount of re-planning could help.
+    assert!(window_closed(
+        "[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用"
+    ));
+    // A script that genuinely failed in the sandbox is NOT this: those are the
+    // rounds where a new script is exactly the right answer.
+    assert!(!window_closed(
+        "[exitCode:1] Traceback (most recent call last)"
+    ));
+    assert!(!window_closed("[TIMEOUT] 执行超时"));
+    assert!(!window_closed("[JUDGER_ERROR] 未知指令 submitAnswer"));
+
+    let (_, mut state) = task_at(1, "统计 /tmp/selfEvolutionTask 下的文件数量", "");
+    state.task.point = Some(Pos { x: 14, y: 14 });
+    state.task.accepted_round = 1;
+
+    awaiting_verdict(&mut state, 5);
+    state.observe(&refused_command(
+        6,
+        "[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用",
+    ));
+    assert!(
+        state.task.active,
+        "a single refusal is retried — it can be a transient sandbox fault"
+    );
+    assert_eq!(state.task.stage, TaskStage::Planning);
+
+    awaiting_verdict(&mut state, 7);
+    state.observe(&refused_command(
+        8,
+        "[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用",
+    ));
+    assert!(
+        !state.task.active,
+        "a second refusal to the same command is the window itself: the \
+         session has to end rather than re-plan into it"
+    );
+    assert_eq!(
+        state.task_refusals.get(&Pos { x: 14, y: 14 }),
+        Some(&130),
+        "the point is remembered as refused through the end of the day, or the \
+         pioneer walks straight back into the same window"
+    );
+
+    // …and the pioneer is free again: the next round it takes an errand instead
+    // of accepting the refused point a third time.
+    let turn = refused_command(9, "");
+    let mut claimed = std::collections::HashSet::new();
+    let pioneer = turn.role_by_id(10011).unwrap();
+    assert!(
+        state
+            .next_task_point(&turn, pioneer, &mut claimed)
+            .is_none(),
+        "the refused point is not accepted again on the same day"
+    );
+
+    // A later day is a fresh offer: the point is no longer held against it.
+    let turn = refused_command(131, "");
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let cmd = state
+        .next_task_point(&turn, pioneer, &mut claimed)
+        .expect("the refusal does not last past the day it was learned on");
+    assert_eq!(cmd.action, "acceptTask");
+}
+
+#[test]
+fn a_verdict_that_is_not_about_the_window_clears_the_streak() {
+    // Two refusals in a row end a session; a real sandbox run in between proves
+    // the window is open, so the count restarts.
+    let (_, mut state) = task_at(1, "统计 /tmp/selfEvolutionTask 下的文件数量", "");
+    state.task.point = Some(Pos { x: 14, y: 14 });
+    state.task.accepted_round = 1;
+
+    awaiting_verdict(&mut state, 5);
+    state.observe(&refused_command(
+        6,
+        "[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用",
+    ));
+    assert_eq!(state.task.judger_window_errors, 1);
+
+    awaiting_verdict(&mut state, 7);
+    state.observe(&refused_command(8, "[exitCode:1] NameError: name 'x'"));
+    assert_eq!(state.task.judger_window_errors, 0);
+    assert!(
+        state.task.active,
+        "a script error is re-planned, not abandoned"
+    );
+
+    awaiting_verdict(&mut state, 9);
+    state.observe(&refused_command(
+        10,
+        "[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用",
+    ));
+    assert!(
+        state.task.active,
+        "one refusal after a working window is not enough to abandon"
+    );
+}

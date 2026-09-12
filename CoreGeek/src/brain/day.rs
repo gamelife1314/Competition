@@ -31,6 +31,63 @@ const STONE_BATCH: i64 = 6;
 /// wall and a frozen purse in issues #12/#13/#14.
 const RING_BATCH: i64 = 20;
 
+/// Stones a wall trip must be able to carry home before it is worth starting.
+/// A trip that lands one stone is not a wall line, it is a lost day: issue #17
+/// spent the whole of D1 walking to a vein on the far side of the map and put
+/// up zero walls.
+const MIN_WALL_LOAD: i64 = 4;
+/// Rounds kept in hand on top of the walk home before a stone carrier gives up
+/// on the vein — a blocked cell, a detour, a claim.
+const WALL_TRIP_SLACK: i64 = 3;
+
+/// The day-round by which this role must be standing beside its gun. A role
+/// with no gun pair is due at dusk like everyone else.
+fn gun_deadline(turn: &Turn, role: &Unit, pairs: &[(i64, i64)]) -> i64 {
+    pairs
+        .iter()
+        .find(|(controller, _)| *controller == role.id)
+        .and_then(|(_, tower)| turn.role_by_id(*tower))
+        .map(|tower| preposition_round(chebyshev(role.pos, tower.pos)))
+        .unwrap_or(economy::DUSK_ROUND)
+}
+
+/// Can a stone trip to `vein` still land a load before this role has to be at
+/// its gun? Walk out, dig `MIN_WALL_LOAD`, walk back to the wall line: a vein
+/// further than that is not a wall this day, it is a walk into the dusk.
+/// Issue #17: "我方仅 14 次 collect，金币峰值仅 75（初始值）… 城墙体系彻底缺失
+/// （0 墙）" — the crew crossed the map for stone it could not bring home, and
+/// the day produced neither a wall nor a coin.
+fn stone_trip_fits(
+    turn: &Turn,
+    role: &Unit,
+    pairs: &[(i64, i64)],
+    vein: Pos,
+    gaps: &[Pos],
+) -> bool {
+    let back = gaps
+        .iter()
+        .map(|gap| chebyshev(vein, *gap) as i64)
+        .min()
+        .unwrap_or(0);
+    let rounds = chebyshev(role.pos, vein) as i64 + MIN_WALL_LOAD + back + 1;
+    rounds <= gun_deadline(turn, role, pairs) - turn.in_day_round
+}
+
+/// Has the vein stopped paying for the walk home? The load already in hand is
+/// what the ring gets; a carrier that keeps digging is a carrier the night
+/// finds outside the wall. Measured against the wall window (dusk plus the
+/// seal grace), not the gun deadline: the seal is allowed to spend the last
+/// rounds of the day on the ring, and a trip that is still placing walls then
+/// is a trip that worked.
+fn wall_trip_overdue(turn: &Turn, role: &Unit, gaps: &[Pos]) -> bool {
+    let home = gaps
+        .iter()
+        .map(|gap| chebyshev(role.pos, *gap) as i64)
+        .min()
+        .unwrap_or(0);
+    turn.in_day_round + home + 1 + WALL_TRIP_SLACK >= economy::DUSK_ROUND + SEAL_GRACE
+}
+
 /// Stones this role should carry before it walks out to the wall line.
 fn stone_batch(turn: &Turn, gaps: usize) -> i64 {
     let want = if turn.day == 1 {
@@ -112,6 +169,9 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             "towers": turn.towers().len(),
             "gaps": tower_gaps.len(),
             "reserve": build_reserve,
+            "wallGaps": wall_gaps.len(),
+            "stoneDemand": stone_demand,
+            "teamStone": economy::team_ores(turn, STONE),
             "mayBuild": economy::may_build_weapon(turn, state),
             "upgradeReachable": economy::upgrade_reachable(turn, state),
             "fallbackRound": economy::DUSK_ROUND - economy::FALLBACK_LEAD,
@@ -320,8 +380,22 @@ fn worker_day(
             // assignment past its travel deadline.
             let deadline = preposition_round(dist);
             if turn.in_day_round >= deadline {
-                if dist > 1 {
-                    let stands = tower_stand_cells(turn, tower.pos);
+                // "Arrived" is a cell the gun can be OPERATED from, not merely
+                // one within a chebyshev cell of it. A gun's diagonal
+                // neighbours sit on the radius-2 wall ring: a controller that
+                // parks on one of them is standing in the wall line, outside
+                // the base. `update_wall_gate` then never sees "everyone has
+                // retreated", the gate is never sealed, and since the gate seal
+                // is the only wall action that outranks this lock the stone the
+                // crew is carrying never becomes wall — the ring ends the day at
+                // 0/20 with nine stone in two backpacks. It is also issue #15's
+                // "操控者在墙的外侧": the gun is manned from in front of the
+                // wall it is supposed to be behind. Walking on until a real
+                // operating cell is reached (or, when none can be reached,
+                // sheltering inside) is what lets the ring close around the
+                // crew.
+                let stands = tower_stand_cells(turn, tower.pos);
+                if !stands.iter().any(|stand| *stand == role.pos) {
                     // Walk there — but never by demolishing the wall line. The
                     // ring is the day's whole product (issues #12/#13/#14: "420
                     // log lines and zero wall builds"), and a controller that
@@ -340,8 +414,9 @@ fn worker_day(
                         return;
                     }
                 }
-                // Already adjacent (or no walkable step): hold position so a
-                // late mine/wall errand can't drag the role away from the gun.
+                // Already at the post (or no walkable step to one): hold
+                // position so a late mine/wall errand can't drag the role away
+                // from the gun.
                 return;
             }
         }
@@ -375,11 +450,17 @@ fn worker_day(
         // single worker is supposed to carry and the ring is never started.
         // Once the team between them holds enough to fill every gap, the next
         // mine trip only pushes the build past dusk.
+        //
+        // And the walk home has the last word: once dusk plus the seal grace
+        // is only a walk away, the load in hand is the load the ring gets.
+        // Issue #17's crew was still digging at the far vein when the day ran
+        // out — the stone arrived nowhere, and the ring kept zero walls.
         let team_stone = economy::team_ores(turn, STONE);
         let load_complete = carrying >= batch
             || team_stone >= wall_gaps.len() as i64
             || stone_demand <= 0
-            || turn.in_day_round >= economy::DUSK_ROUND - 12;
+            || turn.in_day_round >= economy::DUSK_ROUND - 12
+            || wall_trip_overdue(turn, role, wall_gaps);
         // Build immediately when already standing next to a safe gap — but only
         // once this trip's load is settled. The batch exists to avoid the
         // mine↔ring commute, so it decides whether it is worth WALKING OUT to
@@ -495,9 +576,21 @@ fn worker_day(
     //    fired for a role already standing beside a damaged wall, and the
     //    mining step returns long before that: with stone still to dig, the
     //    worker never walks to the wall it should be mending.
-    if let Some(cmd) = repair_flow(turn, state, role, wall_gaps, claimed) {
-        plan.push(role.id, cmd);
-        return;
+    //
+    //    One role is excused: the dedicated economy worker with a load to sell.
+    //    It is the one keeping the collect→sell→buy loop running — the loop
+    //    that pays for these kits in the first place — and it is also the role
+    //    that walks to the shop and ends up holding them, so exempting it is
+    //    not an option. Instead the sale goes first and the repair happens a
+    //    round later, from the same errand: the wall is still mended today, and
+    //    no round of the loop is spent on it.
+    let repair_duty =
+        Some(role.id) != economy_id || !economy::should_sell(turn, state, role, stone_demand);
+    if repair_duty {
+        if let Some(cmd) = repair_flow(turn, state, role, wall_gaps, claimed) {
+            plan.push(role.id, cmd);
+            return;
+        }
     }
     // 9. Sell accumulated ore in one batch before collecting more. This keeps
     //    the collect→sell→buy loop moving instead of filling a 100-slot pack
@@ -511,7 +604,7 @@ fn worker_day(
     // 10. Mine the nearest ore (stone first while walls are wanted). Mining
     //    pauses during dusk so the ore we hold is converted to gold instead.
     if turn.in_day_round < economy::DUSK_ROUND && !role.backpack_full() {
-        if let Some(cmd) = mine_flow(turn, state, role, stone_demand, claimed) {
+        if let Some(cmd) = mine_flow(turn, state, role, stone_demand, pairs, wall_gaps, claimed) {
             plan.push(role.id, cmd);
             return;
         }
@@ -589,8 +682,12 @@ fn pioneer_day(
         if let Some(tower) = turn.role_by_id(tower_id) {
             let dist = chebyshev(pioneer.pos, tower.pos);
             if turn.in_day_round >= preposition_round(dist) {
-                if dist > 1 {
-                    let stands = tower_stand_cells(turn, tower.pos);
+                // As for the workers: the post is a cell the gun can be
+                // operated from, and a diagonal neighbour of a gun is a cell of
+                // the radius-2 wall ring — a pioneer parked there is outside
+                // the ring and keeps the gate seal from ever completing.
+                let stands = tower_stand_cells(turn, tower.pos);
+                if !stands.iter().any(|stand| *stand == pioneer.pos) {
                     if let Some(cmd) = walk_toward(turn, pioneer, &stands, claimed) {
                         plan.push(pioneer.id, cmd);
                         return;
@@ -602,7 +699,7 @@ fn pioneer_day(
                         return;
                     }
                 }
-                // Already adjacent (or no walkable step): hold at the tower.
+                // Already at the post (or no walkable step to one): hold there.
                 return;
             }
         }
@@ -637,7 +734,7 @@ fn pioneer_day(
     // 7. Loiter next to a task point so we catch refreshes immediately — until
     //    the recall round, after which loitering IS the thing being recalled.
     if !recalled {
-        loiter_at_task_point(turn, pioneer, claimed, plan);
+        loiter_at_task_point(turn, state, pioneer, claimed, plan);
         if plan.commands.contains_key(&pioneer.id) {
             return;
         }
@@ -691,6 +788,15 @@ impl BotState {
             .player_tasks
             .iter()
             .filter(|task| task.is_valid && task.cooldown_rounds == 0)
+            // A point whose execution window the judger already shut stays
+            // shut for this pioneer: re-accepting it only re-enters the same
+            // refusal. See `BotState::task_refusals`.
+            .filter(|task| {
+                !self
+                    .task_refusals
+                    .get(&task.pos)
+                    .map_or(false, |until| turn.round_no <= *until)
+            })
             .min_by_key(|task| chebyshev(pioneer.pos, task.pos))?;
         if chebyshev(pioneer.pos, candidate.pos) <= 1 {
             let timeout = if candidate.timeout_rounds > 0 {
@@ -736,9 +842,25 @@ fn pioneer_recall_round(turn: &Turn, pioneer: &Unit) -> i64 {
     (economy::DUSK_ROUND - 1 - walk - PIONEER_RETREAT_SLACK).max(0)
 }
 
-fn loiter_at_task_point(turn: &Turn, pioneer: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) {
+fn loiter_at_task_point(
+    turn: &Turn,
+    state: &BotState,
+    pioneer: &Unit,
+    claimed: &mut HashSet<Pos>,
+    plan: &mut Plan,
+) {
     let mut stands: Vec<Pos> = Vec::new();
     for task in &turn.player_tasks {
+        // Loitering beside a refused point is the same loop one step slower:
+        // the pioneer camps the window it may not use instead of taking the
+        // treasure or the walk home. See `BotState::task_refusals`.
+        if state
+            .task_refusals
+            .get(&task.pos)
+            .map_or(false, |until| turn.round_no <= *until)
+        {
+            continue;
+        }
         stands.extend(stand_cells(turn, task.pos));
     }
     if stands.is_empty() {
@@ -1141,6 +1263,8 @@ fn mine_flow(
     state: &BotState,
     role: &Unit,
     stone_demand: i64,
+    pairs: &[(i64, i64)],
+    wall_gaps: &[Pos],
     claimed: &mut HashSet<Pos>,
 ) -> Option<RoleCommand> {
     // Fetch stone only while the TEAM is short of the gaps still open.
@@ -1149,13 +1273,29 @@ fn mine_flow(
     // them digging stone long after the ring has all the stone it can use,
     // and the sellable ore that funds the rest of the day never gets mined.
     let want_stone = stone_demand > 0 && economy::team_ores(turn, STONE) < stone_demand;
-    let (mine, ore) = economy::choose_mine(
+    let pick = economy::choose_mine(
         turn,
         state,
         role.pos,
         if want_stone { stone_demand } else { 0 },
         claimed,
     )?;
+    // Stone is what the ring wants, but only a trip that can carry a load home
+    // before this role must be at its gun is a wall trip. When no vein is that
+    // close, the demand is not "stone" any more — it is an unwinnable walk, and
+    // the day is worth more spent on ore that sells (issue #17's frozen purse).
+    let stone_errand = want_stone && pick.1 == STONE;
+    let (mine, ore) = if stone_errand && !stone_trip_fits(turn, role, pairs, pick.0, wall_gaps) {
+        economy::choose_mine(turn, state, role.pos, 0, claimed)?
+    } else {
+        pick
+    };
+    // On a stone errand the trip is the point: an ore picked up on the way
+    // there is a detour that fills the pack with the wrong load, and the stone
+    // is never reached. Everywhere else the pass-by mine is free money — and
+    // that includes the day when the ring's stone turned out to be out of
+    // reach, because the errand is ore that sells by then, not stone.
+    let strict = stone_errand && ore == STONE;
     // Collect an adjacent mine of the preferred ore directly. A mine a
     // teammate has merely RESERVED as a walking target is still collectable by
     // a role already standing next to it: the reservation decides who walks
@@ -1164,12 +1304,40 @@ fn mine_flow(
     // the cell, cannot walk to it either (it is already on a stand, so the
     // path search returns "no step"), and produces no command at all for the
     // rest of the day — issue #13's idle role, caused by a claim.
-    let adjacent = nearest_adjacent_mine(turn, role, &ore, claimed)
-        .or_else(|| nearest_adjacent_mine(turn, role, &ore, &HashSet::new()));
+    //
+    // While the ring is still short of stone that courtesy stops at stone.
+    // `nearest_adjacent_mine` also accepts a vein of ANY ore, which is right
+    // for the general miner — a windfall is a windfall — but on the stone
+    // errand it is how the wall line loses its day: with the stone 22 cells out
+    // (issue #17) every carrier that brushed the iron on the way stopped there
+    // and mined four ore instead, twice over, and the day ended 8 collects and
+    // 0 walls with gold frozen at the 75 it started with. We came for stone;
+    // the ore under our feet can wait for the walk home.
+    let adjacent = if strict {
+        adjacent_mine_of(turn, role, STONE)
+    } else {
+        nearest_adjacent_mine(turn, role, &ore, claimed)
+            .or_else(|| nearest_adjacent_mine(turn, role, &ore, &HashSet::new()))
+    };
     if let Some(mine_pos) = adjacent {
         claimed.insert(mine_pos);
         return Some(RoleCommand::collect(mine_pos));
     }
+    // Which vein the day is being spent on, and why. The wall line is the one
+    // errand whose failure is invisible until the night (issues #12-#17 all
+    // opened with "0 墙"), so the pick, the ring's demand and whether the trip
+    // can still be paid for in walls are worth a line in the log.
+    crate::log::event(
+        "mine_pick",
+        serde_json::json!({
+            "round": turn.round_no,
+            "role": role.id,
+            "wantStone": want_stone,
+            "stoneErrand": stone_errand,
+            "ore": ore,
+            "mine": mine,
+        }),
+    );
     let stands = stand_cells(turn, mine);
     let cmd = walk_toward(turn, role, &stands, claimed)?;
     claimed.insert(mine);
@@ -1261,6 +1429,18 @@ fn repair_flow(
 }
 
 /// A mine of the preferred ore (or any valuable ore) we already stand next to.
+/// A mine of exactly `ore` this role is already standing next to.
+///
+/// The narrow sibling of `nearest_adjacent_mine`, for the errands where the
+/// wrong ore is not a windfall but a lost day.
+fn adjacent_mine_of(turn: &Turn, role: &Unit, ore: &str) -> Option<Pos> {
+    turn.all_mines()
+        .into_iter()
+        .filter(|(pos, kind)| kind == ore && chebyshev(role.pos, *pos) == 1)
+        .map(|(pos, _kind)| pos)
+        .min_by_key(|pos| (pos.x, pos.y))
+}
+
 fn nearest_adjacent_mine(
     turn: &Turn,
     role: &Unit,

@@ -190,6 +190,12 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         // to spare duties instead of idling next to a dead tower all night.
         paired.insert(*controller_id);
         let dist = chebyshev(controller.pos, tower.pos);
+        // At night "in position" is the game's own rule — `chebyshev <= 1`,
+        // which is also what `validate.rs` requires of an attack keyed to this
+        // tower. The recall below exists to MAN the gun, so a controller
+        // already able to fire must fire rather than walk: it is the day lock
+        // that insists on the inner operating cell, because only there can the
+        // ring be sealed around it.
         let adjacent = dist <= 1;
         let mut targets_count: usize = 0;
         let mut fired = false;
@@ -204,7 +210,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             // tower MUST move there, outranking every other night duty (heal,
             // items, shelter, economy). Battle pk575098 / pk575557 left towers
             // idle all night because their operators were never recalled — this
-            // runs every round until the controller is adjacent.
+            // runs every round until the controller is at an operating cell.
             let stands = tower_stand_cells(turn, tower.pos);
             let mut moved = false;
             if let Some(cmd) = walk_or_remove_wall(turn, controller, &stands, &mut claimed) {
