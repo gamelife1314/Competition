@@ -121,11 +121,30 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             // Man the tower: attack commands are keyed by the TOWER's id.
             if tower.cooldown == 0 {
                 if let Some(targets) = combat::choose_attack(turn, tower, &mut sim) {
+                    crate::log::event(
+                        "night_attack",
+                        serde_json::json!({
+                            "round": turn.round_no,
+                            "controller": controller.id,
+                            "tower": tower.id,
+                            "cooldown": tower.cooldown,
+                            "targets": targets.len(),
+                        }),
+                    );
                     plan.push(tower.id, RoleCommand::attack(controller.id, targets));
                 }
             }
             // The controller holds position (no command) to stay adjacent.
         } else {
+            crate::log::event(
+                "night_pair_walk",
+                serde_json::json!({
+                    "round": turn.round_no,
+                    "controller": controller.id,
+                    "tower": tower.id,
+                    "dist": chebyshev(controller.pos, tower.pos),
+                }),
+            );
             let stands = stand_cells(turn, tower.pos);
             // Try walking while respecting claimed cells (soft preference).
             if let Some(cmd) = walk_toward(turn, controller, &stands, &mut claimed) {

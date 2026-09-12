@@ -9,6 +9,10 @@ use crate::state::BotState;
 pub const SELL_BATCH: i64 = 20;
 pub const STONE_BUFFER: i64 = 2;
 
+/// First day round (in_day_round) of the "dusk" window: mining stops and every
+/// ore is converted to gold so the night is spent upgrading, not digging.
+pub const DUSK_ROUND: i64 = 55;
+
 #[derive(Debug, Clone)]
 pub struct Need {
     pub name: String,
@@ -68,15 +72,17 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             needs.push(Need { name: voucher.into(), num: 1, priority: 2 });
         }
     }
-    // Night consumables: stock up once upgrades are affordable.
-    if stock_of(turn, "Bomb") < 2 && gold >= 150 {
+    // Night consumables: only once the defense is solid (every weapon slot
+    // filled → no gold still reserved for builds) and gold is plentiful.
+    let defense_solid = reserve == 0;
+    if defense_solid && stock_of(turn, "Bomb") < 2 && gold >= 150 {
         needs.push(Need {
             name: "Bomb".into(),
             num: (2 - stock_of(turn, "Bomb")).min(gold / 100),
             priority: 3,
         });
     }
-    if stock_of(turn, "DizzyWeapon") < 1 && gold >= 150 {
+    if defense_solid && stock_of(turn, "DizzyWeapon") < 1 && gold >= 150 {
         needs.push(Need { name: "DizzyWeapon".into(), num: 1, priority: 3 });
     }
     // Wall repair kits when the wall line took damage overnight (10g each).
@@ -182,6 +188,10 @@ pub fn should_sell(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i64
     let ores = total_ores(role);
     if ores == 0 {
         return false;
+    }
+    // Dusk: stop stockpiling — convert every ore to gold before nightfall.
+    if turn.in_day_round >= DUSK_ROUND {
+        return true;
     }
     if role.backpack_full() || ores >= SELL_BATCH {
         return true;

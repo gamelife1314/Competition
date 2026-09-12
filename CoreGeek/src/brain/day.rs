@@ -5,12 +5,17 @@
 use std::collections::HashSet;
 
 use crate::brain::{economy, night, stand_cells, task, treasure, walk_toward, Plan};
-use crate::model::{chebyshev, footprint_distance, station_footprint, Turn, Unit, STONE, WEAPON_BUILD_COST};
+use crate::model::{chebyshev, footprint_distance, station_footprint, Turn, Unit, DAY_ROUNDS, STONE, WEAPON_BUILD_COST};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::{BotState, TaskSession};
 
-/// Rounds before dusk when controllers pre-position at their towers.
-const PREPOSITION_ROUND: i64 = 58;
+/// First day round (in_day_round) when a controller must drop everything and
+/// walk to its tower, so it arrives adjacent (chebyshev <= 1) by the first
+/// night round. `dist - 1` moves are needed (one per round) plus two rounds of
+/// slack for blocked cells and detours.
+fn preposition_round(dist: i32) -> i64 {
+    (DAY_ROUNDS - 1 - dist as i64).max(0)
+}
 /// Stones to carry before walking out to the wall line (same as the demo).
 const STONE_BATCH: i64 = 6;
 
@@ -91,24 +96,41 @@ fn worker_day(
         plan.push(role.id, cmd);
         return;
     }
-    // 2. Shopping mission.
+    // 2. Apply upgrade vouchers we already carry — using them the moment we
+    //    hold them beats buying more or anything else (the night's firepower
+    //    depends on it).
+    if let Some(cmd) = voucher_flow(turn, role, claimed) {
+        plan.push(role.id, cmd);
+        return;
+    }
+    // 3. Shopping mission (dedicated buyer).
     if buyer_id == Some(role.id) && !shopping.is_empty() {
         if let Some(cmd) = buyer_flow(turn, role, shopping, claimed) {
             plan.push(role.id, cmd);
             return;
         }
     }
-    // 3. Apply upgrade vouchers we already carry.
-    if let Some(cmd) = voucher_flow(turn, role, claimed) {
-        plan.push(role.id, cmd);
-        return;
+    // 4. Pre-position at the assigned tower so the first night round is spent
+    //    firing, not walking. Deadline is distance-aware: a worker far from
+    //    its tower starts early enough to make it.
+    if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == role.id).map(|(_, tower)| *tower) {
+        if let Some(tower) = turn.role_by_id(tower_id) {
+            let dist = chebyshev(role.pos, tower.pos);
+            if dist > 1 && turn.in_day_round >= preposition_round(dist) {
+                let stands = stand_cells(turn, tower.pos);
+                if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
+                    plan.push(role.id, cmd);
+                    return;
+                }
+            }
+        }
     }
-    // 3b. Repair walls damaged during the night (cheap: 10g per fix).
+    // 5. Repair walls damaged during the night (cheap: 10g per fix).
     if let Some(wall_pos) = crate::brain::combat::repair_target(turn, role, 0) {
         plan.push(role.id, RoleCommand::use_item_at("WallFixer", wall_pos));
         return;
     }
-    // 4. Build towers (gold) — highest defensive value.
+    // 6. Build towers (gold) — highest defensive value.
     if turn.gold >= WEAPON_BUILD_COST {
         for (site, kind) in tower_gaps {
             if claimed.contains(site) {
@@ -121,7 +143,7 @@ fn worker_day(
             }
         }
     }
-    // 5. Build walls (stone). Build immediately when already standing next
+    // 7. Build walls (stone). Build immediately when already standing next
     //    to a gap; otherwise batch stones before committing to a long walk.
     if role.count_item(STONE) > 0 && !wall_gaps.is_empty() {
         let adjacent_site = wall_gaps
@@ -147,27 +169,13 @@ fn worker_day(
             }
         }
     }
-    // 5b. Burn a carried robot-summon order (enemy harassment) once build
-    //     duties are done — buying and building are never delayed by it.
+    // 8. Burn a carried robot-summon order (enemy harassment) once build
+    //    duties are done — buying and building are never delayed by it.
     if let Some(cmd) = burn_summon_order(state, role) {
         plan.push(role.id, cmd);
         return;
     }
-    // 6. Late day: pre-position at the assigned tower.
-    if turn.in_day_round >= PREPOSITION_ROUND {
-        if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == role.id).map(|(_, tower)| *tower) {
-            if let Some(tower) = turn.role_by_id(tower_id) {
-                if chebyshev(role.pos, tower.pos) > 1 {
-                    let stands = stand_cells(turn, tower.pos);
-                    if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
-                        plan.push(role.id, cmd);
-                        return;
-                    }
-                }
-            }
-        }
-    }
-    // 7. Economy loop: sell / mine.
+    // 9. Economy loop: sell / mine (mining stops during dusk).
     economy_flow(turn, state, role, stone_demand, claimed, plan);
 }
 
@@ -207,16 +215,16 @@ fn pioneer_day(
         plan.push(pioneer.id, cmd);
         return;
     }
-    // 6. Late day: pre-position at the assigned tower.
-    if turn.in_day_round >= PREPOSITION_ROUND {
-        if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == pioneer.id).map(|(_, tower)| *tower) {
-            if let Some(tower) = turn.role_by_id(tower_id) {
-                if chebyshev(pioneer.pos, tower.pos) > 1 {
-                    let stands = stand_cells(turn, tower.pos);
-                    if let Some(cmd) = walk_toward(turn, pioneer, &stands, claimed) {
-                        plan.push(pioneer.id, cmd);
-                        return;
-                    }
+    // 6. Pre-position at the assigned tower (distance-aware deadline) so the
+    //    first night round is spent firing, not walking.
+    if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == pioneer.id).map(|(_, tower)| *tower) {
+        if let Some(tower) = turn.role_by_id(tower_id) {
+            let dist = chebyshev(pioneer.pos, tower.pos);
+            if dist > 1 && turn.in_day_round >= preposition_round(dist) {
+                let stands = stand_cells(turn, tower.pos);
+                if let Some(cmd) = walk_toward(turn, pioneer, &stands, claimed) {
+                    plan.push(pioneer.id, cmd);
+                    return;
                 }
             }
         }
@@ -374,7 +382,7 @@ fn economy_flow(
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
 ) {
-    // Sell first when the backpack is heavy or a price spiked.
+    // Sell first when the backpack is heavy, a price spiked, or dusk is near.
     if economy::should_sell(turn, state, role, stone_demand) {
         let mut stands: Vec<Pos> = Vec::new();
         for vendor in turn.vendors() {
@@ -389,6 +397,10 @@ fn economy_flow(
             plan.push(role.id, cmd);
             return;
         }
+    }
+    // Dusk: no more mining — the ore we hold must become gold, not more ore.
+    if turn.in_day_round >= economy::DUSK_ROUND {
+        return;
     }
     if role.backpack_full() {
         return; // nothing more to do this round

@@ -32,8 +32,12 @@ fn robot(id: i64, x: i32, y: i32, hp: i64, team: &str) -> Value {
 }
 
 fn world(our_roles: Vec<Value>, robots: Vec<Value>) -> Value {
+    night_world(85, our_roles, robots)
+}
+
+fn night_world(round_no: i64, our_roles: Vec<Value>, robots: Vec<Value>) -> Value {
     json!({
-        "roundNo": 85, // night
+        "roundNo": round_no,
         "mapInfo": {"width": 41, "height": 32, "zones": []},
         "teamOur": {
             "type": "challenger", "goldNum": 0, "totalScore": 0,
@@ -323,8 +327,12 @@ fn station(x: i32, y: i32, level: i64) -> Value {
 }
 
 fn day_world(our_roles: Vec<Value>, gold: i64, shop_items: Vec<Value>, zones: Vec<Value>) -> Value {
+    day_world_at(5, our_roles, gold, shop_items, zones)
+}
+
+fn day_world_at(round_no: i64, our_roles: Vec<Value>, gold: i64, shop_items: Vec<Value>, zones: Vec<Value>) -> Value {
     json!({
-        "roundNo": 5, // day
+        "roundNo": round_no, // day
         "mapInfo": {"width": 41, "height": 32, "zones": zones},
         "teamOur": {
             "type": "challenger", "goldNum": gold, "totalScore": 0,
@@ -403,4 +411,107 @@ fn carried_voucher_upgrades_l1_tower() {
         Some(Pos { x: 10, y: 10 }),
         "voucher applied to the L1 tower"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Problem 1b: dusk converts ore to gold; Problem 2b: night-1 operation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dusk_worker_sells_ore_instead_of_mining() {
+    // Round 65 (in_day 64) is inside the final 15 day rounds: the worker must
+    // stop mining and head to the vendor to convert ore to gold.
+    let turn = turn_from(day_world_at(
+        65,
+        vec![
+            station(10, 20, 1),
+            json!({
+                "id": 10010, "pos": {"x": 5, "y": 5}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100, "backpack": ["iron"]
+            }),
+        ],
+        0,
+        vec![],
+        vec![zone(5, 6, "iron"), zone(0, 0, "vendor")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("worker acts");
+    assert_ne!(cmd.action, "collect", "dusk worker must not mine");
+    assert_eq!(cmd.action, "move", "dusk worker walks to the vendor to sell");
+}
+
+#[test]
+fn dusk_worker_sells_at_vendor() {
+    // Round 65, worker already adjacent to the vendor: the dusk window must
+    // turn ore into gold, not dig for more.
+    let turn = turn_from(day_world_at(
+        65,
+        vec![
+            station(10, 20, 1),
+            json!({
+                "id": 10010, "pos": {"x": 1, "y": 0}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100, "backpack": ["iron", "iron", "copper"]
+            }),
+        ],
+        0,
+        vec![],
+        vec![zone(0, 0, "vendor")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("worker acts");
+    assert_eq!(cmd.action, "sell", "dusk worker sells its ore at the vendor");
+}
+
+#[test]
+fn worker_prepositions_to_tower_before_nightfall() {
+    // Round 66 (in_day 65): a worker far from its tower must drop everything
+    // and walk there so the first night round is spent firing, not walking.
+    let turn = turn_from(day_world_at(
+        66,
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker(10010, 25, 25),
+        ],
+        0,
+        vec![],
+        vec![zone(25, 24, "iron")], // adjacent, tempting economy
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("worker acts");
+    assert_eq!(cmd.action, "move", "worker prepositions toward its tower");
+    assert_ne!(cmd.action, "collect", "far worker ignores the adjacent mine");
+}
+
+#[test]
+fn day_two_night_all_weapons_operated() {
+    // Day 2's night starts at round 201 (roundNo is 1-based: day=(roundNo-1)/130+1,
+    // night begins at in_day_round 70 → 130 + 70 + 1). Every tower must fire.
+    let turn = turn_from(night_world(
+        201,
+        vec![
+            gatling(10020, 10, 10, 1),
+            gatling(10021, 14, 10, 1),
+            gatling(10022, 10, 14, 1),
+            worker(10010, 11, 10), // adjacent to 10020
+            worker(10011, 13, 10), // adjacent to 10021
+            worker(10012, 11, 14), // adjacent to 10022
+        ],
+        vec![
+            robot(30001, 11, 9, 40, "challenger"),
+            robot(30002, 13, 9, 40, "challenger"),
+            robot(30003, 9, 13, 40, "challenger"),
+        ],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    for tower_id in [10020i64, 10021, 10022] {
+        let cmd = plan.commands.get(&tower_id).expect("tower fires");
+        assert_eq!(cmd.action, "attack", "tower {tower_id} is operated on day-2 night");
+    }
 }
