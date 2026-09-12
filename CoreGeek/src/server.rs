@@ -1,6 +1,6 @@
 use std::net::TcpListener;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -32,8 +32,12 @@ pub async fn serve(listener: TcpListener) {
     }
 }
 
+/// Hard cap on request body size: a legitimate round payload is a few KiB;
+/// anything larger is abusive and must not be buffered (5s budget / memory).
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let body = match req.into_body().collect().await {
+    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return Ok(json_response(EMPTY_RESPONSE)),
     };

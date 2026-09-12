@@ -2,7 +2,7 @@
 //! parsing and the day/night calendar.
 
 use coregeek::brain::combat::{line_cells, within_cone};
-use coregeek::brain::task::{extract_answer, extract_command, strip_status_line};
+use coregeek::brain::task::{exit_code, extract_answer, extract_command, strip_status_line};
 use coregeek::brain::treasure::parse_plan;
 use coregeek::model::Turn;
 use coregeek::protocol::{Pos, Request};
@@ -76,6 +76,30 @@ fn treasure_plan_parsing() {
     assert_eq!(plan.open_day, 4);
     // Out-of-map coordinates rejected.
     assert!(parse_plan(r#"{"pos":{"x":99,"y":1},"items":["StarSand"],"openDay":2}"#, 1).is_none());
+}
+
+#[test]
+fn treasure_plan_keeps_item_multiplicity() {
+    // "门需三钥" style clues: the same item repeated must survive parsing —
+    // the judger checks the sacrifice set 不能多、不能少.
+    let plan = parse_plan(
+        r#"{"pos":{"x":1,"y":1},"items":["StarSand","StarSand","IronWhistle"],"openDay":2}"#,
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.items,
+        vec!["StarSand".to_string(), "StarSand".to_string(), "IronWhistle".to_string()]
+    );
+}
+
+#[test]
+fn exit_code_parsing() {
+    assert_eq!(exit_code("[exitCode:0]\nok"), Some(0));
+    assert_eq!(exit_code("[exitCode:127]\nnope"), Some(127));
+    assert_eq!(exit_code("[TIMEOUT]\npartial"), None);
+    assert_eq!(exit_code("[JUDGER_ERROR]\nboom"), None);
+    assert_eq!(exit_code("raw output"), None);
 }
 
 #[test]

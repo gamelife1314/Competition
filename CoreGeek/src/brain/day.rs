@@ -21,7 +21,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let tower_gaps = tower_gaps(turn, state);
     let wall_gaps = wall_gaps(turn, state);
     let stone_demand = (wall_gaps.len() as i64 - economy::team_ores(turn, STONE)).max(0);
-    let shopping = economy::shopping_list(turn, state);
+    // Gold reserved for finishing the tower build-out is untouchable by the
+    // shopping list — defenses come before consumables.
+    let build_reserve = tower_gaps.len() as i64 * WEAPON_BUILD_COST;
+    let shopping = economy::shopping_list(turn, state, build_reserve);
 
     // Buyer assignment: the pioneer only when it will not be consumed by a
     // task (active task, or a task point ready to accept), else a worker.
@@ -101,6 +104,11 @@ fn worker_day(
         plan.push(role.id, cmd);
         return;
     }
+    // 3b. Repair walls damaged during the night (cheap: 10g per fix).
+    if let Some(wall_pos) = crate::brain::combat::repair_target(turn, role, 0) {
+        plan.push(role.id, RoleCommand::use_item_at("WallFixer", wall_pos));
+        return;
+    }
     // 4. Build towers (gold) — highest defensive value.
     if turn.gold >= WEAPON_BUILD_COST {
         for (site, kind) in tower_gaps {
@@ -114,16 +122,20 @@ fn worker_day(
             }
         }
     }
-    // 5. Build walls (stone). Batch stones before a long walk; build
-    //    immediately when already standing next to a gap.
+    // 5. Build walls (stone). Build immediately when already standing next
+    //    to a gap; otherwise batch stones before committing to a long walk.
     if role.count_item(STONE) > 0 && !wall_gaps.is_empty() {
         let adjacent_site = wall_gaps
             .iter()
             .find(|site| !claimed.contains(site) && chebyshev(role.pos, **site) == 1)
             .copied();
+        if let Some(site) = adjacent_site {
+            claimed.insert(site);
+            plan.push(role.id, RoleCommand::build(site, "wall"));
+            return;
+        }
         let batch = STONE_BATCH.min(wall_gaps.len() as i64).max(1);
-        let ready = adjacent_site.is_some() || role.count_item(STONE) as i64 >= batch;
-        if ready {
+        if role.count_item(STONE) as i64 >= batch {
             for site in wall_gaps {
                 if claimed.contains(site) {
                     continue;

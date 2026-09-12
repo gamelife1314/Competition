@@ -46,8 +46,18 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let mut plan = Plan::default();
     let mut claimed: HashSet<Pos> = HashSet::new();
 
-    let pairs = pairing(turn, state);
+    let mut pairs = pairing(turn, state);
+    // Fire the towers under the heaviest pressure first: they get first pick
+    // of the shared per-round damage simulation (avoids cross-tower overkill).
+    pairs.sort_by_cached_key(|(_controller_id, tower_id)| {
+        let load = turn
+            .role_by_id(*tower_id)
+            .map(|tower| combat::threat_load(turn, tower))
+            .unwrap_or(0);
+        std::cmp::Reverse(load)
+    });
     let mut paired: HashSet<i64> = HashSet::new();
+    let mut sim = combat::init_sim(turn);
 
     for (controller_id, tower_id) in &pairs {
         paired.insert(*controller_id);
@@ -59,7 +69,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         if chebyshev(controller.pos, tower.pos) <= 1 {
             // Man the tower: attack commands are keyed by the TOWER's id.
             if tower.cooldown == 0 {
-                if let Some(targets) = combat::choose_attack(turn, tower) {
+                if let Some(targets) = combat::choose_attack(turn, tower, &mut sim) {
                     plan.push(tower.id, RoleCommand::attack(controller.id, targets));
                 }
             }
@@ -119,6 +129,11 @@ fn spare_night(
             return;
         }
     }
+    // Patch damaged walls when no robot is breathing down our neck.
+    if let Some(wall_pos) = combat::repair_target(turn, role, 3) {
+        plan.push(role.id, RoleCommand::use_item_at("WallFixer", wall_pos));
+        return;
+    }
     // Bomb: worth it against clusters (>= 2 robots) or big targets.
     if role.count_item("Bomb") > 0 {
         if let Some(impact) = combat::bomb_impact(turn) {
@@ -174,7 +189,7 @@ fn night_economy(
     }
     // Collect from an adjacent, safe mine (prefer stones, then value).
     if !role.backpack_full() {
-        let mut best: Option<(i64, Pos)> = None;
+        let mut best: Option<((i64, i64), Pos)> = None;
         for (mine, ore) in turn.all_mines() {
             if chebyshev(mine, role.pos) != 1 || !safe(mine) {
                 continue;
@@ -183,8 +198,10 @@ fn night_economy(
                 continue;
             }
             let value = if ore == STONE { 1000 } else { turn.vendor_prices.get(&ore).copied().unwrap_or(1) };
-            if best.map(|(v, _)| value > v).unwrap_or(true) {
-                best = Some((value, mine));
+            // Coordinate tiebreak: HashMap iteration order must not decide.
+            let key = (value, -(mine.x as i64 + mine.y as i64));
+            if best.map(|(v, _)| key > v).unwrap_or(true) {
+                best = Some((key, mine));
             }
         }
         if let Some((_, mine)) = best {

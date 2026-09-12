@@ -27,13 +27,30 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
     }
     state.task.result_history.push(truncate(result, 1200));
     let output = strip_status_line(result);
+    let code = exit_code(result);
     if let Some(answer) = extract_answer(output) {
+        // An explicit ANSWER marker is trusted even when the exit code is
+        // non-zero (trailing cleanup may fail after the answer was printed);
+        // a wrong verdict comes back as errorCode 2 and re-triggers Planning.
+        crate::log::event(
+            "task_answer_found",
+            serde_json::json!({"exit": code, "answer": truncate(&answer, 120)}),
+        );
         state.task.best_answer = answer.clone();
         state.task.stage = TaskStage::HaveAnswer { answer };
     } else {
-        // No answer found: ask the LLM again with the failure context.
+        // No answer found: ask the LLM again with the failure context
+        // (result_history carries it into the next prompt).
+        crate::log::event("task_cmd_failed", serde_json::json!({"exit": code, "timeout": result.starts_with("[TIMEOUT]")}));
         state.task.stage = TaskStage::Planning;
     }
+}
+
+/// Parse the "[exitCode:N]" header; None for TIMEOUT/JUDGER_ERROR/raw output.
+pub fn exit_code(result: &str) -> Option<i64> {
+    let rest = result.strip_prefix("[exitCode:")?;
+    let end = rest.find(']')?;
+    rest[..end].parse().ok()
 }
 
 /// Per-round pioneer behaviour while a task is active.

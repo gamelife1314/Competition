@@ -32,9 +32,11 @@ pub fn team_ores(turn: &Turn, ore: &str) -> i64 {
 }
 
 /// What we should buy right now, ordered by priority and filtered by gold.
-pub fn shopping_list(turn: &Turn, state: &BotState) -> Vec<Need> {
+/// `reserve` is gold set aside for tower builds (25/each) — spending it on
+/// consumables would stall the defense build-out.
+pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     let mut needs: Vec<Need> = Vec::new();
-    let gold = turn.gold;
+    let gold = (turn.gold - reserve).max(0);
 
     // Weapon upgrade vouchers: biggest defensive win per gold.
     for tower in turn.towers() {
@@ -69,6 +71,19 @@ pub fn shopping_list(turn: &Turn, state: &BotState) -> Vec<Need> {
     if stock_of(turn, "DizzyWeapon") < 1 && gold >= 150 {
         needs.push(Need { name: "DizzyWeapon".into(), num: 1, priority: 3 });
     }
+    // Wall repair kits when the wall line took damage overnight (10g each).
+    let damaged_walls = turn
+        .walls()
+        .iter()
+        .filter(|wall| wall.health < crate::brain::combat::wall_max_hp(wall.level))
+        .count() as i64;
+    if damaged_walls > 0 && stock_of(turn, "WallFixer") < damaged_walls.min(4) {
+        needs.push(Need {
+            name: "WallFixer".into(),
+            num: (damaged_walls.min(4) - stock_of(turn, "WallFixer")).min(gold / 10),
+            priority: 3,
+        });
+    }
     // Medicine only when someone is actually hurt.
     let injured = turn.controllable().iter().any(|role| {
         let max_hp = if role.kind == UnitKind::Worker { 220 } else { 200 };
@@ -79,8 +94,13 @@ pub fn shopping_list(turn: &Turn, state: &BotState) -> Vec<Need> {
     }
     // (Treasure sacrifice items are bought exclusively by the pioneer inside
     // treasure.rs — summonTreasure requires the items in the pioneer's pack.)
-    // Harassment: boss wave on the enemy when we are rich.
-    if gold >= 500 && !state.harass_done_today && state.summon_orders_today < 10 {
+    // Harassment: boss wave on the enemy, but only once our own defense
+    // stands (all three towers) and we are rich.
+    if gold >= 500
+        && turn.towers().len() >= 3
+        && !state.harass_done_today
+        && state.summon_orders_today < 10
+    {
         needs.push(Need { name: "BossRobotSummonOrder".into(), num: 1, priority: 9 });
     }
 
@@ -90,6 +110,9 @@ pub fn shopping_list(turn: &Turn, state: &BotState) -> Vec<Need> {
     let mut out = Vec::new();
     needs.sort_by_key(|need| need.priority);
     for need in needs {
+        if need.num <= 0 {
+            continue;
+        }
         let price = turn.weapon_shop.get(&need.name).copied().unwrap_or(i64::MAX);
         let cost = price.saturating_mul(need.num);
         if cost <= remaining && price != i64::MAX {
@@ -142,6 +165,10 @@ pub fn should_sell(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i64
         return false;
     }
     if role.backpack_full() || ores >= SELL_BATCH {
+        return true;
+    }
+    // Surplus stones: the wall line is complete, convert dead weight to gold.
+    if stone_demand <= 0 && role.count_item(STONE) >= 8 {
         return true;
     }
     // Price spike: sell the spiked ore immediately (>= 2x baseline).
@@ -206,15 +233,21 @@ pub fn choose_mine(
         return None;
     }
     if stone_demand > 0 {
-        if let Some((pos, ore)) = options.iter().find(|(_pos, ore)| ore == STONE) {
+        // Deterministic pick (zones live in a HashMap): lowest coordinate
+        // wins so workers do not flip-flop between equal stone mines.
+        if let Some((pos, ore)) = options
+            .iter()
+            .filter(|(_pos, ore)| ore == STONE)
+            .min_by_key(|(pos, _ore)| (pos.x, pos.y))
+        {
             return Some((*pos, ore.clone()));
         }
     }
-    // Highest vendor value first; nearest as tiebreak is done by the caller.
+    // Highest vendor value first; coordinate tiebreak keeps it stable.
     options
         .into_iter()
         .max_by_key(|(pos, ore)| {
             let price = turn.vendor_prices.get(ore).copied().unwrap_or(1);
-            (price, -(pos.x as i64 + pos.y as i64))
+            (price, -(pos.x as i64 + pos.y as i64), -(pos.x as i64))
         })
 }

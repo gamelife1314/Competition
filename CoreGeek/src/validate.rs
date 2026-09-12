@@ -171,8 +171,11 @@ fn sanitize_one(turn: &Turn, id: i64, cmd: &RoleCommand) -> Option<RoleCommand> 
             if items.is_empty() {
                 return None;
             }
+            // Items are a multiset: the backpack must hold the FULL count of
+            // each distinct name (a legal summon consumes them all).
             for item in items {
-                if actor.count_item(item) < 1 {
+                let required = items.iter().filter(|other| *other == item).count();
+                if actor.count_item(item) < required {
                     return None;
                 }
             }

@@ -59,11 +59,13 @@ pub fn parse_plan(resp: &str, current_day: i64) -> Option<TreasurePlan> {
     if !(0..41).contains(&x) || !(0..32).contains(&y) {
         return None;
     }
+    // Items are a MULTISET: the legends may ask for e.g. three StarSand
+    // ("门需三钥"). Keep duplicates; the judger checks 不能多、不能少.
     let mut items: Vec<String> = Vec::new();
     if let Some(list) = value.get("items").and_then(|v| v.as_array()) {
         for entry in list {
             if let Some(name) = entry.as_str() {
-                if ALL_ITEMS.contains(&name) && !items.iter().any(|old| old == name) {
+                if ALL_ITEMS.contains(&name) && items.len() < 6 {
                     items.push(name.to_string());
                 }
             }
@@ -80,17 +82,21 @@ pub fn parse_plan(resp: &str, current_day: i64) -> Option<TreasurePlan> {
     Some(TreasurePlan { pos: Pos { x, y }, items, open_day })
 }
 
-fn build_prompt(state: &BotState, feedback: bool) -> String {
+fn build_prompt(state: &BotState) -> String {
     let mut prompt = String::new();
     prompt.push_str("以下是游戏世界中逐日流传的民间传闻，其中隐藏着一个祭坛宝藏的线索。\n");
     prompt.push_str("请推理出：宝藏祭坛坐标（地图 41x32，原点左下角）、开启所需的献祭物品组合、以及宝藏开启的游戏日。\n");
-    prompt.push_str("可用献祭物品（英文名必须原样使用）：AcientTablet(古符石板), StarSand(星辰之沙), FlameBreath(烈焰之息), FrostPotion(寒霜药剂), ThornAmulet(荆棘护符), IronWhistle(回音铁哨)。\n\n");
+    prompt.push_str("可用献祭物品（英文名必须原样使用）：AcientTablet(古符石板), StarSand(星辰之沙), FlameBreath(烈焰之息), FrostPotion(寒霜药剂), ThornAmulet(荆棘护符), IronWhistle(回音铁哨)。\n");
+    prompt.push_str("献祭物品是多重集合：若线索指向同一种物品的多个（例如“门需三钥”指三件同类物品），请在 items 中重复列出该物品名。\n\n");
     prompt.push_str("全部传闻：\n");
     for (day, text) in &state.treasure.legends {
         prompt.push_str(&format!("DAY{day}: {}\n", truncate(text, 400)));
     }
-    if feedback {
+    if state.treasure.wrong_item_rounds > 0 {
         prompt.push_str("\n注意：上次献祭的物品组合被判定错误（结果码3）。请重新审视传闻中关于物品数量与种类的全部细节，给出不同的组合。\n");
+    }
+    if state.treasure.time_feedback {
+        prompt.push_str("\n注意：上次按你给出的坐标与物品献祭，被判定“无宝藏或宝藏暂未开启”（结果码2）。可能是坐标错误或开启时间未到，请重新推理祭坛位置与开启日。\n");
     }
     prompt.push_str(
         "\n只输出一个 JSON 对象，不要输出其它内容，格式：\n{\"pos\":{\"x\":20,\"y\":16},\"items\":[\"StarSand\",\"IronWhistle\"],\"openDay\":5}\n",
@@ -113,9 +119,9 @@ pub fn plan_pioneer(
             // Ask the LLM once we have enough legends and spare budget.
             let enough = state.treasure.legends.len() >= 2;
             if enough && state.is_prompt_free() && plan.prompt.is_none() {
-                let feedback = state.treasure.wrong_item_rounds > 0;
-                plan.prompt = Some(build_prompt(state, feedback));
+                plan.prompt = Some(build_prompt(state));
                 state.consume_prompt_budget();
+                state.treasure.time_feedback = false;
                 state.treasure.phase = TreasurePhase::AskedLlm { round: turn.round_no };
             }
             None
@@ -129,13 +135,19 @@ pub fn plan_pioneer(
         }
         TreasurePhase::HavePlan => {
             let treasure_plan = state.treasure.plan.clone()?;
-            // 1. Collect the sacrifice items.
-            let missing: Vec<String> = treasure_plan
-                .items
-                .iter()
-                .filter(|item| pioneer.count_item(item) == 0)
-                .cloned()
-                .collect();
+            // 1. Collect the sacrifice items (multiset: buy the missing COUNT
+            //    per distinct item, not just one).
+            let mut missing: Vec<(String, i64)> = Vec::new();
+            for item in &treasure_plan.items {
+                if missing.iter().any(|(name, _)| name == item) {
+                    continue;
+                }
+                let need = treasure_plan.items.iter().filter(|other| *other == item).count() as i64;
+                let have = pioneer.count_item(item) as i64;
+                if have < need {
+                    missing.push((item.clone(), need - have));
+                }
+            }
             if !missing.is_empty() {
                 let shops = turn.weapon_shops();
                 let stand = shops
@@ -145,10 +157,10 @@ pub fn plan_pioneer(
                     .collect::<Vec<_>>();
                 if stand.iter().any(|pos| *pos == pioneer.pos) {
                     // Buying one kind per round; gold is team-shared.
-                    let first = &missing[0];
-                    let price = turn.weapon_shop.get(first).copied().unwrap_or(15);
-                    if turn.gold >= price {
-                        return Some(RoleCommand::buy(first, 1));
+                    let (name, num) = &missing[0];
+                    let price = turn.weapon_shop.get(name).copied().unwrap_or(15);
+                    if turn.gold >= price.saturating_mul(*num) {
+                        return Some(RoleCommand::buy(name, *num));
                     }
                     return None; // wait for gold
                 }

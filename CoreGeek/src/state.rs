@@ -90,7 +90,9 @@ pub struct TreasureState {
     pub ask_attempts: i32,
     pub summon_attempts: i32,
     pub wrong_item_rounds: i32,
-    pub items_bought: bool,
+    /// Set when a summon came back "too early" (code 2): the next LLM ask
+    /// must re-derive the opening time instead of just pushing the day.
+    pub time_feedback: bool,
 }
 
 #[derive(Debug, Default)]
@@ -139,6 +141,16 @@ impl BotState {
 
     /// Absorb per-round feedback. Must run before planning.
     pub fn observe(&mut self, turn: &Turn) {
+        // A match is two halves (sides swap, roundNo restarts). If the round
+        // number regresses, the previous match's memory (blacklisted cells,
+        // task session, treasure plan…) belongs to the OTHER board — wipe it.
+        if self.last_round > 0 && turn.round_no < self.last_round {
+            crate::log::event(
+                "state_reset",
+                serde_json::json!({"fromRound": self.last_round, "toRound": turn.round_no}),
+            );
+            *self = BotState::default();
+        }
         // Day rollover: reset daily budgets.
         if turn.day != self.current_day {
             self.current_day = turn.day;
@@ -373,22 +385,30 @@ impl BotState {
                 self.treasure.phase = Done;
             }
             2 => {
-                // Not the right time yet: push the opening day forward.
-                if let Some(plan) = &mut self.treasure.plan {
-                    plan.open_day = turn.day.max(plan.open_day + 1);
-                }
+                // "No treasure here / not open yet". NOTE: a legal summon
+                // CONSUMES the sacrifice items regardless of outcome, so
+                // retries are expensive (15g per item). One in-place retry
+                // with the day pushed forward, then re-ask the LLM; hard cap
+                // at 4 total summons so we never loop forever.
                 self.treasure.summon_attempts = self.treasure.summon_attempts.saturating_add(1);
-                if self.treasure.summon_attempts > 6 {
+                if self.treasure.summon_attempts >= 4 {
                     self.treasure.phase = Done;
-                } else if !matches!(self.treasure.phase, Done) {
+                } else if self.treasure.summon_attempts >= 2 {
+                    self.treasure.plan = None;
+                    self.treasure.time_feedback = true;
+                    self.treasure.phase = if self.treasure.ask_attempts >= 3 { Done } else { Idle };
+                } else if let Some(plan) = &mut self.treasure.plan {
+                    plan.open_day = turn.day.max(plan.open_day + 1);
                     self.treasure.phase = HavePlan;
+                } else {
+                    self.treasure.phase = Idle;
                 }
             }
             3 => {
                 // Wrong sacrifice items: ask the LLM again with feedback.
                 self.treasure.wrong_item_rounds = self.treasure.wrong_item_rounds.saturating_add(1);
                 self.treasure.plan = None;
-                if self.treasure.wrong_item_rounds >= 3 {
+                if self.treasure.wrong_item_rounds + self.treasure.ask_attempts >= 4 {
                     self.treasure.phase = Done;
                 } else {
                     self.treasure.phase = Idle;
