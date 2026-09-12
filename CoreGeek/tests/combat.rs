@@ -515,3 +515,41 @@ fn day_two_night_all_weapons_operated() {
         assert_eq!(cmd.action, "attack", "tower {tower_id} is operated on day-2 night");
     }
 }
+
+#[test]
+fn night_round_one_response_contains_attack_commands() {
+    // Round 71 = day-1 night (in_day_round 70). Three towers, three adjacent
+    // controllers, robots in range. Exercise the FULL path — decide →
+    // sanitize → serialize — because that is what the judger receives. A
+    // planner-level check would not catch an attack command silently dropped
+    // by validation or mis-serialized away.
+    let payload = night_world(
+        71,
+        vec![
+            gatling(10020, 10, 10, 1),
+            gatling(10021, 14, 10, 1),
+            gatling(10022, 10, 14, 1),
+            worker(10010, 11, 10), // adjacent to 10020
+            worker(10011, 13, 10), // adjacent to 10021
+            worker(10012, 11, 14), // adjacent to 10022
+        ],
+        vec![
+            robot(30001, 11, 9, 40, "challenger"),
+            robot(30002, 13, 9, 40, "challenger"),
+            robot(30003, 9, 13, 40, "challenger"),
+        ],
+    );
+    let out = coregeek::brain::respond(payload.to_string().as_bytes());
+    let value: Value = serde_json::from_str(&out).expect("valid JSON response");
+    let map = value.get("roleCommandMap").expect("has roleCommandMap");
+    for tower_id in ["10020", "10021", "10022"] {
+        let cmd = map
+            .get(tower_id)
+            .unwrap_or_else(|| panic!("tower {tower_id} has a command in the response"));
+        assert_eq!(
+            cmd.get("action").and_then(Value::as_str),
+            Some("attack"),
+            "tower {tower_id} must fire through the full response path"
+        );
+    }
+}

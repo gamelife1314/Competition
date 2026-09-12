@@ -117,34 +117,21 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         // Claim only a valid, able controller — an unusable one falls through
         // to spare duties instead of idling next to a dead tower all night.
         paired.insert(*controller_id);
-        if chebyshev(controller.pos, tower.pos) <= 1 {
+        let dist = chebyshev(controller.pos, tower.pos);
+        let adjacent = dist <= 1;
+        let mut targets_count: usize = 0;
+        let mut fired = false;
+        if adjacent {
             // Man the tower: attack commands are keyed by the TOWER's id.
             if tower.cooldown == 0 {
                 if let Some(targets) = combat::choose_attack(turn, tower, &mut sim) {
-                    crate::log::event(
-                        "night_attack",
-                        serde_json::json!({
-                            "round": turn.round_no,
-                            "controller": controller.id,
-                            "tower": tower.id,
-                            "cooldown": tower.cooldown,
-                            "targets": targets.len(),
-                        }),
-                    );
+                    targets_count = targets.len();
+                    fired = true;
                     plan.push(tower.id, RoleCommand::attack(controller.id, targets));
                 }
             }
             // The controller holds position (no command) to stay adjacent.
         } else {
-            crate::log::event(
-                "night_pair_walk",
-                serde_json::json!({
-                    "round": turn.round_no,
-                    "controller": controller.id,
-                    "tower": tower.id,
-                    "dist": chebyshev(controller.pos, tower.pos),
-                }),
-            );
             let stands = stand_cells(turn, tower.pos);
             // Try walking while respecting claimed cells (soft preference).
             if let Some(cmd) = walk_toward(turn, controller, &stands, &mut claimed) {
@@ -159,6 +146,22 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 }
             }
         }
+        // One diagnostic line per pair per round: makes "weapon unoperated"
+        // failures visible in the stdout JSONL log without a debugger.
+        crate::log::event(
+            "night_debug",
+            serde_json::json!({
+                "round": turn.round_no,
+                "pairs_count": pairs.len(),
+                "controller_adjacent": adjacent,
+                "dist": dist,
+                "cooldown": tower.cooldown,
+                "attack_targets": targets_count,
+                "tower_id": *tower_id,
+                "controller_id": *controller_id,
+                "fired": fired,
+            }),
+        );
     }
 
     // Spare controllers.
