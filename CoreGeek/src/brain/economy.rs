@@ -288,10 +288,20 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         0
     };
     if fixers < want_fixers {
+        // A wall at half HP is a breach waiting for the night, and 10 gold
+        // buys its full 1000-3000 HP back (任务书: WallFixer "目标坐标所在围墙回
+        // 满血") — the cheapest HP in the game. Issue #16 could not afford one
+        // on D2 and lost the ring: a chipped wall can wait behind Medicine, a
+        // half-destroyed one cannot. The tie with Medicine keeps Medicine
+        // first (stable sort, and Medicine is listed above), so a hurt role
+        // still drinks before the wall is patched.
+        let critical = walls
+            .iter()
+            .any(|wall| wall.health * 2 < crate::brain::combat::wall_max_hp(wall.level));
         needs.push(Need {
             name: "WallFixer".into(),
             num: want_fixers - fixers,
-            priority: 3,
+            priority: if critical { 2 } else { 3 },
             latest_round: latest(0),
             value: 0,
             reason: "wall_repair",
