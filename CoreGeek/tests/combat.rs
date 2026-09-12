@@ -2474,3 +2474,139 @@ fn a_cash_starved_team_sells_its_pack_instead_of_waiting_for_a_load() {
         "an empty pack is not a reason to shorten the batch"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #18: the purse froze at 0 from R60 to the end of the match — base
+// level 1, no voucher ever bought — because every worker was on the ring's
+// stone errand and stone is the one ore the vendor is refused.
+// ---------------------------------------------------------------------------
+
+/// Two workers and a ring full of gaps, with a stone vein and an iron vein
+/// both touching the crew. `round_no` picks the day; the ring has no walls in
+/// either case, so `stone_demand` is at its largest.
+fn two_vein_world(round_no: i64, extra: Vec<Value>) -> Value {
+    let mut zones = vec![
+        zone(5, 6, "stone"),
+        zone(6, 5, "iron"),
+        zone(0, 0, "vendor"),
+    ];
+    zones.extend(extra);
+    day_world_at(
+        round_no,
+        vec![
+            station(10, 20, 1),
+            worker(10010, 30, 30), // the wall crew
+            worker(10011, 5, 5),   // the dedicated economy worker (highest id)
+        ],
+        0,
+        vec![],
+        zones,
+    )
+}
+
+fn first_target(cmd: &RoleCommand) -> Option<Pos> {
+    cmd.targetPos
+        .as_ref()
+        .and_then(|list| list.first())
+        .copied()
+}
+
+#[test]
+fn economy_worker_digs_ore_the_vendor_buys_not_the_ring_stone() {
+    // Day 2, ring wide open, stone short: the wall crew's errand is stone, and
+    // it never ends — `build` spends the pack, so `team_ores(STONE) <
+    // stone_demand` is restored by the act of closing a gap. A worker kept on
+    // it carries nothing sellable, and `sellable_ores` refuses to sell the
+    // stone itself, so the team earns nothing, buys nothing and repairs
+    // nothing: issue #18's purse at exactly 0 from R60 to R361, base level 1.
+    // One worker has to be digging iron. The second stone vein is what keeps
+    // this an honest test: without it the wall crew reserves the only stone on
+    // the map, the economy worker falls through `choose_mine`'s "no stone
+    // reachable" path to the iron by accident, and the freeze this test exists
+    // to prevent is masked by a claim collision.
+    let turn = turn_from(two_vein_world(135, vec![zone(20, 20, "stone")]));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+
+    let economy = plan.commands.get(&10011).expect("economy worker acts");
+    assert_eq!(economy.action, "collect");
+    assert_eq!(
+        first_target(economy),
+        Some(Pos { x: 6, y: 5 }),
+        "the economy worker digs the iron, not the stone beside it"
+    );
+
+    // The ring still gets its digger: the same round, the other worker walks to
+    // the stone vein. Only ONE role leaves the wall line, never both.
+    let crew = plan.commands.get(&10010).expect("wall crew acts");
+    assert_ne!(
+        (crew.action.as_str(), first_target(crew)),
+        ("collect", Some(Pos { x: 6, y: 5 })),
+        "the wall crew must not follow the economy worker onto the iron"
+    );
+}
+
+#[test]
+fn day_one_keeps_the_whole_crew_on_the_ring() {
+    // The exemption is for the ring's build-out, not for the ring's upkeep: on
+    // day 1 both workers fetch stone, because the ring is what makes every
+    // later day affordable (wall-first build order). This is the behaviour the
+    // economy worker's gold loop must not preempt.
+    let turn = turn_from(two_vein_world(
+        5,
+        vec![zone(20, 20, "stone")], // nearer to 10010, so 10011 keeps its own vein
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let economy = plan.commands.get(&10011).expect("economy worker acts");
+    assert_eq!(economy.action, "collect");
+    assert_eq!(
+        first_target(economy),
+        Some(Pos { x: 5, y: 6 }),
+        "on day 1 the economy worker is a wall builder like everyone else"
+    );
+}
+
+#[test]
+fn a_sellable_vein_beats_the_nearer_stone() {
+    // The low-level rule the day planner leans on: the sellable selector skips
+    // stone even when the stone is closer, and falls back to it only when the
+    // map has nothing else to dig.
+    let turn = turn_from(day_world_at(
+        135,
+        vec![station(10, 20, 1), worker(10011, 5, 5)],
+        0,
+        vec![],
+        vec![zone(5, 6, "stone"), zone(9, 9, "copper")],
+    ));
+    let state = BotState::default();
+    let role = turn.role_by_id(10011).unwrap();
+    let pick = coregeek::brain::economy::choose_sellable_mine(
+        &turn,
+        &state,
+        role.pos,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        pick,
+        Some((Pos { x: 9, y: 9 }, "copper".to_string())),
+        "the nearer stone is not income"
+    );
+
+    // Nothing but stone on the map: income is impossible anyway, and idling is
+    // worse than a load the ring can hold back.
+    let stone_only = turn_from(day_world_at(
+        135,
+        vec![station(10, 20, 1), worker(10011, 5, 5)],
+        0,
+        vec![],
+        vec![zone(5, 6, "stone")],
+    ));
+    let pick = coregeek::brain::economy::choose_sellable_mine(
+        &stone_only,
+        &state,
+        stone_only.role_by_id(10011).unwrap().pos,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(pick, Some((Pos { x: 5, y: 6 }, "stone".to_string())));
+}

@@ -628,7 +628,21 @@ fn worker_day(
     // 10. Mine the nearest ore (stone first while walls are wanted). Mining
     //    pauses during dusk so the ore we hold is converted to gold instead.
     if turn.in_day_round < economy::DUSK_ROUND && !role.backpack_full() {
-        if let Some(cmd) = mine_flow(turn, state, role, stone_demand, pairs, wall_gaps, claimed) {
+        // The dedicated economy worker keeps the collect→sell→buy loop funded
+        // once the ring's own build-out is over: outside day 1 it digs ore the
+        // vendor buys, never the stone the wall line is holding back. See
+        // `economy::choose_sellable_mine`.
+        let keep_gold_loop = Some(role.id) == economy_id && !shared_wall_duty;
+        if let Some(cmd) = mine_flow(
+            turn,
+            state,
+            role,
+            stone_demand,
+            keep_gold_loop,
+            pairs,
+            wall_gaps,
+            claimed,
+        ) {
             plan.push(role.id, cmd);
             return;
         }
@@ -1299,11 +1313,13 @@ fn open_door(
 /// Walk to the nearest mine and collect. Stone is preferred while the wall
 /// line still needs the load this role is carrying; distance always beats ore
 /// value.
+#[allow(clippy::too_many_arguments)]
 fn mine_flow(
     turn: &Turn,
     state: &BotState,
     role: &Unit,
     stone_demand: i64,
+    keep_gold_loop: bool,
     pairs: &[(i64, i64)],
     wall_gaps: &[Pos],
     claimed: &mut HashSet<Pos>,
@@ -1313,14 +1329,25 @@ fn mine_flow(
     // splitting a 20-cell ring hold 10 each, so a per-pack test keeps both of
     // them digging stone long after the ring has all the stone it can use,
     // and the sellable ore that funds the rest of the day never gets mined.
-    let want_stone = stone_demand > 0 && economy::team_ores(turn, STONE) < stone_demand;
-    let pick = economy::choose_mine(
-        turn,
-        state,
-        role.pos,
-        if want_stone { stone_demand } else { 0 },
-        claimed,
-    )?;
+    //
+    // The dedicated economy worker never joins that queue outside day 1: it is
+    // the role that has to keep carrying ore the vendor will buy, and stone is
+    // the one ore the vendor is refused. See
+    // `economy::choose_sellable_mine` for the freeze that cost issue #18 the
+    // whole match.
+    let want_stone =
+        !keep_gold_loop && stone_demand > 0 && economy::team_ores(turn, STONE) < stone_demand;
+    let pick = if keep_gold_loop {
+        economy::choose_sellable_mine(turn, state, role.pos, claimed)?
+    } else {
+        economy::choose_mine(
+            turn,
+            state,
+            role.pos,
+            if want_stone { stone_demand } else { 0 },
+            claimed,
+        )?
+    };
     // Stone is what the ring wants, but only a trip that can carry a load home
     // before this role must be at its gun is a wall trip. When no vein is that
     // close, the demand is not "stone" any more — it is an unwinnable walk, and

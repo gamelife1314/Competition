@@ -705,6 +705,59 @@ pub fn sell_command(
     best.map(|(_, ore, count)| RoleCommand::sell(ore, count))
 }
 
+/// The nearest mine whose ore the vendor will actually take.
+///
+/// `choose_mine` answers "what does the day need", and while the ring is short
+/// of stone the answer is always stone. Every load that errand brings home is
+/// then held back by `sellable_ores` (stone is the wall line's raw material,
+/// not income), so a worker kept on it never earns a coin. The errand is not a
+/// phase that passes, either: `build` spends the pack, so
+/// `team_ores(STONE) < stone_demand` is re-established by the very act of
+/// closing a gap and can hold from the first gap of day 2 to the last round of
+/// the match. Issue #18's purse froze at the 75 gold day 1 had spent on towers
+/// and stayed at exactly 0 for the remaining 300 rounds — base level 1, no
+/// voucher ever bought, while the opponent "通过 sell 操作回血" — and this is
+/// the half of that loop that was missing.
+///
+/// This is the selector for the ONE role whose job is collect→sell→buy (the
+/// dedicated economy worker). The ring still gets its diggers: every other
+/// worker is on `choose_mine` and stone duty, and day 1 keeps the whole crew on
+/// the ring until it closes, because the ring is what makes the rest of the
+/// match affordable ([`crate::brain::day`]'s `shared_wall_duty`). Stone is the
+/// fallback here: with no other vein left to dig, income is impossible anyway
+/// and idling is worse.
+pub fn choose_sellable_mine(
+    turn: &Turn,
+    state: &BotState,
+    role_pos: Pos,
+    claimed: &HashSet<Pos>,
+) -> Option<(Pos, String)> {
+    // Nearest first, equal distance broken by higher vendor value — the same
+    // rule `choose_mine` uses once it has no stone to fetch.
+    let mut best: Option<(i32, std::cmp::Reverse<i64>, i32, i32, Pos, String)> = None;
+    for (pos, ore) in turn.all_mines() {
+        if ore == STONE || state.ore_on_outage(&ore, turn.day) || claimed.contains(&pos) {
+            continue;
+        }
+        let price = turn.vendor_prices.get(&ore).copied().unwrap_or(1);
+        let key = (
+            chebyshev(role_pos, pos),
+            std::cmp::Reverse(price),
+            pos.x,
+            pos.y,
+            pos,
+            ore,
+        );
+        if best.as_ref().map(|current| key < *current).unwrap_or(true) {
+            best = Some(key);
+        }
+    }
+    if let Some((_, _, _, _, pos, ore)) = best {
+        return Some((pos, ore));
+    }
+    choose_mine(turn, state, role_pos, 0, claimed)
+}
+
 /// Pick the nearest mine for this worker: stones first while wall demand is
 /// unmet, otherwise the closest mine of any ore. Distance always beats value
 /// — a short walk keeps the build loop moving faster than a high-value ore
