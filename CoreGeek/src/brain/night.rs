@@ -175,6 +175,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         let adjacent = dist <= 1;
         let mut targets_count: usize = 0;
         let mut fired = false;
+        let mut enemy_fire = false;
         // Why a ready weapon stayed silent. "could fire but did not" was the
         // single hardest failure to diagnose from the logs (battles pk575060 /
         // pk575098 / pk575557), so each idle tower now carries its own reason.
@@ -232,10 +233,15 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 idle_reason = "controller_healing";
                 plan.push(controller.id, cmd);
             } else if tower.cooldown == 0 {
-                if let Some(targets) = combat::choose_attack(turn, tower, &mut sim) {
+                if let Some((targets, kind)) = combat::choose_attack_kind(turn, tower, &mut sim) {
                     targets_count = targets.len();
                     fired = true;
+                    enemy_fire = kind == combat::TargetKind::EnemyAssets;
                     plan.push(tower.id, RoleCommand::attack(controller.id, targets));
+                } else if !combat::spare_firepower(turn) {
+                    // Robots hunting us are outside every ready tower's reach:
+                    // hold the opportunistic shot (issue #7's "有余力时").
+                    idle_reason = "no_target_reserved_for_robots";
                 } else {
                     idle_reason = "no_target_in_range";
                 }
@@ -260,6 +266,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 "controller_pos": controller.pos,
                 "tower_pos": tower.pos,
                 "fired": fired,
+                "enemyFire": enemy_fire,
                 "reason": idle_reason,
             }),
         );
