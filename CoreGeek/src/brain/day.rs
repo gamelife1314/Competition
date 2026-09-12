@@ -227,17 +227,19 @@ fn worker_day(
             return;
         }
     }
-    // 7. Mine the nearest ore (stone first while walls are wanted). Mining
-    //    pauses during dusk so the ore we hold is converted to gold instead.
-    if turn.in_day_round < economy::DUSK_ROUND && !role.backpack_full() {
-        if let Some(cmd) = mine_flow(turn, state, role, stone_demand, claimed) {
+    // 7. Sell accumulated ore in one batch before collecting more. This keeps
+    //    the collect→sell→buy loop moving instead of filling a 100-slot pack
+    //    one item at a time while usable gold remains trapped in the backpack.
+    if economy::should_sell(turn, state, role, stone_demand) {
+        if let Some(cmd) = sell_flow(turn, state, role, stone_demand, claimed) {
             plan.push(role.id, cmd);
             return;
         }
     }
-    // 8. Sell ore for gold.
-    if economy::should_sell(turn, state, role, stone_demand) {
-        if let Some(cmd) = sell_flow(turn, state, role, stone_demand, claimed) {
+    // 8. Mine the nearest ore (stone first while walls are wanted). Mining
+    //    pauses during dusk so the ore we hold is converted to gold instead.
+    if turn.in_day_round < economy::DUSK_ROUND && !role.backpack_full() {
+        if let Some(cmd) = mine_flow(turn, state, role, stone_demand, claimed) {
             plan.push(role.id, cmd);
             return;
         }
@@ -398,14 +400,17 @@ fn buyer_flow(
     }
     if stands.iter().any(|pos| *pos == role.pos) {
         let price = turn.weapon_shop.get(&need.name).copied().unwrap_or(i64::MAX);
-        if price.saturating_mul(need.num) <= turn.gold {
+        let free_slots = role.capacity.saturating_sub(role.backpack.len() as i64);
+        let affordable = if price > 0 { turn.gold / price } else { 0 };
+        let num = need.num.min(free_slots).min(affordable);
+        if num > 0 {
             crate::log::event(
                 "buy",
-                serde_json::json!({"role": role.id, "name": need.name, "num": need.num, "gold": turn.gold}),
+                serde_json::json!({"role": role.id, "name": need.name, "num": num, "gold": turn.gold}),
             );
-            return Some(RoleCommand::buy(&need.name, need.num));
+            return Some(RoleCommand::buy(&need.name, num));
         }
-        return None; // wait for gold
+        return None; // wait for gold or backpack space
     }
     walk_toward(turn, role, &stands, claimed)
 }
@@ -574,6 +579,9 @@ fn nearest_adjacent_mine(turn: &Turn, role: &Unit, preferred_ore: &str, claimed:
 /// paired with the weapon kind that should stand there. Cells already
 /// holding one of our towers, blacklisted cells and non-land are excluded.
 pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
+    if turn.towers().len() >= 3 {
+        return Vec::new();
+    }
     let Some(station) = turn.station() else { return Vec::new() };
     let footprint = station_footprint(station.pos);
     let occupied: HashSet<Pos> =
@@ -595,11 +603,11 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
             _ => {}
         }
     }
-    // Build order: gatling (cheap, fast) → rocket (AOE vs. night waves) →
-    // railgun (single-target snipe). Battle pk575060 was lost to an enemy
-    // gatling+rocket+railgun line while we fielded only gatling+railgun —
-    // the missing rocket's splash was the difference.
-    let build_order: [(usize, &str); 3] = [(0, "gatling"), (2, "rocket"), (1, "railgun")];
+    // Build order: gatling controls the near lane, then railgun exploits lined-up
+    // waves without being stopped by the front robot. Rocket remains the third
+    // slot: it is still completed early, but only after the two dependable
+    // no-cooldown weapons can defend the base.
+    let build_order: [(usize, &str); 3] = [(0, "gatling"), (1, "railgun"), (2, "rocket")];
     let mut gaps: Vec<(Pos, String)> = Vec::new();
     let mut used: HashSet<Pos> = HashSet::new();
     for (have_idx, kind) in build_order {

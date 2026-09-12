@@ -124,6 +124,66 @@ fn railgun_picks_the_piercing_line() {
 }
 
 #[test]
+fn gatling_front_robot_blocks_the_rear_robot() {
+    let turn = turn_from(world(
+        vec![gatling(10020, 10, 10, 1)],
+        vec![
+            robot(30001, 11, 10, 40, "defender"),
+            robot(30002, 12, 10, 40, "challenger"),
+        ],
+    ));
+    let tower = turn.role_by_id(10020).unwrap();
+    let mut sim = init_sim(&turn);
+    let targets = choose_attack(&turn, tower, &mut sim).unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(sim.get(&30001), Some(&30), "front robot absorbs the bullet");
+    assert_eq!(sim.get(&30002), Some(&40), "rear robot is blocked");
+}
+
+#[test]
+fn railgun_energy_pierces_front_robot_into_rear_robot() {
+    let turn = turn_from(world(
+        vec![json!({
+            "id": 10030, "pos": {"x": 10, "y": 10}, "roleType": "railgun",
+            "health": 1000, "attackPower": 30, "attackRange": 10,
+            "level": 3, "backPackCapability": 0, "backpack": []
+        })],
+        vec![
+            robot(30001, 12, 10, 10, "challenger"),
+            robot(30002, 14, 10, 40, "challenger"),
+        ],
+    ));
+    let tower = turn.role_by_id(10030).unwrap();
+    let mut sim = init_sim(&turn);
+    let targets = choose_attack(&turn, tower, &mut sim).unwrap();
+    assert_eq!(targets, vec![Pos { x: 14, y: 10 }]);
+    assert_eq!(sim.get(&30001), Some(&0), "front robot takes the first 10 energy");
+    assert_eq!(sim.get(&30002), Some(&20), "remaining 20 energy reaches the rear robot");
+}
+
+#[test]
+fn idle_weapon_targets_enemy_weapon_before_station() {
+    let mut payload = world(vec![rocket(10040, 10, 10, 1)], vec![]);
+    payload["teamEnemy"]["roles"] = json!([
+        {
+            "id": 20013, "pos": {"x": 14, "y": 10}, "roleType": "station",
+            "health": 1500, "attackPower": 0, "attackRange": 0,
+            "level": 1, "backPackCapability": 0, "backpack": []
+        },
+        {
+            "id": 20020, "pos": {"x": 13, "y": 10}, "roleType": "gatling",
+            "health": 1000, "attackPower": 10, "attackRange": 3,
+            "level": 1, "backPackCapability": 0, "backpack": []
+        }
+    ]);
+    let turn = turn_from(payload);
+    let tower = turn.role_by_id(10040).unwrap();
+    let mut sim = init_sim(&turn);
+    let targets = choose_attack(&turn, tower, &mut sim).unwrap();
+    assert_eq!(targets, vec![Pos { x: 13, y: 10 }]);
+}
+
+#[test]
 fn rocket_fires_level_missiles_at_cluster() {
     let turn = turn_from(world(
         vec![json!({
@@ -952,18 +1012,18 @@ fn worker_prepositions_to_tower_before_dusk() {
 }
 
 #[test]
-fn rocket_is_built_second() {
-    // Battle pk575060 fielded only gatling+railgun while the enemy had
-    // gatling+rocket+railgun; the missing rocket's AOE splash was decisive.
-    // The build order must therefore be gatling → rocket → railgun.
+fn gatling_and_railgun_are_built_before_rocket() {
+    // Gatling controls the nearest lane and railgun pierces lined-up waves.
+    // Rocket remains the third early slot, deferred until those two defenses
+    // exist and the upgrade reserve allows another build.
     let turn = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
     let state = BotState::default();
     let gaps = coregeek::brain::day::tower_gaps(&turn, &state);
     let kinds: Vec<&str> = gaps.iter().map(|(_, kind)| kind.as_str()).collect();
     assert_eq!(
         kinds,
-        vec!["gatling", "rocket", "railgun"],
-        "tower build order is gatling → rocket → railgun"
+        vec!["gatling", "railgun", "rocket"],
+        "tower build order is gatling → railgun → rocket"
     );
 }
 
@@ -1116,4 +1176,100 @@ fn tower_build_reserve_covers_two_towers_not_three() {
     assert_eq!(coregeek::brain::day::tower_build_reserve(0, 3), 50);
     assert_eq!(coregeek::brain::day::tower_build_reserve(1, 2), 25);
     assert_eq!(coregeek::brain::day::tower_build_reserve(2, 1), 0, "no third tower until an upgrade");
+}
+
+#[test]
+fn four_ores_trigger_one_batch_sale_before_more_mining() {
+    let turn = turn_from(day_world_at(
+        5,
+        vec![
+            station(10, 20, 3),
+            gatling(10020, 9, 20, 2),
+            railgun(10030, 10, 21, 2),
+            rocket(10040, 9, 21, 2),
+            json!({
+                "id": 10010, "pos": {"x": 1, "y": 0}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100,
+                "backpack": ["iron", "iron", "iron", "iron"]
+            }),
+        ],
+        0,
+        vec![],
+        vec![zone(0, 0, "vendor"), zone(1, 1, "iron")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("worker sells");
+    assert_eq!(cmd.action, "sell");
+    assert_eq!(cmd.name.as_deref(), Some("iron"));
+    assert_eq!(cmd.num, Some(4), "the complete ore stack is sold in one command");
+}
+
+#[test]
+fn planner_buys_consumables_in_a_batch() {
+    let turn = turn_from(day_world_at(
+        5,
+        vec![
+            station(10, 20, 3),
+            gatling(10020, 9, 20, 2),
+            railgun(10030, 10, 21, 2),
+            rocket(10040, 9, 21, 2),
+            json!({
+                "id": 10010, "pos": {"x": 1, "y": 0}, "roleType": "worker",
+                "health": 100, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100, "backpack": []
+            }),
+        ],
+        20,
+        vec![json!({"name": "Medicine", "price": 10})],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("worker buys");
+    assert_eq!(cmd.action, "buy");
+    assert_eq!(cmd.name.as_deref(), Some("Medicine"));
+    assert_eq!(cmd.num, Some(2), "both medicines are bought in one command");
+}
+
+#[test]
+fn sanitizer_enforces_shared_gold_and_never_overwrites_towers() {
+    let turn = turn_from(day_world_at(
+        5,
+        vec![
+            gatling(10020, 5, 5, 1),
+            worker(10010, 4, 4),
+            worker(10012, 8, 8),
+        ],
+        25,
+        vec![],
+        vec![],
+    ));
+    let mut commands = HashMap::new();
+    commands.insert(10010, RoleCommand::build(Pos { x: 5, y: 5 }, "rocket"));
+    commands.insert(10012, RoleCommand::build(Pos { x: 9, y: 9 }, "railgun"));
+    let out = sanitize(&turn, commands);
+    assert_eq!(out.len(), 1, "only one 25-gold build fits the shared budget");
+    assert!(out.get("10010").is_none(), "the existing gatling is never overwritten");
+}
+
+#[test]
+fn batch_buy_must_fit_remaining_backpack_capacity() {
+    let mut pack = vec!["stone"; 99];
+    pack.push("iron");
+    let turn = turn_from(day_world_at(
+        5,
+        vec![json!({
+            "id": 10010, "pos": {"x": 1, "y": 0}, "roleType": "worker",
+            "health": 220, "attackPower": 0, "attackRange": 0,
+            "backPackCapability": 100, "backpack": pack
+        })],
+        20,
+        vec![json!({"name": "Medicine", "price": 10})],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let mut commands = HashMap::new();
+    commands.insert(10010, RoleCommand::buy("Medicine", 2));
+    assert!(sanitize(&turn, commands).is_empty(), "batch cannot overflow the backpack");
 }

@@ -8,7 +8,7 @@ use crate::state::BotState;
 
 /// Sell a stack once this many ore accumulate — small enough that gold flows
 /// every few rounds instead of sitting in a full backpack until dusk.
-pub const SELL_BATCH: i64 = 5;
+pub const SELL_BATCH: i64 = 4;
 pub const STONE_BUFFER: i64 = 2;
 
 /// First day round (in_day_round) of the "dusk" window: mining stops and every

@@ -331,19 +331,28 @@ fn apply_splash(impact: Pos, robots: &[&Robot], sim: &mut SimHp) {
 }
 
 fn choose_enemy_targets(turn: &Turn, tower: &Unit, projectiles: usize) -> Option<Vec<Pos>> {
+    let mut units: Vec<&Unit> = turn
+        .enemy
+        .iter()
+        .filter(|unit| unit.alive() && unit.footprint().iter().any(|cell| in_range(tower, *cell)))
+        .collect();
+    // With no robot in range, disable the opponent's firepower before spending
+    // shots on walls. Visible humans come first because they operate every
+    // weapon; towers follow, then the station and finally walls.
+    units.sort_by_key(|unit| match unit.kind {
+        UnitKind::Pioneer | UnitKind::Worker => 0,
+        UnitKind::Gatling | UnitKind::Railgun | UnitKind::Rocket => 1,
+        UnitKind::Station => 2,
+        UnitKind::Wall => 3,
+        UnitKind::Unknown => 4,
+    });
     let mut targets: Vec<Pos> = Vec::new();
-    // Enemy station first (2x2 footprint cells), then other visible units.
-    for unit in turn.enemy.iter().filter(|unit| unit.kind == UnitKind::Station) {
+    for unit in units {
         for cell in unit.footprint() {
             if in_range(tower, cell) {
                 targets.push(cell);
             }
         }
-    }
-    for unit in turn.enemy.iter().filter(|unit| {
-        unit.kind != UnitKind::Station && unit.alive() && in_range(tower, unit.pos)
-    }) {
-        targets.push(unit.pos);
     }
     if targets.is_empty() {
         return None;

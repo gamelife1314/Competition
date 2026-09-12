@@ -11,10 +11,35 @@ use crate::protocol::{Pos, RoleCommand};
 
 pub fn sanitize(turn: &Turn, commands: HashMap<i64, RoleCommand>) -> BTreeMap<String, RoleCommand> {
     let mut out = BTreeMap::new();
-    for (id, cmd) in commands {
-        if let Some(cmd) = sanitize_one(turn, id, &cmd) {
-            out.insert(id.to_string(), cmd);
+    let mut remaining_gold = turn.gold;
+    let mut weapon_count = turn.towers().len();
+    let mut ordered: Vec<(i64, RoleCommand)> = commands.into_iter().collect();
+    ordered.sort_by_key(|(id, _)| *id);
+
+    for (id, cmd) in ordered {
+        let Some(cmd) = sanitize_one(turn, id, &cmd) else { continue };
+        let cost = match cmd.action.as_str() {
+            "buy" => {
+                let Some(name) = cmd.name.as_ref() else { continue };
+                let price = turn.weapon_shop.get(name).copied().unwrap_or(i64::MAX);
+                price.saturating_mul(cmd.num.unwrap_or(1))
+            }
+            "build" if cmd.name.as_deref() != Some("wall") => {
+                if weapon_count >= 3 {
+                    continue;
+                }
+                crate::model::WEAPON_BUILD_COST
+            }
+            _ => 0,
+        };
+        if cost > remaining_gold {
+            continue;
         }
+        remaining_gold -= cost;
+        if cmd.action == "build" && cmd.name.as_deref() != Some("wall") {
+            weapon_count += 1;
+        }
+        out.insert(id.to_string(), cmd);
     }
     out
 }
@@ -98,7 +123,8 @@ fn sanitize_one(turn: &Turn, id: i64, cmd: &RoleCommand) -> Option<RoleCommand> 
                 return None;
             }
             let price = turn.weapon_shop.get(name).copied().unwrap_or(i64::MAX);
-            if price.saturating_mul(num) > turn.gold || actor.backpack_full() {
+            let free_slots = actor.capacity.saturating_sub(actor.backpack.len() as i64);
+            if price.saturating_mul(num) > turn.gold || num > free_slots {
                 return None;
             }
         }
@@ -121,7 +147,13 @@ fn sanitize_one(turn: &Turn, id: i64, cmd: &RoleCommand) -> Option<RoleCommand> 
                     }
                 }
                 "gatling" | "railgun" | "rocket" => {
-                    if turn.gold < crate::model::WEAPON_BUILD_COST {
+                    if turn.gold < crate::model::WEAPON_BUILD_COST || turn.towers().len() >= 3 {
+                        return None;
+                    }
+                    // Rebuilding on an occupied weapon cell silently destroys
+                    // the existing tower. Tactical planners must choose a free
+                    // slot; the validator makes that invariant fail-safe.
+                    if turn.towers().iter().any(|tower| tower.pos == target) {
                         return None;
                     }
                 }
