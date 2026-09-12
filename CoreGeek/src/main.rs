@@ -25,7 +25,7 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime");
 
-    eprintln!("listening on 0.0.0.0:{port}");
+    println!("listening on 0.0.0.0:{port}");
     coregeek::log::event(
         "startup",
         serde_json::json!({"port": port, "version": env!("CARGO_PKG_VERSION")}),
