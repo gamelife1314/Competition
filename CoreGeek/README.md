@@ -10,6 +10,11 @@ cargo build --release --locked   # 使用 1.72 工具链（rust-toolchain.toml �
 bash run.sh 8080                 # 或 ./target/release/coregeek 8080
 ```
 
+本 crate 同时是仓库根 `Cargo.toml` 声明的 workspace 成员：评审脚本在仓库根执行
+`cargo test --release --locked`（不进入 `CoreGeek/`）时才能找到清单文件。因此**在
+`CoreGeek/` 目录内构建请带上 `--target-dir target`**（`run.sh` 已内置），否则产物会落到
+仓库根的 `target/`。（只拷贝 `CoreGeek/` 单独构建时无 workspace，产物仍在 `CoreGeek/target/`。）
+
 依赖版本已在 `Cargo.toml` 精确锁定并随仓库提交 `Cargo.lock`
 （cargo 1.72 无 MSRV 感知解析，新版传递依赖如 hashbrown 0.17/edition2024 无法编译，勿随意升级）。
 

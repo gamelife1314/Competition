@@ -1,1 +1,6 @@
 /Demo/CoreGeek/
+
+# Workspace-root build output. `cargo test`/`cargo build` run from the
+# repository root (where the workspace manifest lives) writes here; the crate's
+# own default remains `CoreGeek/target` (see CoreGeek/run.sh).
+/target
