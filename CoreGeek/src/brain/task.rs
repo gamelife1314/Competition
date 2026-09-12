@@ -90,10 +90,11 @@ pub fn plan_pioneer(
             None
         }
         TaskStage::Planning => {
-            // SOP fast path: a cached script for a similar task runs first.
+            // SOP fast path: a cached script whose fingerprint matches this
+            // task AND whose parameters bind to this description runs first.
             if state.task.cmd_history.is_empty() {
-                if let Some(sop) = state.find_sop(&state.task.task_type, &state.task.description) {
-                    let script = sop.script.clone();
+                if let Some(script) = state.find_sop(&state.task.task_type, &state.task.description)
+                {
                     state.task.stage = TaskStage::HavePlan { cmd: script };
                     return plan_pioneer(turn, state, pioneer, plan);
                 }
@@ -128,6 +129,25 @@ pub fn plan_pioneer(
             None
         }
         TaskStage::HaveAnswer { answer } => {
+            // Schema check before submitting: an answer whose shape does not
+            // match what the task asked for scores nothing, and the round is
+            // better spent re-planning with the missing fields named. Inside
+            // the last few rounds the partial pass rate is worth more than the
+            // chance of a complete answer, so the check yields.
+            let gaps = answer_schema_gaps(&state.task.description, &answer);
+            if !gaps.is_empty() && rounds_left > SCHEMA_GRACE {
+                crate::log::event(
+                    "task_answer_schema",
+                    serde_json::json!({
+                        "session": state.task.session_id,
+                        "missing": gaps,
+                        "roundsLeft": rounds_left,
+                    }),
+                );
+                state.task.schema_gaps = gaps;
+                state.task.stage = TaskStage::Planning;
+                return None;
+            }
             state.task.submitted_round = Some(turn.round_no);
             state.task.phase_missing_rounds = 0;
             state.task.point_closed_round = None;
@@ -161,7 +181,7 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
         "1. 给出可直接执行的命令或脚本（放在 ```bash 或 ```python 代码块中），完成全部子任务。\n",
     );
     prompt.push_str("2. 脚本最后一行必须打印 `ANSWER: <最终答案>`，多字段答案用 JSON 表示。\n");
-    prompt.push_str("3. 脚本要可复用：把可变参数（如城市名）写在开头变量里。\n");
+    prompt.push_str("3. 脚本要可复用：把可变参数（如城市名、文件名、数量）写成 `{{参数名}}` 占位符，参数名必须与任务描述里出现的字段名完全一致（例如描述里的“城市名”就用 `{{城市名}}`），脚本中不要写死具体取值；同一类任务下次会复用这段脚本并按新描述自动填参。\n");
     prompt.push_str("4. 尽量在一个脚本内完成全部步骤（find 找文件 → cat 读取 → 计算 → 打印 ANSWER），不要分多轮试探；只有带 `ANSWER:` 标记的输出才会被当作答案提交。\n");
     if !state.task.result_history.is_empty() {
         prompt.push_str("\n上次执行输出（请修正错误）：\n");
@@ -176,6 +196,12 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
                 state.task.wrong_answers, state.task.best_answer
             ));
         }
+    }
+    if !state.task.schema_gaps.is_empty() {
+        prompt.push_str(&format!(
+            "\n上次打印的答案缺少任务要求的字段：{}。请在 ANSWER 的 JSON 中补全这些字段（字段名与任务描述一致）。\n",
+            state.task.schema_gaps.join("、")
+        ));
     }
     prompt
 }
@@ -293,18 +319,177 @@ pub fn is_meta_answer(answer: &str) -> bool {
 
 /// Return the strongest structured result seen so far. Only explicit answer
 /// markers qualify; raw listings, tracebacks and task prose remain excluded.
+///
+/// With no confirmed answer, every `ANSWER:` object in the command history is
+/// merged field-by-field so a run that only printed part of the result still
+/// earns its pass rate instead of submitting nothing.
 pub fn partial_answer(state: &BotState) -> Option<String> {
     if !state.task.best_answer.is_empty() && !is_meta_answer(&state.task.best_answer) {
         return Some(state.task.best_answer.clone());
     }
-    state.task.result_history.iter().rev().find_map(|result| {
-        let answer = extract_answer(strip_status_line(result))?;
-        if is_meta_answer(&answer) {
-            None
-        } else {
-            Some(answer)
+    let answers: Vec<String> = state
+        .task
+        .result_history
+        .iter()
+        .filter_map(|result| extract_answer(strip_status_line(result)))
+        .filter(|answer| !is_meta_answer(answer))
+        .collect();
+    let best = answers.last()?.clone();
+    Some(merge_json_fields(&answers).unwrap_or(best))
+}
+
+/// Union of the fields of every JSON object among `answers` (later runs win on
+/// a conflicting key). None when fewer than two of them parse as objects —
+/// there is nothing to merge then.
+pub fn merge_json_fields(answers: &[String]) -> Option<String> {
+    let mut merged = serde_json::Map::new();
+    let mut objects = 0usize;
+    for answer in answers {
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(answer)
+        {
+            objects += 1;
+            for (key, value) in map {
+                merged.insert(key, value);
+            }
         }
-    })
+    }
+    if objects < 2 || merged.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::Value::Object(merged)).ok()
+}
+
+/// Rounds of grace before a schema mismatch is submitted anyway: re-planning
+/// costs a round-trip, so past this point the partial pass rate wins.
+const SCHEMA_GRACE: i64 = 4;
+
+/// Field names the task text asks the answer to carry.
+///
+/// Deliberately conservative: an empty list means "no schema found" and the
+/// answer is accepted as-is, because a false positive here would reject a
+/// correct answer. Fields are only collected after an explicit trigger word
+/// (输出/返回/字段/包含/…), and a single collected token is too weak a signal to
+/// act on — the caller ignores anything shorter than two fields.
+pub fn expected_fields(description: &str) -> Vec<String> {
+    const TRIGGERS: [&str; 8] = [
+        "输出", "返回", "字段", "包含", "需要", "答案", "格式", "结果",
+    ];
+    const NOISE: [&str; 18] = [
+        "JSON",
+        "json",
+        "Json",
+        "格式",
+        "要求",
+        "结果",
+        "内容",
+        "字符串",
+        "数组",
+        "对象",
+        "如下",
+        "答案",
+        "输出",
+        "返回",
+        "包含",
+        "字段",
+        "需要",
+        "一个",
+    ];
+    let mut fields: Vec<String> = Vec::new();
+    for line in description.lines() {
+        let Some(index) = TRIGGERS
+            .iter()
+            .filter_map(|trigger| line.find(trigger))
+            .min()
+        else {
+            continue;
+        };
+        for token in line[index..].split(|c: char| {
+            matches!(
+                c,
+                '：' | ':'
+                    | '、'
+                    | '，'
+                    | ','
+                    | '和'
+                    | '与'
+                    | '及'
+                    | ' '
+                    | '\t'
+                    | '='
+                    | '＝'
+                    | '"'
+                    | '\''
+                    | '“'
+                    | '”'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | '。'
+                    | '；'
+                    | ';'
+                    | '等'
+            )
+        }) {
+            let token = token.trim();
+            if !(2..=12).contains(&token.chars().count()) || NOISE.contains(&token) {
+                continue;
+            }
+            if token.chars().any(char::is_whitespace) {
+                continue;
+            }
+            if !fields.iter().any(|old| old == token) {
+                fields.push(token.to_string());
+            }
+        }
+        if !fields.is_empty() {
+            break;
+        }
+    }
+    fields.truncate(8);
+    fields
+}
+
+/// Fields the task asked for that `answer` does not carry. Empty means "pass"
+/// — either the answer is complete or no schema could be derived.
+pub fn answer_schema_gaps(description: &str, answer: &str) -> Vec<String> {
+    let fields = expected_fields(description);
+    if fields.len() < 2 {
+        return Vec::new();
+    }
+    let keys = json_keys(answer);
+    let lower = answer.to_lowercase();
+    fields
+        .into_iter()
+        .filter(|field| {
+            let name = field.to_lowercase();
+            !keys.iter().any(|key| *key == name) && !lower.contains(&name)
+        })
+        .collect()
+}
+
+/// Keys of `answer` when it is a JSON object (or an array of objects),
+/// lowercased; empty otherwise.
+fn json_keys(answer: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(answer) else {
+        return Vec::new();
+    };
+    let object = match value {
+        serde_json::Value::Object(map) => Some(map),
+        serde_json::Value::Array(items) => items.into_iter().find_map(|item| match item {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        }),
+        _ => None,
+    };
+    object
+        .map(|map| map.keys().map(|key| key.to_lowercase()).collect())
+        .unwrap_or_default()
 }
 
 pub fn truncate(text: &str, max_chars: usize) -> String {

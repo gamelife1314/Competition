@@ -911,6 +911,7 @@ fn task_description_persists_when_phase_task_clears() {
 
 #[test]
 fn economy_holds_gold_reserve_for_main_weapon_upgrade() {
+    let state = BotState::default();
     let no_tower = turn_from(day_world_at(
         5,
         vec![station(10, 20, 1)],
@@ -919,7 +920,7 @@ fn economy_holds_gold_reserve_for_main_weapon_upgrade() {
         vec![],
     ));
     assert!(
-        coregeek::brain::economy::may_build_weapon(&no_tower),
+        coregeek::brain::economy::may_build_weapon(&no_tower, &state),
         "first weapon builds with 25g"
     );
 
@@ -931,7 +932,7 @@ fn economy_holds_gold_reserve_for_main_weapon_upgrade() {
         vec![],
     ));
     assert!(
-        coregeek::brain::economy::may_build_weapon(&one_tower),
+        coregeek::brain::economy::may_build_weapon(&one_tower, &state),
         "second weapon builds with 25g"
     );
 
@@ -949,7 +950,7 @@ fn economy_holds_gold_reserve_for_main_weapon_upgrade() {
         vec![],
     ));
     assert!(
-        !coregeek::brain::economy::may_build_weapon(&two_l1),
+        !coregeek::brain::economy::may_build_weapon(&two_l1, &state),
         "reserve held for upgrade voucher"
     );
 
@@ -967,7 +968,7 @@ fn economy_holds_gold_reserve_for_main_weapon_upgrade() {
         vec![],
     ));
     assert!(
-        coregeek::brain::economy::may_build_weapon(&two_with_l2),
+        coregeek::brain::economy::may_build_weapon(&two_with_l2, &state),
         "level-2 main weapon unlocks more builds"
     );
 }
@@ -1300,7 +1301,7 @@ fn rejected_answer_drops_cached_sop_and_keeps_task_active() {
     state.sop_cache.push(coregeek::state::SopEntry {
         task_type: "自进化类1".into(),
         keywords: vec!["count".into(), "files".into()],
-        script: "ls | wc -l".into(),
+        template: "ls | wc -l".into(),
     });
     state.task.active = true;
     state.task.accepted_round = 5;
@@ -1723,5 +1724,566 @@ fn timeout_partial_answer_never_uses_the_task_description() {
         coregeek::brain::task::partial_answer(&state).as_deref(),
         Some("{\"lines\": 42}"),
         "a previously observed real answer is the fallback"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1: deadline budgeter, travel-cost selling, wall vouchers, third tower
+// ---------------------------------------------------------------------------
+
+fn wall(id: i64, x: i32, y: i32, level: i64, health: i64) -> Value {
+    json!({
+        "id": id, "pos": {"x": x, "y": y}, "roleType": "wall",
+        "health": health, "attackPower": 0, "attackRange": 0,
+        "level": level, "backPackCapability": 0, "backpack": []
+    })
+}
+
+fn voucher(name: &str, price: i64) -> Value {
+    json!({"name": name, "price": price})
+}
+
+/// Day round (1-based `roundNo`) at which `in_day_round` is reached on day 1.
+fn day_round(in_day_round: i64) -> i64 {
+    in_day_round + 1
+}
+
+#[test]
+fn budget_keeps_an_unaffordable_goal_as_purchase_intent() {
+    // 25 gold cannot buy the 100-gold weapon upgrade, but the intent must
+    // survive with a deadline so the buyer can start moving and the economy
+    // worker knows what the gold is FOR. An empty list was the old freeze.
+    let turn = turn_from(day_world_at(
+        day_round(5),
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            railgun(10030, 12, 10, 1),
+            worker(10010, 5, 5),
+        ],
+        25,
+        vec![voucher("WeaponUpgradeVoucher1", 100)],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let state = BotState::default();
+    let budget = coregeek::brain::economy::budget(&turn, &state, 0);
+    let upgrade = budget
+        .intent
+        .iter()
+        .find(|need| need.name == "WeaponUpgradeVoucher1")
+        .expect("the upgrade is still intended");
+    assert_eq!(upgrade.num, 1);
+    assert!(
+        upgrade.latest_round > 0 && upgrade.latest_round < coregeek::brain::economy::DUSK_ROUND,
+        "the goal carries a buy-by round before dusk (got {})",
+        upgrade.latest_round
+    );
+    assert!(
+        budget.shopping.is_empty(),
+        "nothing is affordable yet, so nothing is acted on"
+    );
+    assert_eq!(
+        budget.head().map(|need| need.name.as_str()),
+        Some("WeaponUpgradeVoucher1"),
+        "the head of the budget is the goal we are saving for"
+    );
+}
+
+#[test]
+fn purchase_deadline_shrinks_with_the_walk_to_the_shop() {
+    let near = turn_from(day_world_at(
+        day_round(5),
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker(10010, 1, 1),
+        ],
+        25,
+        vec![voucher("WeaponUpgradeVoucher1", 100)],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let far = turn_from(day_world_at(
+        day_round(5),
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker(10010, 38, 30),
+        ],
+        25,
+        vec![voucher("WeaponUpgradeVoucher1", 100)],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let state = BotState::default();
+    let latest = |turn: &Turn| {
+        coregeek::brain::economy::intent_list(turn, &state, 0)
+            .into_iter()
+            .find(|need| need.name == "WeaponUpgradeVoucher1")
+            .expect("goal present")
+            .latest_round
+    };
+    let near_round = latest(&near);
+    let far_round = latest(&far);
+    assert!(
+        far_round < near_round,
+        "a buyer 38 cells from the shop must start earlier ({far_round}) than one next to it ({near_round})"
+    );
+    assert!(
+        coregeek::brain::economy::shop_travel(&far, Pos { x: 38, y: 30 })
+            > coregeek::brain::economy::shop_travel(&near, Pos { x: 1, y: 1 }),
+        "the trip cost itself is distance-based"
+    );
+}
+
+#[test]
+fn buyer_sets_off_before_the_gold_arrives() {
+    // Deadline two rounds away, buyer one trip away: the intent must push it
+    // toward the shop even though the 100 gold are not there yet, so the
+    // purchase lands the round the gold does.
+    let turn = turn_from(day_world_at(
+        day_round(45),
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker(10010, 1, 1),
+        ],
+        10,
+        vec![voucher("WeaponUpgradeVoucher1", 100)],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let state = BotState::default();
+    let buyer = turn.role_by_id(10010).unwrap();
+    let budget = coregeek::brain::economy::budget(&turn, &state, 0);
+    assert!(budget.shopping.is_empty(), "10 gold buys nothing yet");
+    assert!(
+        coregeek::brain::economy::buyer_must_preposition(&turn, buyer, &budget.intent),
+        "the buyer pre-positions once a deadline is within one trip"
+    );
+    // Early in the day the same intent must NOT drag the buyer off the economy.
+    let early = turn_from(day_world_at(
+        day_round(5),
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker(10010, 1, 1),
+        ],
+        10,
+        vec![voucher("WeaponUpgradeVoucher1", 100)],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let early_buyer = early.role_by_id(10010).unwrap();
+    let early_budget = coregeek::brain::economy::budget(&early, &state, 0);
+    assert!(
+        !coregeek::brain::economy::buyer_must_preposition(
+            &early,
+            early_buyer,
+            &early_budget.intent
+        ),
+        "no pointless shop camping at round 5"
+    );
+}
+
+#[test]
+fn sell_batch_grows_when_the_vendor_is_far() {
+    // 11 rounds of walking to the vendor: worth a bigger load, and early enough
+    // that the trip is not yet urgent.
+    let far = turn_from(day_world_at(
+        day_round(5),
+        vec![station(10, 20, 1), worker(10010, 12, 12)],
+        0,
+        vec![voucher("WeaponUpgradeVoucher1", 100)],
+        vec![zone(0, 0, "vendor")],
+    ));
+    let near = turn_from(day_world_at(
+        day_round(5),
+        vec![station(10, 20, 1), worker(10010, 2, 2)],
+        0,
+        vec![voucher("WeaponUpgradeVoucher1", 100)],
+        vec![zone(0, 0, "vendor")],
+    ));
+    let state = BotState::default();
+    let far_batch =
+        coregeek::brain::economy::sell_batch(&far, &state, far.role_by_id(10010).unwrap());
+    let near_batch =
+        coregeek::brain::economy::sell_batch(&near, &state, near.role_by_id(10010).unwrap());
+    assert_eq!(
+        near_batch,
+        coregeek::brain::economy::SELL_BATCH,
+        "a vendor next door is worth cashing in at the base batch"
+    );
+    assert!(
+        far_batch > near_batch,
+        "a distant vendor is worth one bigger load ({far_batch} vs {near_batch})"
+    );
+    // Constraint kept: 4+ ore may always be sold — near the vendor that IS the
+    // batch, and the dusk cash-out overrides the batch wherever the worker is.
+    assert!(near_batch <= 4);
+
+    // Once the purchase deadline is within one trip the batch collapses back to
+    // the base size: waiting for a cheaper load would miss the purchase.
+    let urgent = turn_from(day_world_at(
+        day_round(coregeek::brain::economy::DUSK_ROUND - 2),
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker(10010, 12, 12),
+        ],
+        0,
+        vec![voucher("WeaponUpgradeVoucher1", 100)],
+        vec![zone(0, 0, "vendor")],
+    ));
+    let urgent_role = urgent.role_by_id(10010).unwrap();
+    assert_eq!(
+        coregeek::brain::economy::sell_batch(&urgent, &state, urgent_role),
+        coregeek::brain::economy::SELL_BATCH,
+        "an imminent purchase deadline cashes out immediately"
+    );
+}
+
+#[test]
+fn distant_miner_cashes_out_before_dusk() {
+    // 30 cells from the vendor: the walk home starts ~29 rounds before dusk,
+    // not at dusk (the old flat constant left the ore unsold at nightfall).
+    let turn = turn_from(day_world_at(
+        day_round(5),
+        vec![
+            station(10, 20, 1),
+            json!({
+                "id": 10010, "pos": {"x": 30, "y": 30}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100, "backpack": ["iron"]
+            }),
+        ],
+        0,
+        vec![],
+        vec![zone(0, 0, "vendor")],
+    ));
+    let state = BotState::default();
+    let role = turn.role_by_id(10010).unwrap();
+    let deadline = coregeek::brain::economy::sell_deadline(&turn, role);
+    assert!(
+        deadline < coregeek::brain::economy::DUSK_ROUND,
+        "the sell deadline is pulled earlier by the trip ({deadline})"
+    );
+    assert!(
+        !coregeek::brain::economy::should_sell(&turn, &state, role, 0),
+        "one ore at round 5 is not worth the walk"
+    );
+
+    let mut payload = day_world_at(
+        day_round(deadline),
+        vec![
+            station(10, 20, 1),
+            json!({
+                "id": 10010, "pos": {"x": 30, "y": 30}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100, "backpack": ["iron"]
+            }),
+        ],
+        0,
+        vec![],
+        vec![zone(0, 0, "vendor")],
+    );
+    payload["roundNo"] = json!(day_round(deadline));
+    let late = turn_from(payload);
+    let late_role = late.role_by_id(10010).unwrap();
+    assert!(
+        coregeek::brain::economy::should_sell(&late, &state, late_role, 0),
+        "the walk to the vendor must start on the deadline round"
+    );
+}
+
+#[test]
+fn wall_upgrade_vouchers_join_the_shopping_candidates() {
+    // A standing ring plus a level-2 weapon path: 500 HP for 20 gold is now a
+    // purchase candidate instead of an unused item in the shop.
+    let ring: Vec<Value> = (0..8)
+        .map(|index| wall(20000 + index, 6 + index as i32, 18, 1, 1000))
+        .collect();
+    let mut roles = vec![
+        station(10, 20, 1),
+        gatling(10020, 10, 10, 2),
+        railgun(10030, 12, 10, 1),
+        worker(10010, 3, 3),
+    ];
+    roles.extend(ring);
+    let turn = turn_from(day_world_at(
+        day_round(30),
+        roles,
+        120,
+        vec![
+            voucher("WallUpgradeVoucher1", 20),
+            voucher("WallUpgradeVoucher2", 30),
+        ],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let state = BotState::default();
+    let list = coregeek::brain::economy::shopping_list(&turn, &state, 0);
+    assert!(
+        list.iter().any(|need| need.name == "WallUpgradeVoucher1"),
+        "the wall upgrade is a candidate: {:?}",
+        list.iter()
+            .map(|need| need.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let wall_need = list
+        .iter()
+        .find(|need| need.name == "WallUpgradeVoucher1")
+        .unwrap();
+    assert!(wall_need.num >= 1);
+    assert!(
+        wall_need.value > 0,
+        "wall HP per gold is ranked, not fiat-ordered"
+    );
+}
+
+#[test]
+fn wall_vouchers_wait_for_the_ring_and_the_weapon_path() {
+    // No ring yet → no wall voucher: the 20 gold belongs to the first towers.
+    let turn = turn_from(day_world_at(
+        day_round(30),
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker(10010, 3, 3),
+        ],
+        120,
+        vec![voucher("WallUpgradeVoucher1", 20)],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    let state = BotState::default();
+    let list = coregeek::brain::economy::shopping_list(&turn, &state, 0);
+    assert!(
+        !list.iter().any(|need| need.name == "WallUpgradeVoucher1"),
+        "no wall to upgrade: the voucher stays in the shop"
+    );
+}
+
+#[test]
+fn third_tower_fallback_fires_only_when_the_upgrade_is_out_of_reach() {
+    let two_l1 = |round_no: i64, gold: i64| {
+        turn_from(day_world_at(
+            round_no,
+            vec![
+                station(10, 20, 1),
+                gatling(10020, 10, 10, 1),
+                railgun(10030, 12, 10, 1),
+                worker(10010, 3, 3),
+            ],
+            gold,
+            vec![voucher("WeaponUpgradeVoucher1", 100)],
+            vec![zone(0, 0, "weaponShop")],
+        ))
+    };
+    let state = BotState::default();
+
+    // Early in the day 25 gold still has time to become the 100-gold upgrade:
+    // hold the purse, do not spend it on a third level-1 gun.
+    let early = two_l1(day_round(5), 25);
+    assert!(
+        !coregeek::brain::economy::may_build_weapon(&early, &state),
+        "the reserve still belongs to the upgrade at round 5"
+    );
+
+    // Past the fallback round with only 25 gold the upgrade is out of reach:
+    // the 25-gold rocket beats an empty third slot for the whole first night.
+    let late = two_l1(day_round(coregeek::brain::economy::DUSK_ROUND - 15), 25);
+    assert!(
+        !coregeek::brain::economy::upgrade_reachable(&late, &state),
+        "25 gold cannot become 100 before dusk"
+    );
+    assert!(
+        coregeek::brain::economy::may_build_weapon(&late, &state),
+        "the rocket must not be postponed indefinitely (issue #9)"
+    );
+
+    // With the gold for the upgrade already banked, the upgrade path wins and
+    // the reserve rule is unchanged: buy the voucher, apply it, then the third
+    // slot unlocks. The 25-gold rocket is the fallback for an upgrade we can no
+    // longer reach — never a replacement for one we can.
+    let funded = two_l1(day_round(coregeek::brain::economy::DUSK_ROUND - 15), 100);
+    assert!(
+        coregeek::brain::economy::upgrade_reachable(&funded, &state),
+        "100 gold in hand keeps the upgrade path alive"
+    );
+    assert!(
+        !coregeek::brain::economy::may_build_weapon(&funded, &state),
+        "the banked upgrade is spent first; the third slot waits for it"
+    );
+
+    // The same holds when the voucher is already in a backpack and the purse is
+    // empty: the upgrade is on its way, so the rocket stays unbought.
+    let mut carried: Vec<Value> = vec![
+        station(10, 20, 1),
+        gatling(10020, 10, 10, 1),
+        railgun(10030, 12, 10, 1),
+    ];
+    carried.push(json!({
+        "id": 10010, "pos": {"x": 3, "y": 3}, "roleType": "worker",
+        "health": 220, "attackPower": 0, "attackRange": 0,
+        "backPackCapability": 100, "backpack": ["WeaponUpgradeVoucher1"]
+    }));
+    let held = turn_from(day_world_at(
+        day_round(coregeek::brain::economy::DUSK_ROUND - 15),
+        carried,
+        25,
+        vec![voucher("WeaponUpgradeVoucher1", 100)],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    assert!(
+        coregeek::brain::economy::upgrade_reachable(&held, &state),
+        "a carried voucher makes the upgrade reachable without any gold"
+    );
+    assert!(
+        !coregeek::brain::economy::may_build_weapon(&held, &state),
+        "no rocket while the upgrade is already in a backpack"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1: parameterised SOPs and schema-checked answers
+// ---------------------------------------------------------------------------
+
+fn sop(task_type: &str, description: &str, template: &str) -> coregeek::state::SopEntry {
+    coregeek::state::SopEntry {
+        task_type: task_type.into(),
+        keywords: coregeek::state::keywords_of(description),
+        template: template.into(),
+    }
+}
+
+#[test]
+fn sop_template_binds_the_new_task_parameters() {
+    // A cached script is a TEMPLATE: the values that differ between two tasks
+    // of the same kind are placeholders, so replaying it on a new task cannot
+    // silently answer with the previous task's inputs.
+    let entry = sop(
+        "自进化类1",
+        "统计 /tmp/a 的文件数量",
+        "python3 count.py --dir {{目录}} --city {{城市}}",
+    );
+    let bound = entry
+        .bind("统计 /tmp/b 的文件数量。目录：/tmp/b 城市：上海")
+        .expect("both parameters bind from the new description");
+    assert!(bound.contains("--dir /tmp/b"), "got {bound}");
+    assert!(bound.contains("--city 上海"), "got {bound}");
+    assert!(!bound.contains("{{"), "no placeholder survives: {bound}");
+
+    // A placeholder the new description does not name makes the template
+    // unusable — running it with the old value would answer a different task.
+    assert!(
+        entry.bind("统计 /tmp/b 的文件数量").is_none(),
+        "an unbindable parameter must not fall back to the previous value"
+    );
+}
+
+#[test]
+fn sop_reuse_requires_a_fingerprint_match_not_just_a_task_type() {
+    let mut state = BotState::default();
+    state.sop_cache.push(sop(
+        "自进化类1",
+        "统计 /tmp/data 目录下的文件数量",
+        "ls /tmp/data | wc -l",
+    ));
+
+    // Same task type AND matching keywords: the cached script is reused.
+    assert!(
+        state
+            .find_sop("自进化类1", "请统计 /tmp/data 目录下的文件数量")
+            .is_some(),
+        "a fingerprint match reuses the SOP"
+    );
+    // Same task type, different task: NOT reused (this was the issue #9 bug —
+    // the type alone was treated as proof the script still applied).
+    assert!(
+        state
+            .find_sop("自进化类1", "统计 /tmp/data 的字节数")
+            .is_none(),
+        "the same type is not enough on its own"
+    );
+    // Same task, different type: also not reused.
+    assert!(
+        state
+            .find_sop("自进化类2", "请统计 /tmp/data 目录下的文件数量")
+            .is_none(),
+        "type must match too"
+    );
+}
+
+#[test]
+fn incomplete_answer_replans_while_there_is_still_time() {
+    let turn = turn_from(day_world_at(
+        day_round(30),
+        vec![pioneer_with(vec![])],
+        0,
+        vec![],
+        vec![],
+    ));
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.timeout_round = turn.round_no + 50;
+    state.task.description = "输出：城市、人口、面积".into();
+    state.task.stage = coregeek::state::TaskStage::HaveAnswer {
+        answer: "{\"城市\":\"上海\"}".into(),
+    };
+
+    let mut plan = coregeek::brain::Plan::default();
+    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    assert!(
+        cmd.is_none(),
+        "an answer missing required fields is not submitted yet"
+    );
+    assert!(
+        matches!(state.task.stage, coregeek::state::TaskStage::Planning),
+        "the task re-plans instead"
+    );
+    assert_eq!(
+        state.task.schema_gaps,
+        vec!["人口".to_string(), "面积".to_string()],
+        "the missing fields are named for the next prompt"
+    );
+    assert!(
+        coregeek::brain::task::build_prompt(&state, &turn).contains("人口"),
+        "the retry prompt asks for the missing fields"
+    );
+
+    // Near the deadline the partial pass rate is worth more than the chance of
+    // a complete answer, so the schema gate yields.
+    state.task.timeout_round = turn.round_no + 2;
+    state.task.stage = coregeek::state::TaskStage::HaveAnswer {
+        answer: "{\"城市\":\"上海\"}".into(),
+    };
+    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    assert_eq!(
+        cmd.map(|command| command.action),
+        Some("submitAnswer".to_string()),
+        "past the grace window the partial answer is submitted"
+    );
+}
+
+#[test]
+fn schema_gate_passes_a_complete_answer_and_an_unknown_schema() {
+    let description = "输出：城市、人口、面积";
+    assert_eq!(
+        coregeek::brain::task::expected_fields(description),
+        vec!["城市".to_string(), "人口".to_string(), "面积".to_string()]
+    );
+    assert!(
+        coregeek::brain::task::answer_schema_gaps(
+            description,
+            "{\"城市\":\"上海\",\"人口\":1,\"面积\":2}"
+        )
+        .is_empty(),
+        "a complete answer passes"
+    );
+    assert_eq!(
+        coregeek::brain::task::answer_schema_gaps(description, "{\"城市\":\"上海\"}"),
+        vec!["人口".to_string(), "面积".to_string()]
+    );
+    // No schema could be derived: the answer is accepted as-is, because a
+    // false positive here would reject a correct answer.
+    assert!(
+        coregeek::brain::task::answer_schema_gaps("随便写点什么", "whatever").is_empty(),
+        "an unknown schema never blocks a submission"
     );
 }

@@ -73,13 +73,96 @@ pub struct TaskSession {
     pub phase_missing_rounds: i32,
     pub point_closed_round: Option<i64>,
     pub post_submit_error: bool,
+    /// Fields the task text asked for that the produced answer did not carry.
+    /// Fed back into the next prompt so the retry can close the gap.
+    pub schema_gaps: Vec<String>,
 }
 
+/// A cached, parameterised script for one task fingerprint. The body keeps
+/// `{{name}}` placeholders where the values that differ between two tasks of
+/// the same kind go, so replaying it on a *different* task cannot silently
+/// reuse the old task's inputs.
 #[derive(Debug, Clone, Default)]
 pub struct SopEntry {
     pub task_type: String,
     pub keywords: Vec<String>,
-    pub script: String,
+    pub template: String,
+}
+
+impl SopEntry {
+    /// Bind this template to a new task description. A template without
+    /// placeholders is reused verbatim; one WITH placeholders is only reused
+    /// when every placeholder can be resolved from the description, because
+    /// running it with the previous task's values would answer a different
+    /// question confidently.
+    pub fn bind(&self, description: &str) -> Option<String> {
+        if !self.template.contains("{{") {
+            return Some(self.template.clone());
+        }
+        let mut script = self.template.clone();
+        for name in placeholders(&self.template) {
+            let value = param_value(description, &name)?;
+            script = script.replace(&format!("{{{{{name}}}}}"), &value);
+        }
+        Some(script)
+    }
+}
+
+/// `{{name}}` occurrences in a script template, in order and deduped.
+///
+/// A name is an identifier or a short CJK noun. Anything else between doubled
+/// braces is a literal (a python f-string's `{{`, a shell `${}`) and is skipped
+/// rather than mistaken for a parameter — otherwise the template would look
+/// unbindable and every reuse would fall back to the LLM.
+pub fn placeholders(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            break;
+        };
+        let name = after[..end].trim();
+        let is_name = !name.is_empty()
+            && name.chars().count() <= 20
+            && name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+        if is_name && !out.iter().any(|old: &String| old == name) {
+            out.push(name.to_string());
+        }
+        // Skip the opening braces even when this was a literal, so the scan
+        // keeps looking for a real placeholder further along.
+        rest = &rest[start + 2..];
+    }
+    out
+}
+
+/// Value bound to `name` in a task description, e.g. `城市名：上海` → `上海`
+/// or `city = Berlin` → `Berlin`. Returns None when the description does not
+/// name the parameter, which makes the SOP unusable rather than wrong.
+pub fn param_value(description: &str, name: &str) -> Option<String> {
+    let start = description.find(name)? + name.len();
+    let rest = &description[start..];
+    let trimmed = rest.trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ':' | '：' | '=' | '＝' | '是' | '为')
+    });
+    let value: String = trimmed
+        .chars()
+        .take_while(|c| {
+            !c.is_whitespace()
+                && !matches!(
+                    c,
+                    ',' | '，' | '。' | ';' | '；' | '、' | '\n' | '\r' | '(' | '（' | ')' | '）'
+                )
+        })
+        .take(40)
+        .collect();
+    if value.is_empty() || value.chars().count() > 40 {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -462,7 +545,7 @@ impl BotState {
         Some(SopEntry {
             task_type: self.task.task_type.clone(),
             keywords,
-            script,
+            template: script,
         })
     }
 
@@ -476,7 +559,11 @@ impl BotState {
         let Some(entry) = self.extract_sop() else {
             return;
         };
-        if !self.sop_cache.iter().any(|old| old.script == entry.script) {
+        if !self
+            .sop_cache
+            .iter()
+            .any(|old| old.template == entry.template)
+        {
             self.sop_cache.push(entry);
         }
         if self.sop_cache.len() > 32 {
@@ -484,42 +571,46 @@ impl BotState {
         }
     }
 
-    pub fn find_sop(&self, task_type: &str, description: &str) -> Option<&SopEntry> {
-        // Exact task-type reuse first: the same self-evolution task category
-        // runs the same kind of script, so its cached SOP is trusted without a
-        // keyword comparison (this lets a second 自进化类1 task reuse the first
-        // one's working script immediately).
-        if !task_type.is_empty() {
-            if let Some(entry) = self
-                .sop_cache
-                .iter()
-                .rev()
-                .find(|entry| entry.task_type == task_type)
-            {
-                return Some(entry);
-            }
-        }
+    /// A cached script bound to `description`, ready to execute.
+    ///
+    /// Matching is by task FINGERPRINT — the same task type *and* a keyword
+    /// overlap of at least half the smaller keyword set — never by task type
+    /// alone. The same type covers tasks whose inputs differ, and replaying
+    /// the wrong one produces a confidently wrong answer, which costs the
+    /// whole task reward. When the fingerprint or a parameter binding is
+    /// missing the caller falls back to a fresh LLM call.
+    pub fn find_sop(&self, task_type: &str, description: &str) -> Option<String> {
         let keywords = keywords_of(description);
         if keywords.is_empty() {
             return None;
         }
         self.sop_cache
             .iter()
-            .filter(|entry| {
-                entry
+            .rev()
+            .filter(|entry| entry.task_type == task_type)
+            .map(|entry| {
+                let overlap = entry
                     .keywords
                     .iter()
                     .filter(|kw| keywords.contains(*kw))
-                    .count()
-                    * 2
-                    >= entry.keywords.len()
+                    .count();
+                (entry, overlap)
             })
-            .max_by_key(|entry| {
-                entry
-                    .keywords
-                    .iter()
-                    .filter(|kw| keywords.contains(*kw))
-                    .count()
+            .filter(|(entry, overlap)| {
+                *overlap >= 3 && *overlap * 2 >= entry.keywords.len().min(keywords.len())
+            })
+            .max_by_key(|(_, overlap)| *overlap)
+            .and_then(|(entry, overlap)| {
+                let script = entry.bind(description);
+                crate::log::event(
+                    "sop_reuse",
+                    serde_json::json!({
+                        "taskType": task_type,
+                        "overlap": overlap,
+                        "bound": script.is_some(),
+                    }),
+                );
+                script
             })
     }
 

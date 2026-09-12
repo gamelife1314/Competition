@@ -63,17 +63,35 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // shopping list — defenses come before consumables, but only for the 1-2
     // towers we actually build (never all three slots at once).
     let build_reserve = tower_build_reserve(turn.towers().len(), tower_gaps.len());
-    let shopping = economy::shopping_list(turn, state, build_reserve);
+    let budget = economy::budget(turn, state, build_reserve);
 
     // Buyer assignment: a dedicated WORKER so voucher purchases are never
     // preempted by a task accept or the treasure hunt. The pioneer stays free
-    // for tasks/treasure.
+    // for tasks/treasure. An unaffordable intent still nominates a buyer: the
+    // deadline budgeter needs someone walking toward the shop before the gold
+    // arrives.
     let workers = turn.workers();
-    let buyer_id: Option<i64> = if shopping.is_empty() {
+    let buyer_id: Option<i64> = if budget.intent.is_empty() {
         None
     } else {
         workers.last().map(|unit| unit.id)
     };
+    // Tower plan telemetry: whether a third weapon is being held back for the
+    // 100-gold upgrade, and whether that upgrade is still reachable, is the
+    // decision the deadline budgeter exists to make explainable.
+    crate::log::event(
+        "tower_plan",
+        serde_json::json!({
+            "round": turn.round_no,
+            "dayRound": turn.in_day_round,
+            "towers": turn.towers().len(),
+            "gaps": tower_gaps.len(),
+            "reserve": build_reserve,
+            "mayBuild": economy::may_build_weapon(turn, state),
+            "upgradeReachable": economy::upgrade_reachable(turn, state),
+            "fallbackRound": economy::DUSK_ROUND - economy::FALLBACK_LEAD,
+        }),
+    );
     // With two workers, the LAST one is the dedicated economy worker: it skips
     // wall duty and focuses on mine → sell → shop, so the wall line never
     // monopolizes both workers.
@@ -82,23 +100,16 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     } else {
         None
     };
-    if !shopping.is_empty() {
+    if !budget.intent.is_empty() {
         // Economy intent vs outcome: the head of the list is what we WANT, the
         // gold check and the buyer's distance say whether it is reachable this
         // round. A frozen economy (gold stuck, buyer never arriving) is then
         // visible in the log instead of only in the final score.
-        let head = &shopping[0];
+        let head = budget.head().expect("intent is non-empty");
         let price = turn.weapon_shop.get(&head.name).copied().unwrap_or(-1);
         let buyer_dist = buyer_id
             .and_then(|id| turn.role_by_id(id).map(|role| role.pos))
-            .map(|pos| {
-                turn.weapon_shops()
-                    .iter()
-                    .flat_map(|shop| stand_cells(turn, *shop))
-                    .map(|stand| chebyshev(pos, stand))
-                    .min()
-                    .unwrap_or(-1)
-            })
+            .map(|pos| economy::shop_travel(turn, pos))
             .unwrap_or(-1);
         crate::log::event(
             "shopping",
@@ -109,9 +120,12 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 "need": head.name,
                 "needNum": head.num,
                 "price": price,
-                "affordable": price >= 0 && price * head.num <= turn.gold,
+                "reason": head.reason,
+                "deadline": head.latest_round,
+                "affordable": !budget.shopping.is_empty(),
                 "buyerShopDist": buyer_dist,
-                "needs": shopping.iter().map(|need| need.name.as_str()).collect::<Vec<_>>(),
+                "needs": budget.intent.iter().map(|need| need.name.as_str()).collect::<Vec<_>>(),
+                "ready": budget.shopping.iter().map(|need| need.name.as_str()).collect::<Vec<_>>(),
             }),
         );
     }
@@ -124,7 +138,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             &tower_gaps,
             &wall_gaps,
             stone_demand,
-            &shopping,
+            &budget,
             buyer_id,
             economy_id,
             &pairs,
@@ -148,7 +162,7 @@ fn worker_day(
     tower_gaps: &[(Pos, String)],
     wall_gaps: &[Pos],
     stone_demand: i64,
-    shopping: &[economy::Need],
+    budget: &economy::Budget,
     buyer_id: Option<i64>,
     economy_id: Option<i64>,
     pairs: &[(i64, i64)],
@@ -272,8 +286,10 @@ fn worker_day(
         }
     }
     // 6. Build weapons (gold) once the wall line is underway — but keep a
-    //    gold reserve so the main weapon's level-2 upgrade is never starved.
-    if economy::may_build_weapon(turn) {
+    //    gold reserve so the main weapon's level-2 upgrade is never starved,
+    //    unless that upgrade is out of reach before dusk (see
+    //    economy::may_build_weapon).
+    if economy::may_build_weapon(turn, state) {
         for (site, kind) in tower_gaps {
             if claimed.contains(site) {
                 continue;
@@ -285,12 +301,28 @@ fn worker_day(
             }
         }
     }
-    // 7. Shopping (dedicated buyer) — upgrades come after survival.
-    if buyer_id == Some(role.id) && !shopping.is_empty() {
-        if let Some(cmd) = buyer_flow(turn, role, shopping, claimed) {
-            plan.push(role.id, cmd);
-            return;
+    // 7. Shopping (dedicated buyer) — upgrades come after survival. When
+    //    nothing is affordable YET the buyer still sets off once a deadline is
+    //    within one trip, so the purchase lands the round the gold does.
+    if buyer_id == Some(role.id) {
+        if !budget.shopping.is_empty() {
+            if let Some(cmd) = buyer_flow(turn, role, &budget.shopping, claimed) {
+                plan.push(role.id, cmd);
+                return;
+            }
+        } else if economy::buyer_must_preposition(turn, role, &budget.intent) {
+            if let Some(cmd) = walk_to_shop(turn, role, claimed) {
+                plan.push(role.id, cmd);
+                return;
+            }
         }
+    }
+    // 7b. Personal Medicine: only its carrier can drink it, so this is a
+    //     per-role errand and never a detour — it fires only while already
+    //     standing at the shop, after the team list has had its turn.
+    if let Some(cmd) = self_provision(turn, role) {
+        plan.push(role.id, cmd);
+        return;
     }
     // 8. Sell accumulated ore in one batch before collecting more. This keeps
     //    the collect→sell→buy loop moving instead of filling a 100-slot pack
@@ -388,6 +420,11 @@ fn pioneer_day(
         plan.push(pioneer.id, cmd);
         return;
     }
+    // 5b. Personal Medicine while already at the shop (no detour).
+    if let Some(cmd) = self_provision(turn, pioneer) {
+        plan.push(pioneer.id, cmd);
+        return;
+    }
     // 6. Treasure hunt.
     if let Some(cmd) = treasure::plan_pioneer(turn, state, pioneer, claimed, plan) {
         plan.push(pioneer.id, cmd);
@@ -457,15 +494,69 @@ fn loiter_at_task_point(turn: &Turn, pioneer: &Unit, claimed: &mut HashSet<Pos>,
 /// Heal when badly hurt. A dead controller builds nothing and mans nothing,
 /// so this outranks every other action. Threshold: below 30% HP.
 pub(crate) fn use_medicine(role: &Unit) -> Option<RoleCommand> {
-    let max_hp = match role.kind {
-        crate::model::UnitKind::Worker => 220,
-        crate::model::UnitKind::Pioneer => 200,
-        _ => return None,
+    let Some(max_hp) = max_hp(role) else {
+        return None;
     };
     if role.health * 10 < max_hp * 3 && role.count_item("Medicine") > 0 {
         return Some(RoleCommand::use_item("Medicine"));
     }
     None
+}
+
+/// Max HP of a controllable role, or None when the unit is not one.
+fn max_hp(role: &Unit) -> Option<i64> {
+    match role.kind {
+        crate::model::UnitKind::Worker => Some(220),
+        crate::model::UnitKind::Pioneer => Some(200),
+        _ => None,
+    }
+}
+
+/// Buy a Medicine for THIS role when it is already standing at the shop and is
+/// either hurt or close to the first night. Medicine cannot be handed to a
+/// team-mate, so a team-level purchase only ever equips the buyer — this is
+/// the errand that equips everyone else, and it never costs a detour.
+fn self_provision(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
+    if role.count_item("Medicine") > 0 {
+        return None;
+    }
+    let max_hp = max_hp(role)?;
+    let hurt = role.health * 10 < max_hp * 8;
+    let ready = turn.in_day_round >= economy::DUSK_ROUND - economy::READINESS_LEAD;
+    if !hurt && !ready {
+        return None;
+    }
+    let price = turn
+        .weapon_shop
+        .get("Medicine")
+        .copied()
+        .unwrap_or(i64::MAX);
+    if price <= 0 || price == i64::MAX || turn.gold < price {
+        return None;
+    }
+    if !at_shop(turn, role.pos) {
+        return None;
+    }
+    Some(RoleCommand::buy("Medicine", 1))
+}
+
+fn at_shop(turn: &Turn, pos: Pos) -> bool {
+    turn.weapon_shops()
+        .iter()
+        .flat_map(|shop| stand_cells(turn, *shop))
+        .any(|stand| stand == pos)
+}
+
+/// Walk to the nearest weapon shop; None when no shop stand is known.
+fn walk_to_shop(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>) -> Option<RoleCommand> {
+    let mut stands: Vec<Pos> = Vec::new();
+    for shop in turn.weapon_shops() {
+        stands.extend(stand_cells(turn, shop));
+    }
+    if stands.is_empty() {
+        return None;
+    }
+    walk_toward(turn, role, &stands, claimed)
 }
 
 /// Buy the first needed item: walk to the weapon shop, then buy. Buying is
