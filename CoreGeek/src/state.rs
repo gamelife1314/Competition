@@ -46,6 +46,10 @@ pub enum TaskStage {
 #[derive(Debug, Clone, Default)]
 pub struct TaskSession {
     pub active: bool,
+    /// Monotonic identifier allocated after each accept. It scopes every
+    /// asynchronous LLM/command response so identical output in a later task
+    /// is never mistaken for a stale response from an earlier task.
+    pub session_id: u64,
     pub accepted_round: i64,
     pub timeout_round: i64,
     pub point: Option<Pos>,
@@ -57,6 +61,18 @@ pub struct TaskSession {
     pub cmd_history: Vec<String>,
     pub result_history: Vec<String>,
     pub wrong_answers: i32,
+    /// Request rounds provide the second half of the response dedupe key.
+    pub llm_request_round: Option<i64>,
+    pub llm_consumed_request_round: Option<i64>,
+    pub cmd_request_round: Option<i64>,
+    pub cmd_consumed_request_round: Option<i64>,
+    /// Submission-success evidence. Success requires all three independent
+    /// signals: task point closed, phaseTask absent for multiple rounds, and no
+    /// error observed after submission.
+    pub submitted_round: Option<i64>,
+    pub phase_missing_rounds: i32,
+    pub point_closed_round: Option<i64>,
+    pub post_submit_error: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,10 +139,14 @@ pub struct BotState {
     pub blacklisted_builds: HashSet<(Pos, String)>,
 
     pub task: TaskSession,
+    /// Last allocated task session identifier. Preserved across half resets so
+    /// session IDs remain monotonic for the lifetime of this bot process.
+    pub task_session_seq: u64,
     pub sop_cache: Vec<SopEntry>,
     pub treasure: TreasureState,
 
-    /// dedup strings for one-shot fields delivered via request
+    /// Dedup strings for non-task one-shot channels. Task LLM/command responses
+    /// are deduped by (session_id, request_round) inside TaskSession.
     pub seen_llm_resp: String,
     pub seen_cmd_result: String,
     /// bombs/dizzy bought tracker can be derived from backpacks; kept simple
@@ -139,6 +159,24 @@ pub struct BotState {
     pub night_pairs: Vec<(i64, i64)>,
     pub night_pair_day: i64,
     pub night_pair_tower_ids: Vec<i64>,
+    pub night_pair_controller_ids: Vec<i64>,
+    pub night_pair_task_busy: bool,
+
+    /// D1 gate stays open until every controller has reached an inside/tower
+    /// stand, then remains sealed for the rest of the half.
+    pub wall_gate_sealed: bool,
+
+    /// Compact telemetry baselines used to report deltas rather than dumping
+    /// full protocol payloads every round.
+    pub prev_total_score: Option<i64>,
+    pub prev_robot_hp: HashMap<i64, i64>,
+    /// Robot id -> kill score, so a robot leaving the board can be attributed
+    /// to `score2` even after its entity is gone from the payload.
+    pub prev_robot_kind: HashMap<i64, i64>,
+    pub prev_wall_hp: Option<i64>,
+    /// Running estimate of earned kill score, used to split the total into
+    /// kill / survival / residual (task) components.
+    pub cum_kill_score: i64,
 }
 
 impl BotState {
@@ -161,7 +199,9 @@ impl BotState {
                 "state_reset",
                 serde_json::json!({"fromRound": self.last_round, "toRound": turn.round_no}),
             );
+            let task_session_seq = self.task_session_seq;
             *self = BotState::default();
+            self.task_session_seq = task_session_seq;
         }
         // Day rollover: reset daily budgets.
         if turn.day != self.current_day {
@@ -198,16 +238,20 @@ impl BotState {
     fn absorb_news(&mut self, turn: &Turn) {
         if !turn.official_news.is_empty()
             && turn.official_news != "今日无重大新闻"
-            && self.official_seen.get(&turn.day).map(String::as_str) != Some(turn.official_news.as_str())
+            && self.official_seen.get(&turn.day).map(String::as_str)
+                != Some(turn.official_news.as_str())
         {
-            self.official_seen.insert(turn.day, turn.official_news.clone());
+            self.official_seen
+                .insert(turn.day, turn.official_news.clone());
             crate::log::event(
                 "news_official",
                 serde_json::json!({"day": turn.day, "head": crate::log::brief(&turn.official_news, 200)}),
             );
             for outage in news::parse_official(turn.day, &turn.official_news) {
                 if !self.outages.iter().any(|old| {
-                    old.ore == outage.ore && old.from_day == outage.from_day && old.to_day == outage.to_day
+                    old.ore == outage.ore
+                        && old.from_day == outage.from_day
+                        && old.to_day == outage.to_day
                 }) {
                     crate::log::event(
                         "mine_outage",
@@ -218,10 +262,13 @@ impl BotState {
             }
         }
         if !turn.folk_legends.is_empty()
-            && self.legend_seen.get(&turn.day).map(String::as_str) != Some(turn.folk_legends.as_str())
+            && self.legend_seen.get(&turn.day).map(String::as_str)
+                != Some(turn.folk_legends.as_str())
         {
             self.legend_seen.insert(turn.day, turn.folk_legends.clone());
-            self.treasure.legends.push((turn.day, turn.folk_legends.clone()));
+            self.treasure
+                .legends
+                .push((turn.day, turn.folk_legends.clone()));
         }
     }
 
@@ -258,49 +305,61 @@ impl BotState {
     }
 
     fn absorb_llm_and_cmd(&mut self, turn: &Turn) {
-        let llm_new =
-            !turn.llm_resp.is_empty() && turn.llm_resp != self.seen_llm_resp;
-        let cmd_new =
-            !turn.last_cmd_result.is_empty() && turn.last_cmd_result != self.seen_cmd_result;
-        if llm_new {
-            self.seen_llm_resp = turn.llm_resp.clone();
-        }
-        if cmd_new {
-            self.seen_cmd_result = turn.last_cmd_result.clone();
-        }
-        // Task channel: only consumed while a task is active.
-        if llm_new {
-            crate::log::event(
-                "llm_resp",
-                serde_json::json!({
-                    "channel": if self.task.active { "task" } else { "treasure" },
-                    "head": crate::log::brief(&turn.llm_resp, 300),
-                }),
-            );
-        }
-        if cmd_new {
-            crate::log::event("cmd_result", serde_json::json!({"head": crate::log::brief(&turn.last_cmd_result, 300)}));
-        }
         if self.task.active {
+            // Task responses are one-shot per (session, request round), not per
+            // response string. Identical legitimate output in a later session
+            // is therefore consumed, while an echoed payload for the same
+            // request cannot advance the state machine twice.
+            let llm_key = self.task.llm_request_round;
+            let llm_new = !turn.llm_resp.is_empty()
+                && llm_key.is_some()
+                && llm_key != self.task.llm_consumed_request_round;
+            let cmd_key = self.task.cmd_request_round;
+            let cmd_new = !turn.last_cmd_result.is_empty()
+                && cmd_key.is_some()
+                && cmd_key != self.task.cmd_consumed_request_round;
             if llm_new {
+                self.task.llm_consumed_request_round = llm_key;
+                crate::log::event(
+                    "llm_resp",
+                    serde_json::json!({"session": self.task.session_id, "requestRound": llm_key, "chars": turn.llm_resp.len()}),
+                );
                 crate::brain::task::on_llm_resp(self, &turn.llm_resp);
             }
             if cmd_new {
+                self.task.cmd_consumed_request_round = cmd_key;
+                crate::log::event(
+                    "cmd_result",
+                    serde_json::json!({"session": self.task.session_id, "requestRound": cmd_key, "chars": turn.last_cmd_result.len()}),
+                );
                 crate::brain::task::on_cmd_result(self, &turn.last_cmd_result);
             }
-        } else if llm_new && self.treasure.phase != TreasurePhase::Done {
-            crate::brain::treasure::on_llm_resp(self, &turn.llm_resp, turn.round_no);
-        }
-        // Wrong-answer feedback: only meaningful right after we submitted an
-        // answer (stale errorCode=2 in later payloads must not re-trigger).
-        let just_submitted = matches!(self.task.stage, TaskStage::WaitingSubmit { .. });
-        if just_submitted && turn.error_codes.iter().any(|code| *code == 2) {
-            self.task.wrong_answers = self.task.wrong_answers.saturating_add(1);
-            self.task.stage = TaskStage::Planning;
-            // The rejected answer's script must not be reused by the next task
-            // of the same type (instant re-accept with stale state).
-            let failed_type = self.task.task_type.clone();
-            self.drop_sop_for(&failed_type);
+
+            let just_submitted = matches!(self.task.stage, TaskStage::WaitingSubmit { .. });
+            if just_submitted && turn.error_codes.iter().any(|code| *code == 2) {
+                self.task.post_submit_error = true;
+                self.task.wrong_answers = self.task.wrong_answers.saturating_add(1);
+                self.task.stage = TaskStage::Planning;
+                self.task.submitted_round = None;
+                self.task.phase_missing_rounds = 0;
+                self.task.point_closed_round = None;
+                let failed_type = self.task.task_type.clone();
+                self.drop_sop_for(&failed_type);
+            } else if self.task.submitted_round.is_some() && !turn.error_codes.is_empty() {
+                self.task.post_submit_error = true;
+            }
+        } else {
+            let llm_new = !turn.llm_resp.is_empty() && turn.llm_resp != self.seen_llm_resp;
+            if llm_new {
+                self.seen_llm_resp = turn.llm_resp.clone();
+                crate::log::event(
+                    "llm_resp",
+                    serde_json::json!({"channel": "treasure", "chars": turn.llm_resp.len()}),
+                );
+                if self.treasure.phase != TreasurePhase::Done {
+                    crate::brain::treasure::on_llm_resp(self, &turn.llm_resp, turn.round_no);
+                }
+            }
         }
     }
 
@@ -322,33 +381,70 @@ impl BotState {
                 }),
             );
         }
-        // Task ended: only an explicit timeout (error code 1) or passing our
-        // own deadline ends the task. `phaseTask` clearing is NOT a signal —
-        // the judger sometimes stops echoing it while the task is still live,
-        // and treating it as "ended" caused the 97 acceptTask / 0 submitAnswer
-        // spin. The description stays cached so a cleared field never erases it.
-        let ended_by_timeout = turn.error_codes.iter().any(|code| *code == 1);
-        if ended_by_timeout || turn.round_no >= self.task.timeout_round {
-            self.finish_task();
+        let ended_by_timeout = turn.error_codes.iter().any(|code| *code == 1)
+            || turn.round_no >= self.task.timeout_round;
+        if ended_by_timeout {
+            self.finish_task(false, "timeout");
+            return;
+        }
+
+        // A transient empty phaseTask is not completion (#3 regression). Only
+        // evaluate closure after an answer was submitted, and require three
+        // independent signals over subsequent rounds.
+        if let Some(submitted_round) = self.task.submitted_round {
+            if turn.phase_task.is_empty() {
+                self.task.phase_missing_rounds = self.task.phase_missing_rounds.saturating_add(1);
+            } else {
+                self.task.phase_missing_rounds = 0;
+            }
+            let point_closed = self
+                .task
+                .point
+                .and_then(|point| turn.player_tasks.iter().find(|task| task.pos == point))
+                .map(|task| !task.is_valid || task.cooldown_rounds > 0)
+                .unwrap_or(false);
+            if point_closed && self.task.point_closed_round.is_none() {
+                self.task.point_closed_round = Some(turn.round_no);
+            }
+            let confirmed = turn.round_no > submitted_round
+                && self.task.point_closed_round.is_some()
+                && self.task.phase_missing_rounds >= 2
+                && !self.task.post_submit_error
+                && turn.error_codes.is_empty();
+            crate::log::event(
+                "task_closure_probe",
+                serde_json::json!({
+                    "session": self.task.session_id,
+                    "round": turn.round_no,
+                    "pointClosed": self.task.point_closed_round.is_some(),
+                    "phaseMissing": self.task.phase_missing_rounds,
+                    "clean": !self.task.post_submit_error && turn.error_codes.is_empty(),
+                    "confirmed": confirmed,
+                }),
+            );
+            if confirmed {
+                self.finish_task(true, "confirmed_success");
+            }
         }
     }
 
-    pub fn finish_task(&mut self) {
+    pub fn finish_task(&mut self, success: bool, reason: &str) {
         if self.task.active {
             crate::log::event(
                 "task_ended",
                 serde_json::json!({
+                    "session": self.task.session_id,
+                    "success": success,
+                    "reason": reason,
                     "wrongAnswers": self.task.wrong_answers,
                     "cmdRounds": self.task.cmd_history.len(),
                     "bestAnswer": crate::log::brief(&self.task.best_answer, 120),
-                    "head": crate::log::brief(&self.task.description, 120),
                 }),
             );
         }
-        // Cache the working command as an SOP only if its answer was never
-        // rejected — a wrong-answer script would poison the next task of the
-        // same type (the "re-accept same type with stale state" loop).
-        if self.task.wrong_answers == 0 {
+        // A lack of an error is not proof that a script worked. Cache only
+        // after the multi-signal success probe confirms completion.
+        if success {
             self.cache_sop();
         }
         self.task = TaskSession::default();
@@ -363,7 +459,11 @@ impl BotState {
         if keywords.is_empty() {
             return None;
         }
-        Some(SopEntry { task_type: self.task.task_type.clone(), keywords, script })
+        Some(SopEntry {
+            task_type: self.task.task_type.clone(),
+            keywords,
+            script,
+        })
     }
 
     /// Cache the last executed task command as an SOP (deduped) once it has
@@ -373,7 +473,9 @@ impl BotState {
         if self.task.best_answer.is_empty() {
             return; // the command never produced an answer: don't cache it
         }
-        let Some(entry) = self.extract_sop() else { return };
+        let Some(entry) = self.extract_sop() else {
+            return;
+        };
         if !self.sop_cache.iter().any(|old| old.script == entry.script) {
             self.sop_cache.push(entry);
         }
@@ -388,7 +490,12 @@ impl BotState {
         // keyword comparison (this lets a second 自进化类1 task reuse the first
         // one's working script immediately).
         if !task_type.is_empty() {
-            if let Some(entry) = self.sop_cache.iter().rev().find(|entry| entry.task_type == task_type) {
+            if let Some(entry) = self
+                .sop_cache
+                .iter()
+                .rev()
+                .find(|entry| entry.task_type == task_type)
+            {
                 return Some(entry);
             }
         }
@@ -399,11 +506,20 @@ impl BotState {
         self.sop_cache
             .iter()
             .filter(|entry| {
-                entry.keywords.iter().filter(|kw| keywords.contains(*kw)).count() * 2
+                entry
+                    .keywords
+                    .iter()
+                    .filter(|kw| keywords.contains(*kw))
+                    .count()
+                    * 2
                     >= entry.keywords.len()
             })
             .max_by_key(|entry| {
-                entry.keywords.iter().filter(|kw| keywords.contains(*kw)).count()
+                entry
+                    .keywords
+                    .iter()
+                    .filter(|kw| keywords.contains(*kw))
+                    .count()
             })
     }
 
@@ -445,7 +561,11 @@ impl BotState {
                 } else if self.treasure.summon_attempts >= 2 {
                     self.treasure.plan = None;
                     self.treasure.time_feedback = true;
-                    self.treasure.phase = if self.treasure.ask_attempts >= 3 { Done } else { Idle };
+                    self.treasure.phase = if self.treasure.ask_attempts >= 3 {
+                        Done
+                    } else {
+                        Idle
+                    };
                 } else if let Some(plan) = &mut self.treasure.plan {
                     plan.open_day = turn.day.max(plan.open_day + 1);
                     self.treasure.phase = HavePlan;
@@ -483,7 +603,9 @@ impl BotState {
 /// Cheap keyword extraction for SOP matching over Chinese/ASCII task text.
 pub fn keywords_of(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let stop = ["的", "了", "请", "你", "我", "在", "和", "与", "是", "个", "任务", "查询"];
+    let stop = [
+        "的", "了", "请", "你", "我", "在", "和", "与", "是", "个", "任务", "查询",
+    ];
     for token in text.split(|c: char| !c.is_alphanumeric()) {
         if token.is_empty() || token.chars().count() < 2 {
             continue;

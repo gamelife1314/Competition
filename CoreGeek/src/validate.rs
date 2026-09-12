@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::brain::combat;
-use crate::model::{chebyshev, UnitKind, Turn};
+use crate::model::{chebyshev, Turn, UnitKind};
 use crate::protocol::{Pos, RoleCommand};
 
 pub fn sanitize(turn: &Turn, commands: HashMap<i64, RoleCommand>) -> BTreeMap<String, RoleCommand> {
@@ -17,10 +17,14 @@ pub fn sanitize(turn: &Turn, commands: HashMap<i64, RoleCommand>) -> BTreeMap<St
     ordered.sort_by_key(|(id, _)| *id);
 
     for (id, cmd) in ordered {
-        let Some(cmd) = sanitize_one(turn, id, &cmd) else { continue };
+        let Some(cmd) = sanitize_one(turn, id, &cmd) else {
+            continue;
+        };
         let cost = match cmd.action.as_str() {
             "buy" => {
-                let Some(name) = cmd.name.as_ref() else { continue };
+                let Some(name) = cmd.name.as_ref() else {
+                    continue;
+                };
                 let price = turn.weapon_shop.get(name).copied().unwrap_or(i64::MAX);
                 price.saturating_mul(cmd.num.unwrap_or(1))
             }
@@ -79,7 +83,8 @@ fn sanitize_one(turn: &Turn, id: i64, cmd: &RoleCommand) -> Option<RoleCommand> 
             if targets.is_empty() {
                 return None;
             }
-            let projectiles = crate::model::tower_projectiles(actor.kind, actor.level.max(1)) as usize;
+            let projectiles =
+                crate::model::tower_projectiles(actor.kind, actor.level.max(1)) as usize;
             if actor.kind == UnitKind::Railgun && targets.len() != 1 {
                 return None;
             }
@@ -169,11 +174,7 @@ fn sanitize_one(turn: &Turn, id: i64, cmd: &RoleCommand) -> Option<RoleCommand> 
                 return None;
             }
             // Must actually be one of our walls.
-            if !turn
-                .walls()
-                .iter()
-                .any(|wall| wall.pos == target)
-            {
+            if !turn.walls().iter().any(|wall| wall.pos == target) {
                 return None;
             }
         }
@@ -230,8 +231,12 @@ fn sanitize_one(turn: &Turn, id: i64, cmd: &RoleCommand) -> Option<RoleCommand> 
                 }
                 // Upgrade vouchers: target must be our matching building at
                 // the right level, within 1 cell.
-                "WeaponUpgradeVoucher1" | "WeaponUpgradeVoucher2" | "StationUpgradeVoucher1"
-                | "StationUpgradeVoucher2" | "WallUpgradeVoucher1" | "WallUpgradeVoucher2" => {
+                "WeaponUpgradeVoucher1"
+                | "WeaponUpgradeVoucher2"
+                | "StationUpgradeVoucher1"
+                | "StationUpgradeVoucher2"
+                | "WallUpgradeVoucher1"
+                | "WallUpgradeVoucher2" => {
                     let target = single_target(cmd)?;
                     if chebyshev(actor.pos, target) != 1 {
                         return None;
@@ -287,10 +292,13 @@ fn single_target(cmd: &RoleCommand) -> Option<Pos> {
 
 fn voucher_target_ok(turn: &Turn, voucher: &str, target: Pos) -> bool {
     let want_level = if voucher.ends_with('1') { 1 } else { 2 };
-    let target_unit = turn.ours.iter().find(|unit| {
-        unit.footprint().contains(&target)
-    });
-    let Some(unit) = target_unit else { return false };
+    let target_unit = turn
+        .ours
+        .iter()
+        .find(|unit| unit.footprint().contains(&target));
+    let Some(unit) = target_unit else {
+        return false;
+    };
     if unit.level != want_level {
         return false;
     }

@@ -1,7 +1,7 @@
 //! A* pathfinding on the 8-neighbour grid; returns the next step to take.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::model::{chebyshev, neighbours, Turn};
 use crate::protocol::Pos;
@@ -25,7 +25,6 @@ impl PartialOrd for Node {
     }
 }
 
-
 /// Walk toward `goal` but stop at any of `stands` (cells from which the goal
 /// is actionable). Returns the next step to take this round, if any.
 pub fn step_toward_stands(
@@ -39,9 +38,20 @@ pub fn step_toward_stands(
     }
     let stand_set: HashSet<Pos> = stands.iter().copied().collect();
     let mut seq: u32 = 0;
-    let heuristic = |pos: Pos| stands.iter().map(|stand| chebyshev(pos, *stand)).min().unwrap_or(i32::MAX);
+    let heuristic = |pos: Pos| {
+        stands
+            .iter()
+            .map(|stand| chebyshev(pos, *stand))
+            .min()
+            .unwrap_or(i32::MAX)
+    };
     let mut frontier: BinaryHeap<Reverse<Node>> = BinaryHeap::new();
-    frontier.push(Reverse(Node { f: heuristic(start), cost: 0, seq, pos: start }));
+    frontier.push(Reverse(Node {
+        f: heuristic(start),
+        cost: 0,
+        seq,
+        pos: start,
+    }));
     let mut best: HashMap<Pos, i32> = HashMap::new();
     best.insert(start, 0);
     let mut came_from: HashMap<Pos, Pos> = HashMap::new();

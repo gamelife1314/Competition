@@ -67,16 +67,27 @@ fn treasure_plan_parsing() {
     let resp = "推理过程……\n{\"pos\":{\"x\":20,\"y\":16},\"items\":[\"StarSand\",\"IronWhistle\"],\"openDay\":5}\n以上";
     let plan = parse_plan(resp, 3).unwrap();
     assert_eq!(plan.pos, pos(20, 16));
-    assert_eq!(plan.items, vec!["StarSand".to_string(), "IronWhistle".to_string()]);
+    assert_eq!(
+        plan.items,
+        vec!["StarSand".to_string(), "IronWhistle".to_string()]
+    );
     assert_eq!(plan.open_day, 5);
 
     // Items outside the catalog are dropped; empty item list → no plan.
     assert!(parse_plan(r#"{"pos":{"x":1,"y":1},"items":["Rock"],"openDay":2}"#, 1).is_none());
     // openDay before today is clamped.
-    let plan = parse_plan(r#"{"pos":{"x":1,"y":1},"items":["StarSand"],"openDay":0}"#, 4).unwrap();
+    let plan = parse_plan(
+        r#"{"pos":{"x":1,"y":1},"items":["StarSand"],"openDay":0}"#,
+        4,
+    )
+    .unwrap();
     assert_eq!(plan.open_day, 4);
     // Out-of-map coordinates rejected.
-    assert!(parse_plan(r#"{"pos":{"x":99,"y":1},"items":["StarSand"],"openDay":2}"#, 1).is_none());
+    assert!(parse_plan(
+        r#"{"pos":{"x":99,"y":1},"items":["StarSand"],"openDay":2}"#,
+        1
+    )
+    .is_none());
 }
 
 #[test]
@@ -90,7 +101,11 @@ fn treasure_plan_keeps_item_multiplicity() {
     .unwrap();
     assert_eq!(
         plan.items,
-        vec!["StarSand".to_string(), "StarSand".to_string(), "IronWhistle".to_string()]
+        vec![
+            "StarSand".to_string(),
+            "StarSand".to_string(),
+            "IronWhistle".to_string()
+        ]
     );
 }
 

@@ -48,7 +48,10 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
     } else {
         // No answer found: ask the LLM again with the failure context
         // (result_history carries it into the next prompt).
-        crate::log::event("task_cmd_failed", serde_json::json!({"exit": code, "timeout": result.starts_with("[TIMEOUT]")}));
+        crate::log::event(
+            "task_cmd_failed",
+            serde_json::json!({"exit": code, "timeout": result.starts_with("[TIMEOUT]")}),
+        );
         state.task.stage = TaskStage::Planning;
     }
 }
@@ -61,18 +64,20 @@ pub fn exit_code(result: &str) -> Option<i64> {
 }
 
 /// Per-round pioneer behaviour while a task is active.
-pub fn plan_pioneer(turn: &Turn, state: &mut BotState, pioneer: &Unit, plan: &mut Plan) -> Option<RoleCommand> {
-    // Timeout guard: submit whatever we have before the task expires.
+pub fn plan_pioneer(
+    turn: &Turn,
+    state: &mut BotState,
+    pioneer: &Unit,
+    plan: &mut Plan,
+) -> Option<RoleCommand> {
+    // Timeout guard: submit the strongest observed task result before expiry.
+    // Never turn the task description or an exploratory file listing into an
+    // answer; both have caused guaranteed-zero submissions in prior matches.
     let rounds_left = state.task.timeout_round.saturating_sub(turn.round_no);
     if rounds_left <= 2 {
-        if !state.task.best_answer.is_empty() {
-            state.task.stage = TaskStage::HaveAnswer { answer: state.task.best_answer.clone() };
-        } else if matches!(state.task.stage, TaskStage::WaitingCmdResult { .. } | TaskStage::Planning) {
-            // Last resort: submit a placeholder derived from the description.
-            let guess = guess_from_description(&state.task.description);
-            if !guess.is_empty() {
-                state.task.stage = TaskStage::HaveAnswer { answer: guess };
-            }
+        if let Some(answer) = partial_answer(state) {
+            state.task.best_answer = answer.clone();
+            state.task.stage = TaskStage::HaveAnswer { answer };
         }
     }
 
@@ -96,6 +101,7 @@ pub fn plan_pioneer(turn: &Turn, state: &mut BotState, pioneer: &Unit, plan: &mu
             if plan.prompt.is_none() {
                 // LLM calls during an active task are free (do not count
                 // toward the 3/day budget), per the interface doc.
+                state.task.llm_request_round = Some(turn.round_no);
                 plan.prompt = Some(build_prompt(state, turn));
             }
             None
@@ -103,6 +109,7 @@ pub fn plan_pioneer(turn: &Turn, state: &mut BotState, pioneer: &Unit, plan: &mu
         TaskStage::HavePlan { cmd } => {
             if plan.execute_cmd.is_none() {
                 state.task.cmd_history.push(truncate(&cmd, 800));
+                state.task.cmd_request_round = Some(turn.round_no);
                 state.task.stage = TaskStage::WaitingCmdResult { attempts: 0 };
                 plan.execute_cmd = Some(cmd);
             }
@@ -114,21 +121,27 @@ pub fn plan_pioneer(turn: &Turn, state: &mut BotState, pioneer: &Unit, plan: &mu
             if attempts >= 3 {
                 state.task.stage = TaskStage::Planning;
             } else {
-                state.task.stage = TaskStage::WaitingCmdResult { attempts: attempts + 1 };
+                state.task.stage = TaskStage::WaitingCmdResult {
+                    attempts: attempts + 1,
+                };
             }
             None
         }
         TaskStage::HaveAnswer { answer } => {
+            state.task.submitted_round = Some(turn.round_no);
+            state.task.phase_missing_rounds = 0;
+            state.task.point_closed_round = None;
+            state.task.post_submit_error = false;
             state.task.stage = TaskStage::WaitingSubmit { attempts: 0 };
             Some(RoleCommand::submit_answer(&answer))
         }
         TaskStage::WaitingSubmit { attempts } => {
-            if attempts >= 6 {
-                // Verdict never arrived; force a re-plan.
-                state.task.stage = TaskStage::Planning;
-            } else {
-                state.task.stage = TaskStage::WaitingSubmit { attempts: attempts + 1 };
-            }
+            // Do not re-plan merely because the success verdict is implicit.
+            // observe() owns closure and waits for task-point, phase and clean
+            // error-window evidence. Retain the stage until success or timeout.
+            state.task.stage = TaskStage::WaitingSubmit {
+                attempts: attempts.saturating_add(1),
+            };
             None
         }
     }
@@ -137,12 +150,16 @@ pub fn plan_pioneer(turn: &Turn, state: &mut BotState, pioneer: &Unit, plan: &mu
 pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
     let mut prompt = String::new();
     prompt.push_str("你在一个隔离沙盒中执行任务，沙盒可运行基础 shell 与 python3（无外网）。\n");
-    prompt.push_str("环境说明：任务相关文件（如 task_X.md、输入数据）都放在 /tmp/selfEvolutionTask/ 目录下。\n");
+    prompt.push_str(
+        "环境说明：任务相关文件（如 task_X.md、输入数据）都放在 /tmp/selfEvolutionTask/ 目录下。\n",
+    );
     prompt.push_str("请先用 `find /tmp/selfEvolutionTask/ -maxdepth 4` 或 `ls -R /tmp/selfEvolutionTask/` 查看有哪些文件；任务文件可能在多层子目录里（如 1-fixed-step/2-engineering-fix/task_X.md）。必须用 `find`/`ls` 输出的【真实完整路径】去 `cat`，不要假设文件在根目录、不要直接 `cat task_X.md`。\n");
     prompt.push_str("任务描述：\n");
     prompt.push_str(&state.task.description);
     prompt.push_str("\n\n要求：\n");
-    prompt.push_str("1. 给出可直接执行的命令或脚本（放在 ```bash 或 ```python 代码块中），完成全部子任务。\n");
+    prompt.push_str(
+        "1. 给出可直接执行的命令或脚本（放在 ```bash 或 ```python 代码块中），完成全部子任务。\n",
+    );
     prompt.push_str("2. 脚本最后一行必须打印 `ANSWER: <最终答案>`，多字段答案用 JSON 表示。\n");
     prompt.push_str("3. 脚本要可复用：把可变参数（如城市名）写在开头变量里。\n");
     prompt.push_str("4. 尽量在一个脚本内完成全部步骤（find 找文件 → cat 读取 → 计算 → 打印 ANSWER），不要分多轮试探；只有带 `ANSWER:` 标记的输出才会被当作答案提交。\n");
@@ -274,9 +291,20 @@ pub fn is_meta_answer(answer: &str) -> bool {
         || (lower.contains("\"status\"") && lower.contains("parsed"))
 }
 
-fn guess_from_description(description: &str) -> String {
-    // Extremely crude fallback so a timeout still scores partial credit.
-    truncate(description.trim(), 100)
+/// Return the strongest structured result seen so far. Only explicit answer
+/// markers qualify; raw listings, tracebacks and task prose remain excluded.
+pub fn partial_answer(state: &BotState) -> Option<String> {
+    if !state.task.best_answer.is_empty() && !is_meta_answer(&state.task.best_answer) {
+        return Some(state.task.best_answer.clone());
+    }
+    state.task.result_history.iter().rev().find_map(|result| {
+        let answer = extract_answer(strip_status_line(result))?;
+        if is_meta_answer(&answer) {
+            None
+        } else {
+            Some(answer)
+        }
+    })
 }
 
 pub fn truncate(text: &str, max_chars: usize) -> String {

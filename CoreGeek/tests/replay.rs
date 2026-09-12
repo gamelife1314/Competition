@@ -32,11 +32,23 @@ fn replay_scenarios() {
     assert!(resp["executeCmd"].as_str() == Some(""));
     // Three controllers, three towers: each should get at most one command,
     // robots are far away so all commands are moves toward the towers.
-    let ids: Vec<&str> = map.as_object().unwrap().keys().map(String::as_str).collect();
-    assert!(ids.iter().all(|id| ["10010", "10011", "10012"].contains(id)), "{ids:?}");
+    let ids: Vec<&str> = map
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        ids.iter()
+            .all(|id| ["10010", "10011", "10012"].contains(id)),
+        "{ids:?}"
+    );
     for (_id, cmd) in map.as_object().unwrap() {
         let action = cmd["action"].as_str().unwrap();
-        assert!(action == "move" || action == "attack", "unexpected {action}");
+        assert!(
+            action == "move" || action == "attack",
+            "unexpected {action}"
+        );
         if action == "move" {
             let t = &cmd["targetPos"][0];
             assert!(t["x"].is_number() && t["y"].is_number());
@@ -74,8 +86,15 @@ fn replay_scenarios() {
         let action = cmd["action"].as_str().unwrap();
         assert!(
             [
-                "move", "collect", "build", "sell", "buy", "use",
-                "acceptTask", "submitAnswer", "summonTreasure",
+                "move",
+                "collect",
+                "build",
+                "sell",
+                "buy",
+                "use",
+                "acceptTask",
+                "submitAnswer",
+                "summonTreasure",
             ]
             .contains(&action),
             "role {id}: illegal daytime action {action}"

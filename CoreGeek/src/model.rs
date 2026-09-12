@@ -61,7 +61,10 @@ impl UnitKind {
         }
     }
     pub fn is_tower(self) -> bool {
-        matches!(self, UnitKind::Gatling | UnitKind::Railgun | UnitKind::Rocket)
+        matches!(
+            self,
+            UnitKind::Gatling | UnitKind::Railgun | UnitKind::Rocket
+        )
     }
     pub fn is_controllable(self) -> bool {
         matches!(self, UnitKind::Pioneer | UnitKind::Worker)
@@ -111,7 +114,10 @@ pub fn neighbours(pos: Pos) -> [Pos; 8] {
             if dx == 0 && dy == 0 {
                 continue;
             }
-            out[i] = Pos { x: pos.x + dx, y: pos.y + dy };
+            out[i] = Pos {
+                x: pos.x + dx,
+                y: pos.y + dy,
+            };
             i += 1;
         }
     }
@@ -155,7 +161,10 @@ impl Unit {
         self.capacity > 0 && self.backpack.len() as i64 >= self.capacity
     }
     pub fn count_item(&self, name: &str) -> usize {
-        self.backpack.iter().filter(|item| item.as_str() == name).count()
+        self.backpack
+            .iter()
+            .filter(|item| item.as_str() == name)
+            .count()
     }
     /// Effective attack range: trust the request field when set, else fall
     /// back to the per-kind level table.
@@ -177,11 +186,29 @@ impl Unit {
 }
 
 pub fn station_footprint(pos: Pos) -> Vec<Pos> {
-    vec![pos, Pos { x: pos.x + 1, y: pos.y }, Pos { x: pos.x, y: pos.y - 1 }, Pos { x: pos.x + 1, y: pos.y - 1 }]
+    vec![
+        pos,
+        Pos {
+            x: pos.x + 1,
+            y: pos.y,
+        },
+        Pos {
+            x: pos.x,
+            y: pos.y - 1,
+        },
+        Pos {
+            x: pos.x + 1,
+            y: pos.y - 1,
+        },
+    ]
 }
 
 pub fn footprint_distance(pos: Pos, footprint: &[Pos]) -> i32 {
-    footprint.iter().map(|cell| chebyshev(pos, *cell)).min().unwrap_or(0)
+    footprint
+        .iter()
+        .map(|cell| chebyshev(pos, *cell))
+        .min()
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone)]
@@ -314,28 +341,42 @@ impl Turn {
         self.ours.iter().find(|unit| unit.kind == UnitKind::Station)
     }
     pub fn workers(&self) -> Vec<&Unit> {
-        let mut out: Vec<&Unit> =
-            self.ours.iter().filter(|unit| unit.kind == UnitKind::Worker && unit.alive()).collect();
+        let mut out: Vec<&Unit> = self
+            .ours
+            .iter()
+            .filter(|unit| unit.kind == UnitKind::Worker && unit.alive())
+            .collect();
         out.sort_by_key(|unit| unit.id);
         out
     }
     pub fn pioneer(&self) -> Option<&Unit> {
-        self.ours.iter().find(|unit| unit.kind == UnitKind::Pioneer && unit.alive())
+        self.ours
+            .iter()
+            .find(|unit| unit.kind == UnitKind::Pioneer && unit.alive())
     }
     pub fn controllable(&self) -> Vec<&Unit> {
-        let mut out: Vec<&Unit> =
-            self.ours.iter().filter(|unit| unit.kind.is_controllable() && unit.alive()).collect();
+        let mut out: Vec<&Unit> = self
+            .ours
+            .iter()
+            .filter(|unit| unit.kind.is_controllable() && unit.alive())
+            .collect();
         out.sort_by_key(|unit| unit.id);
         out
     }
     pub fn towers(&self) -> Vec<&Unit> {
-        let mut out: Vec<&Unit> =
-            self.ours.iter().filter(|unit| unit.kind.is_tower() && unit.alive()).collect();
+        let mut out: Vec<&Unit> = self
+            .ours
+            .iter()
+            .filter(|unit| unit.kind.is_tower() && unit.alive())
+            .collect();
         out.sort_by_key(|unit| (unit.pos.x, unit.pos.y));
         out
     }
     pub fn walls(&self) -> Vec<&Unit> {
-        self.ours.iter().filter(|unit| unit.kind == UnitKind::Wall && unit.alive()).collect()
+        self.ours
+            .iter()
+            .filter(|unit| unit.kind == UnitKind::Wall && unit.alive())
+            .collect()
     }
     pub fn role_by_id(&self, id: i64) -> Option<&Unit> {
         self.ours.iter().find(|unit| unit.id == id)

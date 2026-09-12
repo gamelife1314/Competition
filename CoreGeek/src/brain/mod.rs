@@ -50,7 +50,11 @@ fn decide(raw_body: &[u8]) -> Result<String, String> {
     let mut state = BotState::locked();
     state.observe(&turn);
 
-    let mut plan = if turn.is_day { day::plan(&turn, &mut state) } else { night::plan(&turn, &mut state) };
+    let mut plan = if turn.is_day {
+        day::plan(&turn, &mut state)
+    } else {
+        night::plan(&turn, &mut state)
+    };
 
     // executeCmd is only accepted by the judger while a task is active.
     if !state.task.active {
@@ -85,7 +89,10 @@ fn decide(raw_body: &[u8]) -> Result<String, String> {
                 id,
                 IssuedCmd {
                     action: cmd.action.clone(),
-                    target: cmd.targetPos.as_ref().and_then(|list| list.first().copied()),
+                    target: cmd
+                        .targetPos
+                        .as_ref()
+                        .and_then(|list| list.first().copied()),
                     name: cmd.name.clone(),
                 },
             );
@@ -93,7 +100,15 @@ fn decide(raw_body: &[u8]) -> Result<String, String> {
     }
     state.last_issued = issued;
 
-    log_round(&turn, &state, &sanitized, &failures, &plan.prompt, &plan.execute_cmd, started);
+    log_round(
+        &turn,
+        &mut state,
+        &sanitized,
+        &failures,
+        &plan.prompt,
+        &plan.execute_cmd,
+        started,
+    );
 
     let response = Response {
         roleCommandMap: sanitized,
@@ -106,7 +121,7 @@ fn decide(raw_body: &[u8]) -> Result<String, String> {
 #[allow(clippy::too_many_arguments)]
 fn log_round(
     turn: &Turn,
-    state: &BotState,
+    state: &mut BotState,
     sanitized: &std::collections::BTreeMap<String, RoleCommand>,
     failures: &[serde_json::Value],
     prompt: &Option<String>,
@@ -138,6 +153,55 @@ fn log_round(
         .iter()
         .map(|role| json!({"id": role.id, "hp": role.health, "pack": role.backpack.len()}))
         .collect();
+    let score_delta = state
+        .prev_total_score
+        .map(|previous| turn.total_score - previous);
+    let robot_hp: HashMap<i64, i64> = turn
+        .robots
+        .iter()
+        .filter(|robot| robot.health > 0)
+        .map(|robot| (robot.id, robot.health))
+        .collect();
+    let robot_events: Vec<serde_json::Value> = robot_hp
+        .iter()
+        .filter_map(|(id, hp)| match state.prev_robot_hp.get(id) {
+            Some(previous) if previous != hp => Some(json!({"id": id, "hpDelta": hp - previous})),
+            None => Some(json!({"id": id, "spawnHp": hp})),
+            _ => None,
+        })
+        .chain(
+            state
+                .prev_robot_hp
+                .iter()
+                .filter(|(id, _)| !robot_hp.contains_key(id))
+                .map(|(id, previous)| json!({"id": id, "goneFromHp": previous})),
+        )
+        .collect();
+    let wall_hp: i64 = turn.walls().iter().map(|wall| wall.health).sum();
+    let wall_hp_delta = state.prev_wall_hp.map(|previous| wall_hp - previous);
+    // Score attribution. Robots that leave the board score `score2`
+    // (small/middle/large/BOSS = 1/2/4/10); the survival rule of chapter 6 is
+    // `10 x day` while the station stands. Both are accumulated here so the
+    // residual — task score (`score1`) plus estimate error — separates the
+    // three objectives and shows WHICH one a change actually moved.
+    let killed: i64 = state
+        .prev_robot_hp
+        .iter()
+        .filter(|(id, hp)| **hp > 0 && !robot_hp.contains_key(id))
+        .map(|(id, _)| state.prev_robot_kind.get(id).copied().unwrap_or(0))
+        .sum();
+    state.cum_kill_score = state.cum_kill_score.saturating_add(killed);
+    let survival_score = if turn.station().is_some() {
+        turn.day * 10
+    } else {
+        0
+    };
+    let residual = turn.total_score - state.cum_kill_score - survival_score;
+    let pairs: Vec<serde_json::Value> = state
+        .night_pairs
+        .iter()
+        .map(|(controller, tower)| json!({"controller": controller, "tower": tower}))
+        .collect();
     crate::log::event(
         "round",
         json!({
@@ -146,9 +210,19 @@ fn log_round(
             "isDay": turn.is_day,
             "gold": turn.gold,
             "score": turn.total_score,
+            "scoreDelta": score_delta,
+            "scoreAttr": {
+                "kill": state.cum_kill_score,
+                "killThisRound": killed,
+                "survival": survival_score,
+                "residual": residual,
+            },
             "stationHp": turn.station().map(|station| station.health),
             "stationLvl": turn.station().map(|station| station.level),
-            "robots": turn.robots.iter().filter(|robot| robot.health > 0).count(),
+            "robotCount": robot_hp.len(),
+            "robotEvents": robot_events,
+            "wall": {"count": turn.walls().len(), "hp": wall_hp, "hpDelta": wall_hp_delta},
+            "pairs": pairs,
             "towers": towers,
             "roles": roles,
             "cmds": cmds,
@@ -161,8 +235,12 @@ fn log_round(
             "llmToday": state.llm_used_today,
             "task": {
                 "active": state.task.active,
+                "session": state.task.session_id,
                 "stage": format!("{:?}", state.task.stage),
                 "wrong": state.task.wrong_answers,
+                "submittedRound": state.task.submitted_round,
+                "phaseMissing": state.task.phase_missing_rounds,
+                "pointClosedRound": state.task.point_closed_round,
             },
             "treasure": {
                 "phase": format!("{:?}", state.treasure.phase),
@@ -172,6 +250,15 @@ fn log_round(
             "ms": started.elapsed().as_micros() as f64 / 1000.0,
         }),
     );
+    state.prev_total_score = Some(turn.total_score);
+    state.prev_robot_hp = robot_hp;
+    state.prev_robot_kind = turn
+        .robots
+        .iter()
+        .filter(|robot| robot.health > 0)
+        .map(|robot| (robot.id, robot.kind.score()))
+        .collect();
+    state.prev_wall_hp = Some(wall_hp);
     if let Some(text) = prompt {
         crate::log::event("prompt_sent", json!({"head": crate::log::brief(text, 300)}));
     }
@@ -182,7 +269,10 @@ fn log_round(
 
 /// Walkable cells around `target` (for "stand next to X" actions).
 pub fn stand_cells(turn: &Turn, target: Pos) -> Vec<Pos> {
-    neighbours(target).into_iter().filter(|pos| turn.is_land(*pos)).collect()
+    neighbours(target)
+        .into_iter()
+        .filter(|pos| turn.is_land(*pos))
+        .collect()
 }
 
 /// Compute the next step for `role` toward any of `stands`, avoiding cells
@@ -214,7 +304,9 @@ pub fn walk_toward(
 /// never be fully enclosed.
 pub fn tower_stand_cells(turn: &Turn, tower_pos: Pos) -> Vec<Pos> {
     let all = stand_cells(turn, tower_pos);
-    let Some(station) = turn.station() else { return all };
+    let Some(station) = turn.station() else {
+        return all;
+    };
     let footprint = station.footprint();
     let inner: Vec<Pos> = all
         .iter()
@@ -249,7 +341,11 @@ pub fn walk_or_remove_wall(
         .map(|wall| wall.pos)
         .filter(|pos| chebyshev(role.pos, *pos) == 1)
         .min_by_key(|pos| {
-            stands.iter().map(|stand| chebyshev(*pos, *stand)).min().unwrap_or(i32::MAX)
+            stands
+                .iter()
+                .map(|stand| chebyshev(*pos, *stand))
+                .min()
+                .unwrap_or(i32::MAX)
         })
         .map(|pos| RoleCommand::remove(pos))
 }

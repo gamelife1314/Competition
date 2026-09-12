@@ -4,8 +4,9 @@
 use crate::model::{COPPER, IRON, STONE};
 use crate::state::Outage;
 
-const OUTAGE_WORDS: [&str; 9] =
-    ["塌方", "停工", "停产", "关停", "封闭", "检修", "暂停", "事故", "管制"];
+const OUTAGE_WORDS: [&str; 9] = [
+    "塌方", "停工", "停产", "关停", "封闭", "检修", "暂停", "事故", "管制",
+];
 
 const CN_NUM: [(char, i64); 10] = [
     ('一', 1),
@@ -32,13 +33,18 @@ pub fn parse_official(day: i64, text: &str) -> Vec<Outage> {
             continue;
         }
         // "今天浅层矿面还能抢采" style: mining still OK today → start tomorrow.
-        let start = if text.contains("即日") || text.contains("今日起") || text.contains("今天起") {
+        let start = if text.contains("即日") || text.contains("今日起") || text.contains("今天起")
+        {
             day
         } else {
             day + 1
         };
         let duration = find_duration_days(text).unwrap_or(2).clamp(1, 5);
-        out.push(Outage { ore: ore.to_string(), from_day: start, to_day: start + duration - 1 });
+        out.push(Outage {
+            ore: ore.to_string(),
+            from_day: start,
+            to_day: start + duration - 1,
+        });
     }
     out
 }

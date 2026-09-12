@@ -11,8 +11,14 @@ use crate::model::{chebyshev, Turn, Unit};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::{BotState, TreasurePhase, TreasurePlan};
 
-const ALL_ITEMS: [&str; 6] =
-    ["AcientTablet", "StarSand", "FlameBreath", "FrostPotion", "ThornAmulet", "IronWhistle"];
+const ALL_ITEMS: [&str; 6] = [
+    "AcientTablet",
+    "StarSand",
+    "FlameBreath",
+    "FrostPotion",
+    "ThornAmulet",
+    "IronWhistle",
+];
 
 /// Consume a fresh `llmResp` addressed to the treasure hunt.
 pub fn on_llm_resp(state: &mut BotState, resp: &str, round_no: i64) {
@@ -79,7 +85,11 @@ pub fn parse_plan(resp: &str, current_day: i64) -> Option<TreasurePlan> {
         .and_then(|v| v.as_i64())
         .unwrap_or(current_day)
         .max(current_day);
-    Some(TreasurePlan { pos: Pos { x, y }, items, open_day })
+    Some(TreasurePlan {
+        pos: Pos { x, y },
+        items,
+        open_day,
+    })
 }
 
 fn build_prompt(state: &BotState) -> String {
@@ -122,7 +132,9 @@ pub fn plan_pioneer(
                 plan.prompt = Some(build_prompt(state));
                 state.consume_prompt_budget();
                 state.treasure.time_feedback = false;
-                state.treasure.phase = TreasurePhase::AskedLlm { round: turn.round_no };
+                state.treasure.phase = TreasurePhase::AskedLlm {
+                    round: turn.round_no,
+                };
             }
             None
         }
@@ -142,7 +154,11 @@ pub fn plan_pioneer(
                 if missing.iter().any(|(name, _)| name == item) {
                     continue;
                 }
-                let need = treasure_plan.items.iter().filter(|other| *other == item).count() as i64;
+                let need = treasure_plan
+                    .items
+                    .iter()
+                    .filter(|other| *other == item)
+                    .count() as i64;
                 let have = pioneer.count_item(item) as i64;
                 if have < need {
                     missing.push((item.clone(), need - have));
@@ -176,7 +192,8 @@ pub fn plan_pioneer(
             let adjacent = chebyshev(pioneer.pos, altar) <= 1;
             if turn.day >= treasure_plan.open_day {
                 if adjacent {
-                    state.treasure.summon_attempts = state.treasure.summon_attempts.saturating_add(1);
+                    state.treasure.summon_attempts =
+                        state.treasure.summon_attempts.saturating_add(1);
                     let items: Vec<String> = treasure_plan.items.clone();
                     return Some(RoleCommand::summon_treasure(altar, items));
                 }
@@ -190,4 +207,3 @@ pub fn plan_pioneer(
         }
     }
 }
-

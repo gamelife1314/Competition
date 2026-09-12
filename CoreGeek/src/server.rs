@@ -37,7 +37,10 @@ pub async fn serve(listener: TcpListener) {
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES).collect().await {
+    let body = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+        .collect()
+        .await
+    {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return Ok(json_response(EMPTY_RESPONSE)),
     };

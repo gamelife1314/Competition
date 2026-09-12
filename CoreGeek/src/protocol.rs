@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 // Request side
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(default)]
 pub struct Pos {
     pub x: i32,
@@ -196,10 +198,18 @@ pub struct RoleCommand {
 
 impl RoleCommand {
     pub fn move_to(pos: Pos) -> Self {
-        Self { action: "move".into(), targetPos: Some(vec![pos]), ..Default::default() }
+        Self {
+            action: "move".into(),
+            targetPos: Some(vec![pos]),
+            ..Default::default()
+        }
     }
     pub fn collect(pos: Pos) -> Self {
-        Self { action: "collect".into(), targetPos: Some(vec![pos]), ..Default::default() }
+        Self {
+            action: "collect".into(),
+            targetPos: Some(vec![pos]),
+            ..Default::default()
+        }
     }
     pub fn build(pos: Pos, name: &str) -> Self {
         Self {
@@ -211,7 +221,11 @@ impl RoleCommand {
     }
     #[allow(dead_code)] // wall demolition: reserved for future tactics
     pub fn remove(pos: Pos) -> Self {
-        Self { action: "remove".into(), targetPos: Some(vec![pos]), ..Default::default() }
+        Self {
+            action: "remove".into(),
+            targetPos: Some(vec![pos]),
+            ..Default::default()
+        }
     }
     pub fn attack(controller_id: i64, targets: Vec<Pos>) -> Self {
         Self {
@@ -222,13 +236,27 @@ impl RoleCommand {
         }
     }
     pub fn sell(name: &str, num: i64) -> Self {
-        Self { action: "sell".into(), name: Some(name.into()), num: Some(num), ..Default::default() }
+        Self {
+            action: "sell".into(),
+            name: Some(name.into()),
+            num: Some(num),
+            ..Default::default()
+        }
     }
     pub fn buy(name: &str, num: i64) -> Self {
-        Self { action: "buy".into(), name: Some(name.into()), num: Some(num), ..Default::default() }
+        Self {
+            action: "buy".into(),
+            name: Some(name.into()),
+            num: Some(num),
+            ..Default::default()
+        }
     }
     pub fn use_item(name: &str) -> Self {
-        Self { action: "use".into(), name: Some(name.into()), ..Default::default() }
+        Self {
+            action: "use".into(),
+            name: Some(name.into()),
+            ..Default::default()
+        }
     }
     pub fn use_item_at(name: &str, pos: Pos) -> Self {
         Self {
@@ -240,10 +268,17 @@ impl RoleCommand {
     }
     #[allow(dead_code)] // reserved for backpack management tactics
     pub fn drop_item(name: &str) -> Self {
-        Self { action: "drop".into(), name: Some(name.into()), ..Default::default() }
+        Self {
+            action: "drop".into(),
+            name: Some(name.into()),
+            ..Default::default()
+        }
     }
     pub fn accept_task() -> Self {
-        Self { action: "acceptTask".into(), ..Default::default() }
+        Self {
+            action: "acceptTask".into(),
+            ..Default::default()
+        }
     }
     pub fn submit_answer(answer: &str) -> Self {
         Self {

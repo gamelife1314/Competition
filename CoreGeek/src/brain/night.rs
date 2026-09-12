@@ -3,8 +3,10 @@
 
 use std::collections::HashSet;
 
-use crate::brain::{combat, stand_cells, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan};
-use crate::model::{chebyshev, Turn, Unit, UnitKind};
+use crate::brain::{
+    combat, stand_cells, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan,
+};
+use crate::model::{chebyshev, footprint_distance, Turn, Unit, UnitKind};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
 
@@ -40,56 +42,88 @@ pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
     pairs
 }
 
-/// Stable controller↔tower pairings: computed once per night (or when
-/// towers change), reused across rounds so controllers actually reach
-/// their assigned weapon instead of oscillating between targets.
+/// Stable controller↔tower pairings. The cache key includes every living
+/// tower/controller and whether the pioneer is occupied by a task. This keeps
+/// assignments stable while all members remain usable, but replaces a dead or
+/// newly freed controller in the very next round.
 pub fn stable_pairs(turn: &Turn, state: &mut BotState) -> Vec<(i64, i64)> {
-    let tower_ids: Vec<i64> = turn
-        .towers()
-        .iter()
-        .filter(|tower| tower.alive())
-        .map(|tower| tower.id)
-        .collect();
+    let tower_ids: Vec<i64> = turn.towers().iter().map(|tower| tower.id).collect();
+    let controller_ids: Vec<i64> = turn.controllable().iter().map(|role| role.id).collect();
+    let task_busy = state.task.active;
 
-    // Recompute if: first night, day changed, or tower set changed.
     let needs_recompute = state.night_pairs.is_empty()
         || state.night_pair_day != turn.day
-        || state.night_pair_tower_ids != tower_ids;
+        || state.night_pair_tower_ids != tower_ids
+        || state.night_pair_controller_ids != controller_ids
+        || state.night_pair_task_busy != task_busy;
 
     if needs_recompute {
-        let towers = turn.towers();
-        let mut controllers: Vec<&Unit> = turn
-            .controllable()
-            .into_iter()
-            .filter(|role| !(state.task.active && role.kind == UnitKind::Pioneer))
-            .collect();
-        let mut pairs: Vec<(i64, i64)> = Vec::new();
-        for tower in towers {
-            if controllers.is_empty() || !tower.alive() {
-                break;
-            }
-            let mut best_index = 0usize;
-            let mut best_dist = i32::MAX;
-            for (index, role) in controllers.iter().enumerate() {
-                let dist = chebyshev(role.pos, tower.pos);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_index = index;
-                }
-            }
-            let role = controllers.remove(best_index);
-            pairs.push((role.id, tower.id));
-        }
-        state.night_pairs = pairs;
+        let reason = if state.night_pairs.is_empty() {
+            "empty"
+        } else if state.night_pair_day != turn.day {
+            "day"
+        } else if state.night_pair_tower_ids != tower_ids {
+            "towers"
+        } else if state.night_pair_controller_ids != controller_ids {
+            "controllers"
+        } else {
+            "task_occupancy"
+        };
+        state.night_pairs = pairing(turn, state);
         state.night_pair_day = turn.day;
         state.night_pair_tower_ids = tower_ids;
+        state.night_pair_controller_ids = controller_ids;
+        state.night_pair_task_busy = task_busy;
+        crate::log::event(
+            "pair_recomputed",
+            serde_json::json!({"round": turn.round_no, "reason": reason, "pairs": state.night_pairs}),
+        );
     }
     state.night_pairs.clone()
+}
+
+pub fn operator_shortage(turn: &Turn) -> bool {
+    let towers = turn.towers().len();
+    let free_controllers = turn
+        .controllable()
+        .iter()
+        .filter(|role| role.kind != UnitKind::Pioneer)
+        .count();
+    towers > free_controllers
+}
+
+pub fn defense_needs_pioneer(turn: &Turn) -> bool {
+    let shortage = operator_shortage(turn);
+    let station = turn.station();
+    let station_damaged = station.map(|unit| unit.health < 1500).unwrap_or(false);
+    let close_threat = station
+        .map(|unit| {
+            let footprint = unit.footprint();
+            turn.robots.iter().any(|robot| {
+                robot.health > 0
+                    && robot.target_team == turn.team_type
+                    && footprint_distance(robot.pos, &footprint) <= 8
+            })
+        })
+        .unwrap_or(false);
+    shortage && (station_damaged || close_threat)
 }
 
 pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let mut plan = Plan::default();
     let mut claimed: HashSet<Pos> = HashSet::new();
+
+    // A task must never cost an operated tower while robots are actively
+    // threatening our side. Release the pioneer before pairing so it can be
+    // recalled in this same round. In quiet nights, two operators may cover two
+    // towers while a task continues.
+    if state.task.active && defense_needs_pioneer(turn) {
+        crate::log::event(
+            "task_defense_abort",
+            serde_json::json!({"round": turn.round_no, "session": state.task.session_id, "reason": "unmanned_tower_under_threat"}),
+        );
+        state.finish_task(false, "night_defense");
+    }
 
     let mut pairs = stable_pairs(turn, state);
     // Fire the towers under the heaviest pressure first: they get first pick
@@ -102,11 +136,35 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         std::cmp::Reverse(load)
     });
     let mut paired: HashSet<i64> = HashSet::new();
+    let paired_towers: HashSet<i64> = pairs.iter().map(|(_, tower)| *tower).collect();
+    let available = turn
+        .controllable()
+        .iter()
+        .filter(|role| !(state.task.active && role.kind == UnitKind::Pioneer))
+        .count();
+    for tower in turn.towers() {
+        if !paired_towers.contains(&tower.id) {
+            let reason = if state.task.active && turn.pioneer().is_some() {
+                "pioneer_task_occupied"
+            } else if available < turn.towers().len() {
+                "no_live_controller"
+            } else {
+                "pairing_invariant"
+            };
+            crate::log::event(
+                "tower_unpaired",
+                serde_json::json!({"round": turn.round_no, "tower": tower.id, "reason": reason}),
+            );
+        }
+    }
     let mut sim = combat::init_sim(turn);
 
     for (controller_id, tower_id) in &pairs {
-        let (Some(tower), Some(controller)) = (turn.role_by_id(*tower_id), turn.role_by_id(*controller_id))
-        else { continue };
+        let (Some(tower), Some(controller)) =
+            (turn.role_by_id(*tower_id), turn.role_by_id(*controller_id))
+        else {
+            continue;
+        };
         if !tower.alive() || !controller.alive() {
             continue;
         }
@@ -117,6 +175,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         let adjacent = dist <= 1;
         let mut targets_count: usize = 0;
         let mut fired = false;
+        // Why a ready weapon stayed silent. "could fire but did not" was the
+        // single hardest failure to diagnose from the logs (battles pk575060 /
+        // pk575098 / pk575557), so each idle tower now carries its own reason.
+        let mut idle_reason = "fired";
 
         if !adjacent {
             // NIGHT RECALL (recurring defect): a controller not adjacent to its
@@ -142,11 +204,17 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             // walkable cell adjacent to the tower still lets the operator fire.
             if !moved {
                 let any_stands = stand_cells(turn, tower.pos);
-                if let Some(cmd) = walk_or_remove_wall(turn, controller, &any_stands, &mut claimed) {
+                if let Some(cmd) = walk_or_remove_wall(turn, controller, &any_stands, &mut claimed)
+                {
                     plan.push(controller.id, cmd);
                     moved = true;
                 }
             }
+            idle_reason = if moved {
+                "controller_walking"
+            } else {
+                "controller_stuck"
+            };
             crate::log::event(
                 "night_recall",
                 serde_json::json!({
@@ -161,13 +229,18 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             // Adjacent: a badly hurt operator heals first (a dead one mans
             // nothing), otherwise man the tower.
             if let Some(cmd) = crate::brain::day::use_medicine(controller) {
+                idle_reason = "controller_healing";
                 plan.push(controller.id, cmd);
             } else if tower.cooldown == 0 {
                 if let Some(targets) = combat::choose_attack(turn, tower, &mut sim) {
                     targets_count = targets.len();
                     fired = true;
                     plan.push(tower.id, RoleCommand::attack(controller.id, targets));
+                } else {
+                    idle_reason = "no_target_in_range";
                 }
+            } else {
+                idle_reason = "cooldown";
             }
             // The controller holds position (no command) to stay adjacent.
         }
@@ -187,6 +260,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 "controller_pos": controller.pos,
                 "tower_pos": tower.pos,
                 "fired": fired,
+                "reason": idle_reason,
             }),
         );
     }
@@ -258,7 +332,9 @@ fn spare_night(
                 .filter(|robot| robot.health > 0 && chebyshev(impact, robot.pos) <= 1)
                 .count();
             let big = turn.robots.iter().any(|robot| {
-                robot.health > 0 && chebyshev(impact, robot.pos) <= 1 && combat::is_big_threat(robot.kind)
+                robot.health > 0
+                    && chebyshev(impact, robot.pos) <= 1
+                    && combat::is_big_threat(robot.kind)
             });
             if clustered >= 2 || big {
                 plan.push(role.id, RoleCommand::use_item_at("Bomb", impact));
@@ -282,7 +358,9 @@ fn spare_night(
 /// this round). Uses only the cells at footprint distance <= 1 — hugging the
 /// station — so the role never stops on the wall line or out near the mines.
 fn shelter(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) -> bool {
-    let Some(station) = turn.station() else { return false };
+    let Some(station) = turn.station() else {
+        return false;
+    };
     let footprint = station.footprint();
     let mut stands: Vec<Pos> = Vec::new();
     for cell in &footprint {

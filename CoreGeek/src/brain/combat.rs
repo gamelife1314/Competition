@@ -14,7 +14,10 @@
 
 use std::collections::HashMap;
 
-use crate::model::{chebyshev, footprint_distance, station_footprint, Unit, UnitKind, Turn, Robot, RobotKind, FULL_MAP_RANGE};
+use crate::model::{
+    chebyshev, footprint_distance, station_footprint, Robot, RobotKind, Turn, Unit, UnitKind,
+    FULL_MAP_RANGE,
+};
 use crate::protocol::Pos;
 
 const KILL_BONUS_PER_SCORE: i64 = 20;
@@ -160,7 +163,10 @@ fn choose_gatling(
     bullets: usize,
     sim: &mut SimHp,
 ) -> Option<Vec<Pos>> {
-    let candidates: Vec<&&Robot> = robots.iter().filter(|robot| in_range(tower, robot.pos)).collect();
+    let candidates: Vec<&&Robot> = robots
+        .iter()
+        .filter(|robot| in_range(tower, robot.pos))
+        .collect();
     if candidates.is_empty() {
         return None;
     }
@@ -174,7 +180,9 @@ fn choose_gatling(
                 continue;
             }
             // Bullet hits the first robot along the trajectory.
-            let Some(victim) = first_on_line(robots, sim, tower.pos, robot.pos) else { continue };
+            let Some(victim) = first_on_line(robots, sim, tower.pos, robot.pos) else {
+                continue;
+            };
             let hp = sim.get(&victim.id).copied().unwrap_or(0);
             let value = hit_value(turn, victim, hp, 10);
             if best.map(|(v, _)| value > v).unwrap_or(true) {
@@ -203,7 +211,12 @@ fn choose_gatling(
     Some(chosen)
 }
 
-fn choose_railgun(turn: &Turn, tower: &Unit, robots: &[&Robot], sim: &mut SimHp) -> Option<Vec<Pos>> {
+fn choose_railgun(
+    turn: &Turn,
+    tower: &Unit,
+    robots: &[&Robot],
+    sim: &mut SimHp,
+) -> Option<Vec<Pos>> {
     let energy0 = if tower.attack_power > 0 {
         tower.attack_power
     } else {
@@ -225,7 +238,9 @@ fn choose_railgun(turn: &Turn, tower: &Unit, robots: &[&Robot], sim: &mut SimHp)
             if cell == tower.pos || energy <= 0 {
                 continue;
             }
-            let Some(victim) = robot_at(robots, cell) else { continue };
+            let Some(victim) = robot_at(robots, cell) else {
+                continue;
+            };
             let hp = sim.get(&victim.id).copied().unwrap_or(0);
             if hp <= 0 {
                 continue;
@@ -375,7 +390,11 @@ fn choose_enemy_targets(turn: &Turn, tower: &Unit, projectiles: usize) -> Option
 
 /// Best 3×3 bomb impact: max simulated damage (100 per cell) + kill bonuses.
 pub fn bomb_impact(turn: &Turn) -> Option<Pos> {
-    let robots: Vec<&Robot> = turn.robots.iter().filter(|robot| robot.health > 0).collect();
+    let robots: Vec<&Robot> = turn
+        .robots
+        .iter()
+        .filter(|robot| robot.health > 0)
+        .collect();
     if robots.is_empty() {
         return None;
     }
@@ -429,13 +448,33 @@ pub fn is_big_threat(kind: RobotKind) -> bool {
     matches!(kind, RobotKind::Large | RobotKind::Boss)
 }
 
+/// A robot this close to a tower is a direct danger to it even when it is not
+/// (yet) marching on our base.
+const LOCAL_PRESSURE_RADIUS: i32 = 5;
+
 /// Total threat a tower can currently engage — used to decide which tower
-/// fires first in the shared damage simulation.
+/// fires first in the shared damage simulation and which tower gets first pick
+/// of a controller.
+///
+/// Mere range coverage is NOT pressure: a level-3 rocket covers the whole map,
+/// so counting every robot it could reach made the rocket the top-priority
+/// tower on every board and starved the close-range guns that actually stop a
+/// wave. Only robots that are a real danger (marching on us, or already next to
+/// this tower) count.
 pub fn threat_load(turn: &Turn, tower: &Unit) -> i64 {
     turn.robots
         .iter()
         .filter(|robot| robot.health > 0 && in_range(tower, robot.pos))
-        .map(|robot| threat(turn, robot) + robot.kind.score())
+        .map(|robot| {
+            let marching = threat(turn, robot);
+            if marching > 0 {
+                marching + robot.kind.score()
+            } else if chebyshev(tower.pos, robot.pos) <= LOCAL_PRESSURE_RADIUS {
+                robot.kind.score()
+            } else {
+                0
+            }
+        })
         .sum()
 }
 

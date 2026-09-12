@@ -4,8 +4,13 @@
 
 use std::collections::HashSet;
 
-use crate::brain::{economy, night, stand_cells, task, tower_stand_cells, treasure, walk_or_remove_wall, walk_toward, Plan};
-use crate::model::{chebyshev, footprint_distance, station_footprint, Turn, Unit, DAY_ROUNDS, STONE, WEAPON_BUILD_COST};
+use crate::brain::{
+    economy, night, stand_cells, task, tower_stand_cells, treasure, walk_or_remove_wall,
+    walk_toward, Plan,
+};
+use crate::model::{
+    chebyshev, footprint_distance, station_footprint, Turn, Unit, STONE, WEAPON_BUILD_COST,
+};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::{BotState, TaskSession};
 
@@ -20,10 +25,19 @@ fn preposition_round(dist: i32) -> i64 {
 }
 /// Stones to carry before walking out to the wall line (same as the demo).
 const STONE_BATCH: i64 = 6;
-/// Max walls placed per day: a minimal defensible ring is enough — after that
-/// workers switch to the economy (mine → sell → buy upgrades) instead of
-/// spending the whole day on the wall line.
-const WALL_DAILY_CAP: i64 = 6;
+/// The radius-2 station ring has 20 cells. Day 1 is allowed to complete that
+/// entire single-layer shell; later days retain the conservative repair/expand
+/// budget so fortification cannot permanently starve the economy.
+const D1_WALL_CAP: i64 = 20;
+const LATER_WALL_CAP: i64 = 6;
+
+fn wall_daily_cap(day: i64) -> i64 {
+    if day == 1 {
+        D1_WALL_CAP
+    } else {
+        LATER_WALL_CAP
+    }
+}
 
 /// Gold reserved for tower builds. We build 1-2 towers first and keep the
 /// rest for wall repair kits, medicine and upgrades — never all three slots
@@ -37,10 +51,13 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let mut claimed: HashSet<Pos> = HashSet::new();
 
     let tower_gaps = tower_gaps(turn, state);
+    let pairs = night::stable_pairs(turn, state);
+    update_wall_gate(turn, state, &pairs);
     let wall_gaps = wall_gaps(turn, state);
-    // Only ever want enough stone for the day's wall cap — beyond that, stone
-    // is dead weight to sell.
-    let wall_demand = (wall_gaps.len() as i64).min(WALL_DAILY_CAP);
+    let wall_cap = wall_daily_cap(turn.day);
+    // On D1 carry enough stone to finish the complete radius-2 shell. Later
+    // days use a bounded maintenance budget.
+    let wall_demand = (wall_gaps.len() as i64).min(wall_cap);
     let stone_demand = (wall_demand - economy::team_ores(turn, STONE)).max(0);
     // Gold reserved for finishing the tower build-out is untouchable by the
     // shopping list — defenses come before consumables, but only for the 1-2
@@ -60,20 +77,44 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // With two workers, the LAST one is the dedicated economy worker: it skips
     // wall duty and focuses on mine → sell → shop, so the wall line never
     // monopolizes both workers.
-    let economy_id = if workers.len() >= 2 { workers.last().map(|unit| unit.id) } else { None };
+    let economy_id = if workers.len() >= 2 {
+        workers.last().map(|unit| unit.id)
+    } else {
+        None
+    };
     if !shopping.is_empty() {
+        // Economy intent vs outcome: the head of the list is what we WANT, the
+        // gold check and the buyer's distance say whether it is reachable this
+        // round. A frozen economy (gold stuck, buyer never arriving) is then
+        // visible in the log instead of only in the final score.
+        let head = &shopping[0];
+        let price = turn.weapon_shop.get(&head.name).copied().unwrap_or(-1);
+        let buyer_dist = buyer_id
+            .and_then(|id| turn.role_by_id(id).map(|role| role.pos))
+            .map(|pos| {
+                turn.weapon_shops()
+                    .iter()
+                    .flat_map(|shop| stand_cells(turn, *shop))
+                    .map(|stand| chebyshev(pos, stand))
+                    .min()
+                    .unwrap_or(-1)
+            })
+            .unwrap_or(-1);
         crate::log::event(
             "shopping",
             serde_json::json!({
                 "buyer": buyer_id,
                 "gold": turn.gold,
                 "reserve": build_reserve,
+                "need": head.name,
+                "needNum": head.num,
+                "price": price,
+                "affordable": price >= 0 && price * head.num <= turn.gold,
+                "buyerShopDist": buyer_dist,
                 "needs": shopping.iter().map(|need| need.name.as_str()).collect::<Vec<_>>(),
             }),
         );
     }
-
-    let pairs = night::stable_pairs(turn, state);
 
     for worker in &workers {
         worker_day(
@@ -126,23 +167,42 @@ fn worker_day(
         plan.push(role.id, cmd);
         return;
     }
-    // 3. Pre-position near the assigned tower. This outranks walls, weapons
+    // 3. Once everyone has retreated at dusk, an adjacent stone carrier seals
+    // the intentionally-last gate before holding its tower position. This is
+    // the only wall action allowed to outrank the hard pre-position lock.
+    if state.wall_gate_sealed && role.count_item(STONE) > 0 {
+        if let Some(gate) = wall_gate(turn) {
+            if wall_gaps.contains(&gate) && chebyshev(role.pos, gate) == 1 {
+                state.walls_built_today = state.walls_built_today.saturating_add(1);
+                crate::log::event(
+                    "wall_gate_build",
+                    serde_json::json!({"round": turn.round_no, "role": role.id, "target": gate}),
+                );
+                plan.push(role.id, RoleCommand::build(gate, "wall"));
+                return;
+            }
+        }
+    }
+    // 4. Pre-position near the assigned tower. This outranks walls, weapons
     //    and the economy once the deadline hits: a tower with no operator by
     //    dusk is a weapon that never fires (battle pk575060 lost 17/20 night
     //    rounds to walking back). Once past the deadline the role locks to the
     //    tower — late-day economy is deliberately sacrificed for a manned gun.
-    if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == role.id).map(|(_, tower)| *tower) {
+    if let Some(tower_id) = pairs
+        .iter()
+        .find(|(controller, _)| *controller == role.id)
+        .map(|(_, tower)| *tower)
+    {
         if let Some(tower) = turn.role_by_id(tower_id) {
             let dist = chebyshev(role.pos, tower.pos);
             // The dedicated economy worker keeps the collect→sell→buy loop
             // running until the last day rounds (so gold never freezes during
             // tasks); everyone else retreats by dusk. The unconditional night
             // recall still guarantees arrival even if this lands late.
-            let deadline = if Some(role.id) == economy_id {
-                (DAY_ROUNDS - 1 - dist as i64).max(0)
-            } else {
-                preposition_round(dist)
-            };
+            // Dusk is a hard defense checkpoint for every operator, including
+            // the economy worker. No collect/sell/buy action may delay a tower
+            // assignment past its travel deadline.
+            let deadline = preposition_round(dist);
             if turn.in_day_round >= deadline {
                 if dist > 1 {
                     let stands = tower_stand_cells(turn, tower.pos);
@@ -157,14 +217,19 @@ fn worker_day(
             }
         }
     }
-    // 4. Build walls (stone) BEFORE weapons: the wall ring protects the base
+    // 5. Build walls (stone) BEFORE weapons: the wall ring protects the base
     //    and the roles standing behind it. Capped to a minimal daily ring and
     //    skipped by the dedicated economy worker, so the wall line never
     //    monopolizes the whole day. Building also stops the moment any role
     //    could no longer reach its night weapon — the gate stays open until
     //    everyone has retreated inside, so we never wall ourselves out.
-    let on_wall_duty = Some(role.id) != economy_id && state.walls_built_today < WALL_DAILY_CAP;
-    if role.count_item(STONE) > 0 && !wall_gaps.is_empty() && on_wall_duty && roles_can_reach(turn, pairs) {
+    let on_wall_duty =
+        Some(role.id) != economy_id && state.walls_built_today < wall_daily_cap(turn.day);
+    if role.count_item(STONE) > 0
+        && !wall_gaps.is_empty()
+        && on_wall_duty
+        && roles_can_reach(turn, pairs)
+    {
         // Build immediately when already standing next to a safe gap.
         let adjacent_site = wall_gaps
             .iter()
@@ -206,7 +271,7 @@ fn worker_day(
             }
         }
     }
-    // 5. Build weapons (gold) once the wall line is underway — but keep a
+    // 6. Build weapons (gold) once the wall line is underway — but keep a
     //    gold reserve so the main weapon's level-2 upgrade is never starved.
     if economy::may_build_weapon(turn) {
         for (site, kind) in tower_gaps {
@@ -220,14 +285,14 @@ fn worker_day(
             }
         }
     }
-    // 6. Shopping (dedicated buyer) — upgrades come after survival.
+    // 7. Shopping (dedicated buyer) — upgrades come after survival.
     if buyer_id == Some(role.id) && !shopping.is_empty() {
         if let Some(cmd) = buyer_flow(turn, role, shopping, claimed) {
             plan.push(role.id, cmd);
             return;
         }
     }
-    // 7. Sell accumulated ore in one batch before collecting more. This keeps
+    // 8. Sell accumulated ore in one batch before collecting more. This keeps
     //    the collect→sell→buy loop moving instead of filling a 100-slot pack
     //    one item at a time while usable gold remains trapped in the backpack.
     if economy::should_sell(turn, state, role, stone_demand) {
@@ -236,7 +301,7 @@ fn worker_day(
             return;
         }
     }
-    // 8. Mine the nearest ore (stone first while walls are wanted). Mining
+    // 9. Mine the nearest ore (stone first while walls are wanted). Mining
     //    pauses during dusk so the ore we hold is converted to gold instead.
     if turn.in_day_round < economy::DUSK_ROUND && !role.backpack_full() {
         if let Some(cmd) = mine_flow(turn, state, role, stone_demand, claimed) {
@@ -244,13 +309,13 @@ fn worker_day(
             return;
         }
     }
-    // 9. Repair walls damaged overnight (cheap: 10g per fix) when standing
+    // 10. Repair walls damaged overnight (cheap: 10g per fix) when standing
     //    next to one — keeps the ring standing.
     if let Some(wall_pos) = crate::brain::combat::repair_target(turn, role, 0) {
         plan.push(role.id, RoleCommand::use_item_at("WallFixer", wall_pos));
         return;
     }
-    // 10. Burn a carried robot-summon order only when everything else is done.
+    // 11. Burn a carried robot-summon order only when everything else is done.
     if let Some(cmd) = burn_summon_order(state, role) {
         plan.push(role.id, cmd);
     }
@@ -264,8 +329,19 @@ fn pioneer_day(
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
 ) {
-    // 1. Active self-evolution task owns the pioneer completely (must stay
-    //    within 1 cell of the task point).
+    // 1. Active tasks yield at the hard dusk defense checkpoint when the
+    // pioneer is required to operate a tower. This mirrors night arbitration
+    // and releases it early enough to traverse the wall gate before sealing.
+    if state.task.active
+        && turn.in_day_round >= economy::DUSK_ROUND
+        && night::operator_shortage(turn)
+    {
+        crate::log::event(
+            "task_defense_abort",
+            serde_json::json!({"round": turn.round_no, "session": state.task.session_id, "reason": "dusk_operator_shortage"}),
+        );
+        state.finish_task(false, "dusk_defense");
+    }
     if state.task.active {
         if let Some(cmd) = task::plan_pioneer(turn, state, pioneer, plan) {
             plan.push(pioneer.id, cmd);
@@ -282,7 +358,11 @@ fn pioneer_day(
     //    treasure, so it is not stranded far away when night falls. Once the
     //    deadline passes the role locks to the tower (wall demolition stays
     //    worker-only, so only walk_toward is used here).
-    if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == pioneer.id).map(|(_, tower)| *tower) {
+    if let Some(tower_id) = pairs
+        .iter()
+        .find(|(controller, _)| *controller == pioneer.id)
+        .map(|(_, tower)| *tower)
+    {
         if let Some(tower) = turn.role_by_id(tower_id) {
             let dist = chebyshev(pioneer.pos, tower.pos);
             if turn.in_day_round >= preposition_round(dist) {
@@ -331,13 +411,20 @@ impl BotState {
             .filter(|task| task.is_valid && task.cooldown_rounds == 0)
             .min_by_key(|task| chebyshev(pioneer.pos, task.pos))?;
         if chebyshev(pioneer.pos, candidate.pos) <= 1 {
-            let timeout = if candidate.timeout_rounds > 0 { candidate.timeout_rounds } else { 250 };
+            let timeout = if candidate.timeout_rounds > 0 {
+                candidate.timeout_rounds
+            } else {
+                250
+            };
+            self.task_session_seq = self.task_session_seq.saturating_add(1);
+            let session_id = self.task_session_seq;
             crate::log::event(
                 "task_accept",
-                serde_json::json!({"round": turn.round_no, "point": candidate.pos, "taskType": candidate.task_type}),
+                serde_json::json!({"round": turn.round_no, "session": session_id, "point": candidate.pos, "taskType": candidate.task_type}),
             );
             self.task = TaskSession {
                 active: true,
+                session_id,
                 accepted_round: turn.round_no,
                 timeout_round: turn.round_no + timeout,
                 point: Some(candidate.pos),
@@ -399,7 +486,11 @@ fn buyer_flow(
         return None;
     }
     if stands.iter().any(|pos| *pos == role.pos) {
-        let price = turn.weapon_shop.get(&need.name).copied().unwrap_or(i64::MAX);
+        let price = turn
+            .weapon_shop
+            .get(&need.name)
+            .copied()
+            .unwrap_or(i64::MAX);
         let free_slots = role.capacity.saturating_sub(role.backpack.len() as i64);
         let affordable = if price > 0 { turn.gold / price } else { 0 };
         let num = need.num.min(free_slots).min(affordable);
@@ -476,7 +567,10 @@ fn can_reach(turn: &Turn, start: Pos, stands: &[Pos]) -> bool {
 
 /// Stand cells of the tower a role is paired with for the coming night.
 fn night_goal(turn: &Turn, pairs: &[(i64, i64)], role_id: i64) -> Option<Vec<Pos>> {
-    let tower_id = pairs.iter().find(|(controller, _)| *controller == role_id).map(|(_, tower)| *tower)?;
+    let tower_id = pairs
+        .iter()
+        .find(|(controller, _)| *controller == role_id)
+        .map(|(_, tower)| *tower)?;
     let tower = turn.role_by_id(tower_id)?;
     Some(tower_stand_cells(turn, tower.pos))
 }
@@ -503,7 +597,9 @@ fn wall_would_trap(turn: &Turn, pairs: &[(i64, i64)], site: Pos) -> bool {
     let mut blocked = turn.blocked_for(-1);
     blocked.insert(site);
     for role in turn.controllable() {
-        let Some(stands) = night_goal(turn, pairs, role.id) else { continue };
+        let Some(stands) = night_goal(turn, pairs, role.id) else {
+            continue;
+        };
         if stands.iter().any(|stand| *stand == role.pos) {
             continue; // already at the weapon: nothing to trap
         }
@@ -557,7 +653,12 @@ fn sell_flow(
 }
 
 /// A mine of the preferred ore (or any valuable ore) we already stand next to.
-fn nearest_adjacent_mine(turn: &Turn, role: &Unit, preferred_ore: &str, claimed: &HashSet<Pos>) -> Option<Pos> {
+fn nearest_adjacent_mine(
+    turn: &Turn,
+    role: &Unit,
+    preferred_ore: &str,
+    claimed: &HashSet<Pos>,
+) -> Option<Pos> {
     let mut best: Option<(i64, Pos)> = None;
     for (pos, ore) in turn.all_mines() {
         if claimed.contains(&pos) || chebyshev(role.pos, pos) != 1 {
@@ -582,11 +683,15 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
     if turn.towers().len() >= 3 {
         return Vec::new();
     }
-    let Some(station) = turn.station() else { return Vec::new() };
+    let Some(station) = turn.station() else {
+        return Vec::new();
+    };
     let footprint = station_footprint(station.pos);
-    let occupied: HashSet<Pos> =
-        turn.ours.iter().flat_map(|unit| unit.footprint()).collect();
-    let center = Pos { x: turn.width / 2, y: turn.height / 2 };
+    let occupied: HashSet<Pos> = turn.ours.iter().flat_map(|unit| unit.footprint()).collect();
+    let center = Pos {
+        x: turn.width / 2,
+        y: turn.height / 2,
+    };
 
     let mut cells: Vec<Pos> = ring_cells(&footprint, 1)
         .into_iter()
@@ -615,8 +720,7 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
             continue;
         }
         let site = cells.iter().copied().find(|pos| {
-            !used.contains(pos)
-                && !state.blacklisted_builds.contains(&(*pos, kind.to_string()))
+            !used.contains(pos) && !state.blacklisted_builds.contains(&(*pos, kind.to_string()))
         });
         if let Some(pos) = site {
             used.insert(pos);
@@ -626,48 +730,72 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
     gaps
 }
 
-/// Desired wall cells: a two-cell-thick ring (distance 3 outer + distance 2
-/// inner) ordered FURTHEST-from-the-gate first, so the far side builds up
-/// while the corridor stays open for the roles still outside. The two gate
-/// cells span both rings and are never built — the reachability guards in
-/// `worker_day` seal the ring only once every role is already inside.
-pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
-    let Some(station) = turn.station() else { return Vec::new() };
-    let footprint = station_footprint(station.pos);
-    let xs: Vec<i32> = footprint.iter().map(|pos| pos.x).collect();
-    let ys: Vec<i32> = footprint.iter().map(|pos| pos.y).collect();
-    let xmax = *xs.iter().max().unwrap_or(&0);
-    let ymin = *ys.iter().min().unwrap_or(&0);
+fn wall_gate(turn: &Turn) -> Option<Pos> {
+    let station = turn.station()?;
+    let footprint = station.footprint();
+    let xmax = footprint.iter().map(|pos| pos.x).max()?;
+    let ymin = footprint.iter().map(|pos| pos.y).min()?;
+    Some(Pos {
+        x: xmax + 2,
+        y: ymin - 1,
+    })
+}
 
-    // Two gate cells: one per ring, so the entrance corridor is two cells wide
-    // (a single-cell gate would still leave a wall between the two rings).
-    let gate: [Pos; 2] = [
-        Pos { x: xmax + 2, y: ymin - 1 },
-        Pos { x: xmax + 3, y: ymin - 1 },
-    ];
-    let mut cells: Vec<Pos> = ring_cells(&footprint, 2); // inner box first: a tight enclosure around the base
-    cells.extend(ring_cells(&footprint, 3)); // outer ring second
-    // Box-first build order: the inner ring (a tight 2-cell box around the
-    // base) closes before the outer ring scatters far away; within each ring,
-    // furthest-from-the-gate goes up first so the entrance corridor is the last
-    // thing to close. A deterministic (x,y) tiebreak keeps the flanks together.
-    cells.sort_by_key(|pos| {
-        let ring = footprint_distance(*pos, &footprint);
-        (ring, std::cmp::Reverse(chebyshev(*pos, gate[0])), pos.x, pos.y)
+fn update_wall_gate(turn: &Turn, state: &mut BotState, pairs: &[(i64, i64)]) {
+    if state.wall_gate_sealed || turn.day != 1 || turn.in_day_round < economy::DUSK_ROUND {
+        return;
+    }
+    let Some(station) = turn.station() else {
+        return;
+    };
+    let footprint = station.footprint();
+    let all_retreated = turn.controllable().iter().all(|role| {
+        footprint_distance(role.pos, &footprint) <= 1
+            || night_goal(turn, pairs, role.id)
+                .map(|stands| stands.contains(&role.pos))
+                .unwrap_or(false)
     });
+    if all_retreated {
+        state.wall_gate_sealed = true;
+        crate::log::event(
+            "wall_gate_seal",
+            serde_json::json!({"round": turn.round_no, "dayRound": turn.in_day_round}),
+        );
+    } else {
+        crate::log::event(
+            "wall_gate_open",
+            serde_json::json!({"round": turn.round_no, "reason": "controllers_not_retreated"}),
+        );
+    }
+}
+
+/// Desired D1 wall cells: one radius-2 shell around the station. One gate cell
+/// remains omitted while any controller is outside; after the dusk retreat
+/// checkpoint `update_wall_gate` explicitly admits that final seal cell.
+pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
+    let Some(station) = turn.station() else {
+        return Vec::new();
+    };
+    let footprint = station_footprint(station.pos);
+    let Some(gate) = wall_gate(turn) else {
+        return Vec::new();
+    };
+
+    let mut cells = ring_cells(&footprint, 2);
+    cells.sort_by_key(|pos| (std::cmp::Reverse(chebyshev(*pos, gate)), pos.x, pos.y));
 
     let existing_walls: HashSet<Pos> = turn.walls().iter().map(|wall| wall.pos).collect();
-    let occupied: HashSet<Pos> =
-        turn.ours.iter().flat_map(|unit| unit.footprint()).collect();
-    let mut seen: HashSet<Pos> = HashSet::new();
+    let occupied: HashSet<Pos> = turn.ours.iter().flat_map(|unit| unit.footprint()).collect();
     cells
         .into_iter()
-        .filter(|pos| !gate.contains(pos) && seen.insert(*pos))
+        .filter(|pos| state.wall_gate_sealed || *pos != gate)
         .filter(|pos| {
             turn.is_land(*pos)
                 && !existing_walls.contains(pos)
                 && !occupied.contains(pos)
-                && !state.blacklisted_builds.contains(&(*pos, "wall".to_string()))
+                && !state
+                    .blacklisted_builds
+                    .contains(&(*pos, "wall".to_string()))
         })
         .collect()
 }
@@ -675,8 +803,14 @@ pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
 fn ring_cells(footprint: &[Pos], radius: i32) -> Vec<Pos> {
     let xs: Vec<i32> = footprint.iter().map(|pos| pos.x).collect();
     let ys: Vec<i32> = footprint.iter().map(|pos| pos.y).collect();
-    let (xmin, xmax) = (*xs.iter().min().unwrap_or(&0), *xs.iter().max().unwrap_or(&0));
-    let (ymin, ymax) = (*ys.iter().min().unwrap_or(&0), *ys.iter().max().unwrap_or(&0));
+    let (xmin, xmax) = (
+        *xs.iter().min().unwrap_or(&0),
+        *xs.iter().max().unwrap_or(&0),
+    );
+    let (ymin, ymax) = (
+        *ys.iter().min().unwrap_or(&0),
+        *ys.iter().max().unwrap_or(&0),
+    );
     let mut cells = Vec::new();
     for x in xmin - radius..=xmax + radius {
         for y in ymin - radius..=ymax + radius {
@@ -706,22 +840,23 @@ mod tests {
         let footprint = station_footprint(pos(10, 24));
         let ring = ring_cells(&footprint, 1);
         assert_eq!(ring.len(), 12); // 4x4 outer minus 2x2 footprint
-        assert!(ring.iter().all(|cell| footprint_distance(*cell, &footprint) == 1));
+        assert!(ring
+            .iter()
+            .all(|cell| footprint_distance(*cell, &footprint) == 1));
     }
 
     #[test]
-    fn wall_order_leaves_entrance() {
-        // entrance at (xmax+2, ymin-1) must not appear in the ring order
+    fn radius_two_ring_is_one_complete_layer() {
         let footprint = station_footprint(pos(10, 24));
-        let xs: Vec<i32> = footprint.iter().map(|p| p.x).collect();
-        let ys: Vec<i32> = footprint.iter().map(|p| p.y).collect();
-        let entrance = pos(xs.iter().max().unwrap() + 2, ys.iter().min().unwrap() - 1);
-        let mut order: Vec<Pos> = Vec::new();
-        for x in (xs.iter().min().unwrap() - 2..=xs.iter().max().unwrap() + 2).rev() {
-            order.push(pos(x, ys.iter().min().unwrap() - 2));
-        }
-        assert!(!order.contains(&entrance));
-        let _ = neighbours(entrance);
+        let ring = ring_cells(&footprint, 2);
+        assert_eq!(ring.len(), 20);
+        assert!(ring
+            .iter()
+            .all(|cell| footprint_distance(*cell, &footprint) == 2));
+        assert!(ring
+            .iter()
+            .all(|cell| footprint_distance(*cell, &footprint) != 3));
+        let _ = neighbours(pos(0, 0));
         let _ = ORES;
     }
 }

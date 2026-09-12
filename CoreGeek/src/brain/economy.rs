@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use crate::model::{chebyshev, Unit, UnitKind, Turn, ORES, STONE, WEAPON_BUILD_COST};
+use crate::model::{chebyshev, Turn, Unit, UnitKind, ORES, STONE, WEAPON_BUILD_COST};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
 
@@ -38,7 +38,10 @@ fn total_ores(role: &Unit) -> i64 {
 }
 
 pub fn team_ores(turn: &Turn, ore: &str) -> i64 {
-    turn.controllable().iter().map(|role| role.count_item(ore) as i64).sum()
+    turn.controllable()
+        .iter()
+        .map(|role| role.count_item(ore) as i64)
+        .sum()
 }
 
 /// Whether we may spend 25g building another weapon this round. Build 1-2
@@ -50,7 +53,8 @@ pub fn may_build_weapon(turn: &Turn) -> bool {
     if towers.len() < 2 {
         return turn.gold >= WEAPON_BUILD_COST;
     }
-    towers.iter().any(|tower| tower.level >= 2) && turn.gold >= WEAPON_BUILD_COST + WEAPON_UPGRADE_RESERVE
+    towers.iter().any(|tower| tower.level >= 2)
+        && turn.gold >= WEAPON_BUILD_COST + WEAPON_UPGRADE_RESERVE
 }
 
 /// What we should buy right now, ordered by priority and filtered by gold.
@@ -87,7 +91,11 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             _ => "",
         };
         if !voucher.is_empty() && stock_of(turn, voucher) == 0 {
-            needs.push(Need { name: voucher.into(), num: 1, priority: 2 });
+            needs.push(Need {
+                name: voucher.into(),
+                num: 1,
+                priority: 2,
+            });
         }
     }
     // Night consumables: only once the defense is solid (every weapon slot
@@ -101,7 +109,11 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         });
     }
     if defense_solid && stock_of(turn, "DizzyWeapon") < 1 && gold >= 150 {
-        needs.push(Need { name: "DizzyWeapon".into(), num: 1, priority: 3 });
+        needs.push(Need {
+            name: "DizzyWeapon".into(),
+            num: 1,
+            priority: 3,
+        });
     }
     // Wall repair kits when the wall line took damage overnight (10g each).
     let damaged_walls = turn
@@ -119,11 +131,19 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     // Medicine only when someone is actually hurt (keep a spare so a second
     // injury doesn't force a fresh 10g trip).
     let injured = turn.controllable().iter().any(|role| {
-        let max_hp = if role.kind == UnitKind::Worker { 220 } else { 200 };
+        let max_hp = if role.kind == UnitKind::Worker {
+            220
+        } else {
+            200
+        };
         role.health * 10 < max_hp * 8
     });
     if injured && stock_of(turn, "Medicine") < 2 {
-        needs.push(Need { name: "Medicine".into(), num: 2 - stock_of(turn, "Medicine"), priority: 2 });
+        needs.push(Need {
+            name: "Medicine".into(),
+            num: 2 - stock_of(turn, "Medicine"),
+            priority: 2,
+        });
     }
     // (Treasure sacrifice items are bought exclusively by the pioneer inside
     // treasure.rs — summonTreasure requires the items in the pioneer's pack.)
@@ -134,7 +154,11 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         && !state.harass_done_today
         && state.summon_orders_today < 10
     {
-        needs.push(Need { name: "BossRobotSummonOrder".into(), num: 1, priority: 9 });
+        needs.push(Need {
+            name: "BossRobotSummonOrder".into(),
+            num: 1,
+            priority: 9,
+        });
     }
 
     // Gold filter. Two budgets: upgrade vouchers are defensive infrastructure
@@ -147,7 +171,11 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         if need.num <= 0 {
             continue;
         }
-        let price = turn.weapon_shop.get(&need.name).copied().unwrap_or(i64::MAX);
+        let price = turn
+            .weapon_shop
+            .get(&need.name)
+            .copied()
+            .unwrap_or(i64::MAX);
         if price == i64::MAX {
             continue;
         }
@@ -210,7 +238,10 @@ pub fn should_sell(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i64
     }
     // Already at the vendor: never walk away with a half-sold backpack —
     // convert every sellable ore before leaving (stones stay held for walls).
-    let at_vendor = turn.vendors().iter().any(|vendor| chebyshev(role.pos, *vendor) == 1);
+    let at_vendor = turn
+        .vendors()
+        .iter()
+        .any(|vendor| chebyshev(role.pos, *vendor) == 1);
     if at_vendor {
         for ore in ORES {
             if role.count_item(ore) == 0 {
@@ -258,7 +289,12 @@ pub fn should_sell(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i64
 
 /// Sell the most valuable stack (one ore kind per round). Stones are held
 /// back while wall demand is unmet.
-pub fn sell_command(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i64) -> Option<RoleCommand> {
+pub fn sell_command(
+    turn: &Turn,
+    state: &BotState,
+    role: &Unit,
+    stone_demand: i64,
+) -> Option<RoleCommand> {
     let mut best: Option<(i64, &str, i64)> = None; // (value, ore, count)
     for ore in ORES {
         let count = role.count_item(ore) as i64;
@@ -316,10 +352,13 @@ pub fn choose_mine(
         }
     }
     // Nearest mine first; equal distance broken by higher vendor value.
-    options
-        .into_iter()
-        .min_by_key(|(pos, ore)| {
-            let price = turn.vendor_prices.get(ore).copied().unwrap_or(1);
-            (chebyshev(role_pos, *pos), std::cmp::Reverse(price), pos.x, pos.y)
-        })
+    options.into_iter().min_by_key(|(pos, ore)| {
+        let price = turn.vendor_prices.get(ore).copied().unwrap_or(1);
+        (
+            chebyshev(role_pos, *pos),
+            std::cmp::Reverse(price),
+            pos.x,
+            pos.y,
+        )
+    })
 }
