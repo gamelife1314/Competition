@@ -394,18 +394,64 @@ pub fn budget(turn: &Turn, state: &BotState, reserve: i64) -> Budget {
 /// purchase lands the round the gold does rather than the round after it.
 const PREPOSITION_LEAD: i64 = 3;
 
+/// Gold the team could raise today: coins in hand plus every ore in a backpack
+/// valued at the vendor's current price. The economy's real spending power —
+/// used to tell a goal that is merely not-yet-affordable from one that is out
+/// of reach entirely.
+pub fn liquid_gold(turn: &Turn) -> i64 {
+    let mut liquid = turn.gold;
+    for role in turn.controllable() {
+        for ore in ORES {
+            let count = role.count_item(ore) as i64;
+            if count > 0 {
+                liquid += turn.vendor_prices.get(ore).copied().unwrap_or(1).max(1) * count;
+            }
+        }
+    }
+    liquid
+}
+
 /// Should the buyer set off for the shop even though nothing on the list is
-/// affordable yet? True once the earliest deadline is within one shop trip
-/// plus `PREPOSITION_LEAD`: arriving early means the purchase lands the round
-/// the gold does, instead of the round after another cross-map walk. Early in
-/// the day this is false, so the buyer never camps at the shop instead of
-/// mining.
+/// affordable yet?
+///
+/// Two cases, and only two. *Last chance*: the round to leave has arrived and
+/// there will be no more time to earn, so the walk has to start now whatever
+/// the purse says. *Funded*: the deadline is within one trip and the ore
+/// already in our backpacks covers the price, so leaving now means the purchase
+/// lands the round the sale does instead of a cross-map walk later.
+///
+/// Deliberately NOT "any deadline is within one trip": that parked the only
+/// economic worker at a far shop for half the day for a 100-gold voucher the
+/// team was never going to afford, which is how the day ended with two towers,
+/// no walls and a frozen purse (issues #12/#14).
 pub fn buyer_must_preposition(turn: &Turn, role: &Unit, needs: &[Need]) -> bool {
     let travel = shop_travel(turn, role.pos);
+    let liquid = liquid_gold(turn);
     needs.iter().any(|need| {
-        need.num > 0
-            && need.latest_round > 0
-            && turn.in_day_round + travel + PREPOSITION_LEAD >= need.latest_round
+        if !(need.num > 0 && need.latest_round > 0) {
+            return false;
+        }
+        let price = turn
+            .weapon_shop
+            .get(&need.name)
+            .copied()
+            .unwrap_or(i64::MAX);
+        if price <= 0 || price == i64::MAX {
+            return false;
+        }
+        // A deadline the walk can no longer meet is a dead goal, not a reason
+        // to set off. Reading it the other way ("we would arrive late, so
+        // leave now") parked the only economic worker at a far shop for the
+        // whole afternoon, chasing a 100-gold voucher the team could never
+        // afford — gold froze because the buyer was never at the mine or the
+        // vendor (issues #12/#14).
+        let arrival = turn.in_day_round + travel;
+        if arrival > need.latest_round {
+            return false;
+        }
+        // Funded: be there the round the gold lands. Not funded yet: only
+        // worth leaving early if there is no time left for a second trip.
+        liquid >= price * need.num || arrival + PREPOSITION_LEAD >= need.latest_round
     })
 }
 
@@ -482,25 +528,9 @@ fn third_tower_fallback(turn: &Turn, state: &BotState) -> bool {
 }
 
 /// Can the team still put 100 gold together before dusk? A carried voucher
-/// counts; otherwise liquid gold plus the ore already in backpacks at today's
-/// vendor prices.
-pub fn upgrade_reachable(turn: &Turn, state: &BotState) -> bool {
-    if stock_of(turn, "WeaponUpgradeVoucher1") > 0 {
-        return true;
-    }
-    let mut liquid = turn.gold;
-    for role in turn.controllable() {
-        for ore in ORES {
-            let count = role.count_item(ore) as i64;
-            if count == 0 {
-                continue;
-            }
-            let base = state.base_prices.get(ore).copied().unwrap_or(1).max(1);
-            let price = turn.vendor_prices.get(ore).copied().unwrap_or(base);
-            liquid += price * count;
-        }
-    }
-    liquid >= WEAPON_VOUCHER1_PRICE
+/// counts; otherwise the liquid wealth already on the board.
+pub fn upgrade_reachable(turn: &Turn, _state: &BotState) -> bool {
+    stock_of(turn, "WeaponUpgradeVoucher1") > 0 || liquid_gold(turn) >= WEAPON_VOUCHER1_PRICE
 }
 
 /// Find a building the voucher in `role`'s backpack can upgrade.
@@ -538,9 +568,20 @@ pub fn held_vouchers(role: &Unit) -> Vec<String> {
         .collect()
 }
 
+/// Ore in this backpack the vendor would actually take. Stone is held back
+/// while the wall line still wants it, so counting it as sellable sent the
+/// carrier on a cross-map walk to a sale that `sell_command` then refused —
+/// the trip was spent, the stone stayed, and the wall never got built.
+pub fn sellable_ores(turn: &Turn, role: &Unit, stone_demand: i64) -> i64 {
+    let stone = role.count_item(STONE) as i64;
+    let team_stone = team_ores(turn, STONE);
+    let surplus = (team_stone - stone_demand - STONE_BUFFER).max(0);
+    total_ores(role) - stone + surplus.min(stone)
+}
+
 /// Should this role head to the vendor?
 pub fn should_sell(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i64) -> bool {
-    let ores = total_ores(role);
+    let ores = sellable_ores(turn, role, stone_demand);
     if ores == 0 {
         return false;
     }
@@ -569,7 +610,12 @@ pub fn should_sell(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i64
     let half_full = role.capacity > 0 && role.backpack.len() as i64 * 2 >= role.capacity;
     // A pack of 15+ items forces a vendor run regardless of ore type — a
     // nearly-full miner that keeps digging for "one more stack" stalls gold.
-    let force_sell = role.backpack.len() as i64 >= 15;
+    // Only SELLABLE ore counts: stone the ring still needs is not "one more
+    // stack", it is the wall line's raw material, and walking a full pack of
+    // it to a vendor is how day 1 ended up with two towers, no ring and a
+    // frozen purse (issues #12/#13/#14). Committed stone instead makes the
+    // role take the wall step below, which is where it was headed anyway.
+    let force_sell = ores >= 15;
     if role.backpack_full() || ores >= sell_batch(turn, state, role) || half_full || force_sell {
         return true;
     }

@@ -11,7 +11,7 @@ pub mod verify;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{chebyshev, neighbours, Turn, Unit};
+use crate::model::{chebyshev, footprint_distance, neighbours, station_footprint, Turn, Unit};
 use crate::protocol::{Pos, Request, Response, RoleCommand};
 use crate::state::{BotState, IssuedCmd};
 
@@ -45,16 +45,29 @@ pub fn respond(raw_body: &[u8]) -> String {
 }
 
 fn decide(raw_body: &[u8]) -> Result<String, String> {
+    let mut state = BotState::locked();
+    decide_with(&mut state, raw_body)
+}
+
+/// `decide` with the cross-round memory supplied by the caller.
+///
+/// The server is single-bot and uses the process-wide `BotState` singleton,
+/// but a simulation that drives a whole match round by round must NOT: two
+/// simulations sharing one state observe round numbers that jump backwards,
+/// `BotState::observe` reads that as a new half and wipes the memory, and the
+/// result is a match whose outcome depends on which test ran first. Tests get
+/// their own `BotState` through this entry point (issues #12/#13/#14 all came
+/// out of a day-1 simulation, so it has to be reproducible).
+pub fn decide_with(state: &mut BotState, raw_body: &[u8]) -> Result<String, String> {
     let started = std::time::Instant::now();
     let req: Request = serde_json::from_slice(raw_body).map_err(|err| err.to_string())?;
     let turn = Turn::from_request(req);
-    let mut state = BotState::locked();
     state.observe(&turn);
 
     let mut plan = if turn.is_day {
-        day::plan(&turn, &mut state)
+        day::plan(&turn, state)
     } else {
-        night::plan(&turn, &mut state)
+        night::plan(&turn, state)
     };
 
     // executeCmd is only accepted by the judger while a task is active.
@@ -112,7 +125,7 @@ fn decide(raw_body: &[u8]) -> Result<String, String> {
 
     log_round(
         &turn,
-        &mut state,
+        state,
         &sanitized,
         &failures,
         &volley,
@@ -304,6 +317,16 @@ pub fn stand_cells(turn: &Turn, target: Pos) -> Vec<Pos> {
         .collect()
 }
 
+/// Can `role` reach any of `stands` from where it is? A role already standing
+/// on one counts as reachable. Walls, robots and the map edge all block.
+pub fn can_reach_any(turn: &Turn, role: &Unit, stands: &[Pos]) -> bool {
+    if stands.iter().any(|stand| *stand == role.pos) {
+        return true;
+    }
+    let blocked = turn.blocked_for(role.id);
+    crate::path::step_toward_stands(turn, role.pos, stands, &blocked).is_some()
+}
+
 /// Compute the next step for `role` toward any of `stands`, avoiding cells
 /// already claimed by teammates this round. Returns a move command and
 /// reserves the chosen step.
@@ -323,6 +346,35 @@ pub fn walk_toward(
     let step = crate::path::step_toward_stands(turn, role.pos, &usable, &blocked)?;
     claimed.insert(step);
     Some(RoleCommand::move_to(step))
+}
+
+/// Walkable cells at footprint distance <= 1 from the station — the band
+/// between the base and the radius-2 wall ring. This is the set
+/// `update_wall_gate` measures "everyone is inside" against, so it is also the
+/// right target for a role that has nowhere else useful to be: hugging the
+/// station is both the safest cell on the board and the one that lets the last
+/// ring cell be sealed.
+///
+/// The station's own four cells are excluded: they satisfy the distance test
+/// but no role can ever stand on them, and offering them as a retreat target
+/// makes `walk_toward` path at a wall of its own base.
+pub fn interior_cells(turn: &Turn) -> Vec<Pos> {
+    let Some(station) = turn.station() else {
+        return Vec::new();
+    };
+    let footprint = station_footprint(station.pos);
+    let mut cells: Vec<Pos> = footprint
+        .iter()
+        .flat_map(|cell| neighbours(*cell))
+        .filter(|pos| {
+            turn.is_land(*pos)
+                && !footprint.contains(pos)
+                && footprint_distance(*pos, &footprint) <= 1
+        })
+        .collect();
+    cells.sort_by_key(|pos| (pos.x, pos.y));
+    cells.dedup();
+    cells
 }
 
 /// Walkable cells from which a controller can OPERATE a tower, restricted to

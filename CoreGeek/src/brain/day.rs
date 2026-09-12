@@ -5,8 +5,7 @@
 use std::collections::HashSet;
 
 use crate::brain::{
-    economy, night, stand_cells, task, tower_stand_cells, treasure, walk_or_remove_wall,
-    walk_toward, Plan,
+    economy, night, stand_cells, task, tower_stand_cells, treasure, walk_toward, Plan,
 };
 use crate::model::{
     chebyshev, footprint_distance, station_footprint, Turn, Unit, STONE, WEAPON_BUILD_COST,
@@ -23,13 +22,33 @@ use crate::state::{BotState, TaskSession};
 fn preposition_round(dist: i32) -> i64 {
     (economy::DUSK_ROUND - 1 - dist as i64 - 3).max(0)
 }
-/// Stones to carry before walking out to the wall line (same as the demo).
+/// Stones to carry before walking out to the wall line on a maintenance day.
 const STONE_BATCH: i64 = 6;
+/// Day 1's wall line is one complete ring, and the mine↔ring commute costs more
+/// rounds than the mining does. Carrying the whole remaining demand in a single
+/// trip is what closes the ring before the dusk lock-in; the one-stone dribble
+/// (mine one, walk back, build one) is how the base ended up with two towers, no
+/// wall and a frozen purse in issues #12/#13/#14.
+const RING_BATCH: i64 = 20;
+
+/// Stones this role should carry before it walks out to the wall line.
+fn stone_batch(turn: &Turn, gaps: usize) -> i64 {
+    let want = if turn.day == 1 {
+        RING_BATCH
+    } else {
+        STONE_BATCH
+    };
+    want.min(gaps as i64).max(1)
+}
 /// The radius-2 station ring has 20 cells. Day 1 is allowed to complete that
 /// entire single-layer shell; later days retain the conservative repair/expand
 /// budget so fortification cannot permanently starve the economy.
 const D1_WALL_CAP: i64 = 20;
 const LATER_WALL_CAP: i64 = 6;
+/// Day-rounds after dusk during which a stone carrier may still walk out to
+/// close the last hole in the ring. Long enough for a round trip from any
+/// tower post, short enough that the gun is manned again well before night.
+const SEAL_GRACE: i64 = 8;
 
 fn wall_daily_cap(day: i64) -> i64 {
     if day == 1 {
@@ -56,9 +75,12 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let wall_gaps = wall_gaps(turn, state);
     let wall_cap = wall_daily_cap(turn.day);
     // On D1 carry enough stone to finish the complete radius-2 shell. Later
-    // days use a bounded maintenance budget.
+    // days use a bounded maintenance budget. `stone_demand` counts the GAPS
+    // still open, not the shortfall against what is already carried: stone in a
+    // backpack is committed to those gaps, and treating it as "demand already
+    // met" made the carrier sell the ring's own stone out from under itself.
     let wall_demand = (wall_gaps.len() as i64).min(wall_cap);
-    let stone_demand = (wall_demand - economy::team_ores(turn, STONE)).max(0);
+    let stone_demand = wall_demand;
     // Gold reserved for finishing the tower build-out is untouchable by the
     // shopping list — defenses come before consumables, but only for the 1-2
     // towers we actually build (never all three slots at once).
@@ -94,12 +116,21 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     );
     // With two workers, the LAST one is the dedicated economy worker: it skips
     // wall duty and focuses on mine → sell → shop, so the wall line never
-    // monopolizes both workers.
+    // monopolizes both workers. Day 1's open ring is the exception — a builder
+    // can only spend stone it is carrying itself, so a "held back" stone in
+    // the economy worker's pack is not a reserve, it is a hole in the ring,
+    // and the only role that can close it is the one carrying it. That is
+    // exactly the shape of issues #12/#13/#14: one worker swept 8 walls and
+    // ran dry while the other stood on 17 stone it was neither allowed to
+    // build with nor able to sell. While the D1 ring is still open both
+    // workers fortify; the exemption returns as soon as only the gate is left,
+    // and the mine→sell→shop loop owns the rest of the day.
     let economy_id = if workers.len() >= 2 {
         workers.last().map(|unit| unit.id)
     } else {
         None
     };
+    let shared_wall_duty = turn.day == 1 && !wall_gaps.is_empty();
     if !budget.intent.is_empty() {
         // Economy intent vs outcome: the head of the list is what we WANT, the
         // gold check and the buyer's distance say whether it is reachable this
@@ -141,6 +172,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             &budget,
             buyer_id,
             economy_id,
+            shared_wall_duty,
             &pairs,
             &mut claimed,
             &mut plan,
@@ -151,7 +183,51 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         pioneer_day(turn, state, pioneer, &pairs, &mut claimed, &mut plan);
     }
 
+    // Backstop. Every step above can decline: the target is claimed by a
+    // teammate, the path closed behind the role, the mine it is standing next
+    // to was reserved by someone else, the ring is between it and everything.
+    // Declining is fine, standing still is not — a controller with no command
+    // at all is issue #13's "0 角色站桩闲置", and it is also what pins a role
+    // outside the ring so the gate seal never completes. A role that is neither
+    // on a gun nor inside shelters by closing on the station, which is always
+    // legal and always useful: it is the cell the gate seal waits for and the
+    // corridor every post is reached from.
+    //
+    // Claims are deliberately ignored here. A reservation is etiquette for
+    // choosing between two targets; it must never be a reason to do nothing.
+    for role in turn.controllable() {
+        if plan.commands.contains_key(&role.id) {
+            continue;
+        }
+        if let Some(cmd) = fallback_toward_station(turn, role) {
+            plan.push(role.id, cmd);
+        }
+    }
+
     plan
+}
+
+/// Last resort for a role that produced no command: close on the station.
+/// Returns `None` when holding position is the right answer (already at a gun
+/// or already inside), so the deliberate dusk lock-in is never overridden.
+fn fallback_toward_station(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
+    let station = turn.station()?;
+    let footprint = station.footprint();
+    if footprint_distance(role.pos, &footprint) <= 1 {
+        return None; // already home: standing still here is the plan
+    }
+    if turn
+        .towers()
+        .iter()
+        .any(|tower| chebyshev(role.pos, tower.pos) <= 1)
+    {
+        return None; // on post: holding the gun outranks everything
+    }
+    let stands = crate::brain::interior_cells(turn);
+    if stands.is_empty() {
+        return None;
+    }
+    walk_toward(turn, role, &stands, &mut HashSet::new())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -165,6 +241,7 @@ fn worker_day(
     budget: &economy::Budget,
     buyer_id: Option<i64>,
     economy_id: Option<i64>,
+    shared_wall_duty: bool,
     pairs: &[(i64, i64)],
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
@@ -181,19 +258,41 @@ fn worker_day(
         plan.push(role.id, cmd);
         return;
     }
-    // 3. Once everyone has retreated at dusk, an adjacent stone carrier seals
-    // the intentionally-last gate before holding its tower position. This is
-    // the only wall action allowed to outrank the hard pre-position lock.
+    // 3. Once everyone has retreated at dusk, a stone carrier closes what is
+    //    left of the ring — the intentionally-last gate first, then any other
+    //    cell the sweep had to skip because a teammate was standing on it when
+    //    it went past (that is the hole that left the ring at 19/20 with the
+    //    stone already in a backpack). This is the only wall action allowed to
+    //    outrank the hard pre-position lock, and the errand is bounded to the
+    //    dusk window so a gun is never abandoned at nightfall.
     if state.wall_gate_sealed && role.count_item(STONE) > 0 {
-        if let Some(gate) = wall_gate(turn) {
-            if wall_gaps.contains(&gate) && chebyshev(role.pos, gate) == 1 {
+        let mut gaps = wall_gaps.to_vec();
+        gaps.sort_by_key(|site| chebyshev(role.pos, *site));
+        if let Some(site) = gaps
+            .into_iter()
+            .find(|site| !wall_would_trap(turn, pairs, state, *site))
+        {
+            let gate = wall_gate(turn) == Some(site);
+            if chebyshev(role.pos, site) == 1 {
                 state.walls_built_today = state.walls_built_today.saturating_add(1);
+                state.walled_cells_today.insert(site);
                 crate::log::event(
-                    "wall_gate_build",
-                    serde_json::json!({"round": turn.round_no, "role": role.id, "target": gate}),
+                    if gate {
+                        "wall_gate_build"
+                    } else {
+                        "wall_seal_build"
+                    },
+                    serde_json::json!({"round": turn.round_no, "role": role.id, "target": site}),
                 );
-                plan.push(role.id, RoleCommand::build(gate, "wall"));
+                plan.push(role.id, RoleCommand::build(site, "wall"));
                 return;
+            }
+            if turn.in_day_round < economy::DUSK_ROUND + SEAL_GRACE {
+                if let Some(cmd) = build_or_walk(turn, role, site, "wall", claimed) {
+                    claimed.insert(site);
+                    plan.push(role.id, cmd);
+                    return;
+                }
             }
         }
     }
@@ -220,7 +319,20 @@ fn worker_day(
             if turn.in_day_round >= deadline {
                 if dist > 1 {
                     let stands = tower_stand_cells(turn, tower.pos);
-                    if let Some(cmd) = walk_or_remove_wall(turn, role, &stands, claimed) {
+                    // Walk there — but never by demolishing the wall line. The
+                    // ring is the day's whole product (issues #12/#13/#14: "420
+                    // log lines and zero wall builds"), and a controller that
+                    // cuts its way to a gun on the way in leaves a base that is
+                    // open all night. The night recall in `night::plan` keeps
+                    // its demolition escape hatch, where being locked out is
+                    // fatal; here the fallback is to shelter inside, which is
+                    // one of the three valid night duties (operate / heal /
+                    // retreat) and the exact set the gate seal waits for.
+                    if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
+                        plan.push(role.id, cmd);
+                        return;
+                    }
+                    if let Some(cmd) = retreat_inside(turn, role, claimed) {
                         plan.push(role.id, cmd);
                         return;
                     }
@@ -237,25 +349,62 @@ fn worker_day(
     //    monopolizes the whole day. Building also stops the moment any role
     //    could no longer reach its night weapon — the gate stays open until
     //    everyone has retreated inside, so we never wall ourselves out.
-    let on_wall_duty =
-        Some(role.id) != economy_id && state.walls_built_today < wall_daily_cap(turn.day);
+    let on_wall_duty = (Some(role.id) != economy_id || shared_wall_duty)
+        && (state.walled_cells_today.len() as i64) < wall_daily_cap(turn.day);
+    // (shared_wall_duty is passed in from `plan`: day 1 keeps both workers on
+    // the ring until it closes — see the comment there.)
     if role.count_item(STONE) > 0
         && !wall_gaps.is_empty()
         && on_wall_duty
         && roles_can_reach(turn, pairs)
     {
-        // Build immediately when already standing next to a safe gap.
-        let adjacent_site = wall_gaps
-            .iter()
-            .find(|site| {
-                !claimed.contains(site)
-                    && chebyshev(role.pos, **site) == 1
-                    && !wall_would_trap(turn, pairs, **site)
-            })
-            .copied();
+        let batch = stone_batch(turn, wall_gaps.len());
+        let carrying = role.count_item(STONE) as i64;
+        // One trip per batch. Dropping a wall every time we happen to walk past
+        // a gap with a single stone in hand is what turned the day into a
+        // mine↔ring shuttle: the build is only worth taking once the load is
+        // complete, there is no more stone left to fetch, or nightfall is close
+        // enough that another trip would not pay for itself.
+        //
+        // "Complete" is measured against the TEAM's stone, not this one pack:
+        // two workers splitting a 20-cell ring hold 10 each and neither pack
+        // ever reaches the batch, so a per-pack test waits for a load that no
+        // single worker is supposed to carry and the ring is never started.
+        // Once the team between them holds enough to fill every gap, the next
+        // mine trip only pushes the build past dusk.
+        let team_stone = economy::team_ores(turn, STONE);
+        let load_complete = carrying >= batch
+            || team_stone >= wall_gaps.len() as i64
+            || stone_demand <= 0
+            || turn.in_day_round >= economy::DUSK_ROUND - 12;
+        // Build immediately when already standing next to a safe gap — but only
+        // once this trip's load is settled. The batch exists to avoid the
+        // mine↔ring commute, so it decides whether it is worth WALKING OUT to
+        // the wall line, never whether a stone already in hand gets used: when
+        // there is no more stone to fetch (batch complete, no reachable ore
+        // left, or dusk too close for another trip) waiting for a load means
+        // never placing the stone at all, and the role walks off to a tower
+        // with a full pack instead
+        // (tests/combat.rs::worker_builds_wall_before_weapon).
+        let more_stone_available =
+            economy::choose_mine(turn, state, role.pos, stone_demand, &mut HashSet::new())
+                .is_some();
+        let adjacent_site = if load_complete || !more_stone_available {
+            wall_gaps
+                .iter()
+                .find(|site| {
+                    !claimed.contains(site)
+                        && chebyshev(role.pos, **site) == 1
+                        && !wall_would_trap(turn, pairs, state, **site)
+                })
+                .copied()
+        } else {
+            None
+        };
         if let Some(site) = adjacent_site {
             claimed.insert(site);
             state.walls_built_today = state.walls_built_today.saturating_add(1);
+            state.walled_cells_today.insert(site);
             crate::log::event(
                 "wall_build",
                 serde_json::json!({"role": role.id, "target": site, "stone": role.count_item(STONE)}),
@@ -264,16 +413,16 @@ fn worker_day(
             return;
         }
         // Otherwise commit to the wall line once we carry a batch of stone.
-        let batch = STONE_BATCH.min(wall_gaps.len() as i64).max(1);
-        if role.count_item(STONE) as i64 >= batch {
+        if load_complete {
             for site in wall_gaps {
-                if claimed.contains(site) || wall_would_trap(turn, pairs, *site) {
+                if claimed.contains(site) || wall_would_trap(turn, pairs, state, *site) {
                     continue;
                 }
                 if let Some(cmd) = build_or_walk(turn, role, *site, "wall", claimed) {
                     claimed.insert(*site);
                     if cmd.action == "build" {
                         state.walls_built_today = state.walls_built_today.saturating_add(1);
+                        state.walled_cells_today.insert(*site);
                         crate::log::event(
                             "wall_build",
                             serde_json::json!({"role": role.id, "target": *site, "stone": role.count_item(STONE)}),
@@ -321,6 +470,16 @@ fn worker_day(
     //     per-role errand and never a detour — it fires only while already
     //     standing at the shop, after the team list has had its turn.
     if let Some(cmd) = self_provision(turn, role) {
+        plan.push(role.id, cmd);
+        return;
+    }
+    // 7c. Cut a door in our own wall line. Everything the economy needs — ore,
+    //     the vendor, the shop — is OUTSIDE the ring, and a ring with no door is
+    //     a base nobody can leave: the day after the wall line closes, every
+    //     role stands inside with an empty pack and issues no command at all
+    //     (issue #14's frozen economy, in its final form). Runs before selling
+    //     and mining because with the door shut there is no point trying either.
+    if let Some(cmd) = open_door(turn, state, role, claimed) {
         plan.push(role.id, cmd);
         return;
     }
@@ -404,6 +563,12 @@ fn pioneer_day(
                         plan.push(pioneer.id, cmd);
                         return;
                     }
+                    // Same fallback as the workers: a pioneer whose tower is
+                    // walled off retreats inside rather than standing idle.
+                    if let Some(cmd) = retreat_inside(turn, pioneer, claimed) {
+                        plan.push(pioneer.id, cmd);
+                        return;
+                    }
                 }
                 // Already adjacent (or no walkable step): hold at the tower.
                 return;
@@ -432,6 +597,44 @@ fn pioneer_day(
     }
     // 7. Loiter next to a task point so we catch refreshes immediately.
     loiter_at_task_point(turn, pioneer, claimed, plan);
+    if plan.commands.contains_key(&pioneer.id) {
+        return;
+    }
+    // 7b. No task point to wait at either: run the economy. With nothing to
+    //     fight for the pioneer used to walk to the station and stand there for
+    //     the rest of the day — 47 of day 1's 70 rounds, which is issue #13's
+    //     "角色站桩闲置" in its purest form, and a third pair of hands the wall
+    //     line and the purse never got. It has the same pack and the same arms
+    //     as a worker; the only thing it must not do is stop being a pioneer
+    //     when a task point appears, so this sits below the task, voucher,
+    //     treasure and loiter steps.
+    //
+    //     It mines for VALUE, not for the ring: a builder can only spend the
+    //     stone in its own pack and the pioneer has no wall step, so stone in
+    //     its hands would be the "held back" load that left the ring at 19/20.
+    //     Ore it can sell is gold it can spend on towers and upgrades.
+    //
+    //     Never past the pre-position deadline (step 3 above runs first), so an
+    //     errand can still not cost the pioneer its gun at dusk.
+    // 7b. Nothing to fight for: shelter inside the ring. NOT the mine→sell loop
+    //     — that was tried and it is worse than useless: `validate` admits
+    //     `collect` and `sell` for Workers only, so a pioneer handed the
+    //     economy produced a command every round that the judger dropped on the
+    //     floor. The role looked busy to the planner and stood rooted to the
+    //     spot on the board — 47 of day 1's 70 rounds at (17,22) with an empty
+    //     pack, which is exactly the "角色站桩闲置" of issue #13. What a pioneer
+    //     can actually do with a free afternoon is get behind the wall line
+    //     before the robots come, and that is also what lets the gate seal.
+    // 8. Nothing to do at all — no task point, no treasure, no voucher. Retreat
+    //    inside the ring instead of standing in the open: a lone role parked
+    //    outside the wall line is a free kill for the robots, and it is also
+    //    what stops `update_wall_gate` from ever sealing (the gate waits for
+    //    everyone to be inside). Issue #13's "0 角色站桩闲置" is exactly this —
+    //    a role with no task, no treasure and no post, silent for the rest of
+    //    the day while a gun stands unmanned nearby.
+    if let Some(cmd) = retreat_inside(turn, pioneer, claimed) {
+        plan.push(pioneer.id, cmd);
+    }
 }
 
 /// Accept or walk toward the first valid task point.
@@ -646,6 +849,22 @@ fn build_or_walk(
     walk_toward(turn, role, &stands, claimed)
 }
 
+/// Walk a role back inside the ring, onto a cell at footprint distance <= 1
+/// from the station. Returns `None` when it is already inside or when nothing
+/// inside is reachable, so a genuinely boxed-in role holds rather than paces.
+fn retreat_inside(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>) -> Option<RoleCommand> {
+    let station = turn.station()?;
+    let footprint = station_footprint(station.pos);
+    if footprint_distance(role.pos, &footprint) <= 1 {
+        return None;
+    }
+    let stands = crate::brain::interior_cells(turn);
+    if stands.is_empty() {
+        return None;
+    }
+    walk_toward(turn, role, &stands, claimed)
+}
+
 /// Is there a walkable route from `start` to any of `stands`? A role already
 /// standing on a stand cell counts as reachable (no move needed).
 fn can_reach(turn: &Turn, start: Pos, stands: &[Pos]) -> bool {
@@ -680,11 +899,13 @@ fn roles_can_reach(turn: &Turn, pairs: &[(i64, i64)]) -> bool {
     true
 }
 
-/// Would placing a wall at `site` cut any role off from its weapon? Simulate
-/// the wall and re-run the reachability check. Together with the
+/// Would placing a wall at `site` cut any role off from its weapon, or seal a
+/// gap the ring still has to fill away from the workers who can fill it?
+/// Simulate the wall and re-run both reachability checks. Together with the
 /// far-side-first build order, this guarantees the ring is only ever closed
-/// after everyone has retreated inside.
-fn wall_would_trap(turn: &Turn, pairs: &[(i64, i64)], site: Pos) -> bool {
+/// after everyone has retreated inside — and that the last stone can still
+/// reach the last gap.
+fn wall_would_trap(turn: &Turn, pairs: &[(i64, i64)], state: &BotState, site: Pos) -> bool {
     let mut blocked = turn.blocked_for(-1);
     blocked.insert(site);
     for role in turn.controllable() {
@@ -694,15 +915,169 @@ fn wall_would_trap(turn: &Turn, pairs: &[(i64, i64)], site: Pos) -> bool {
         if stands.iter().any(|stand| *stand == role.pos) {
             continue; // already at the weapon: nothing to trap
         }
+        // A role that cannot reach its weapon even WITHOUT this wall is not
+        // what the wall would trap. Counting it anyway vetoes every remaining
+        // ring cell at once — the gate included — which is how day 1 ended at
+        // 19/20 with the last stone sitting in a backpack (issues #12/#13/#14).
+        if !crate::brain::can_reach_any(turn, role, &stands) {
+            continue;
+        }
         if crate::path::step_toward_stands(turn, role.pos, &stands, &blocked).is_none() {
+            return true;
+        }
+    }
+    // The same question for the wall line itself. A ring cell is only
+    // buildable from a cell next to it, and a cell a teammate was standing on
+    // when the sweep went past is exactly the one that stays open. Closing the
+    // ring over the top of it leaves that hole reachable from the outside
+    // only, with the stone on the wrong side of the wall — day 1 finished
+    // 19/20 with two stones stuck in a backpack exactly that way.
+    let can_build = |role: &Unit, gap: Pos, blocked: &HashSet<Pos>| -> bool {
+        if chebyshev(role.pos, gap) == 1 {
+            return true;
+        }
+        let stands = stand_cells(turn, gap);
+        crate::path::step_toward_stands(turn, role.pos, &stands, blocked).is_some()
+    };
+    let before = turn.blocked_for(-1);
+    for gap in pending_ring(turn, state, site) {
+        let reachable = |blocked: &HashSet<Pos>| {
+            turn.controllable()
+                .iter()
+                .any(|role| can_build(role, gap, blocked))
+        };
+        // A gap nobody could reach even before this wall is not the wall's
+        // doing, and vetoing on its account would leave the ring open forever.
+        if reachable(&before) && !reachable(&blocked) {
             return true;
         }
     }
     false
 }
 
+/// Ring cells that are still to be filled, IGNORING whether a teammate happens
+/// to be standing on one. `wall_gaps` drops an occupied cell so we never build
+/// under a unit, but that same filter hides the cell from the build-order
+/// safety check — and a ring cell a role was standing on when the sweep went
+/// past is precisely the one that ends up walled off from the inside, with the
+/// stone on the wrong side. Day 1 finished 19/20 exactly that way.
+fn pending_ring(turn: &Turn, state: &BotState, ignore: Pos) -> Vec<Pos> {
+    let Some(station) = turn.station() else {
+        return Vec::new();
+    };
+    let footprint = station_footprint(station.pos);
+    let Some(gate) = wall_gate(turn) else {
+        return Vec::new();
+    };
+    let walls: HashSet<Pos> = turn.walls().iter().map(|wall| wall.pos).collect();
+    ring_cells(&footprint, 2)
+        .into_iter()
+        .filter(|pos| *pos != gate || state.wall_gate_sealed)
+        .filter(|pos| {
+            *pos != ignore
+                && turn.is_land(*pos)
+                && !walls.contains(pos)
+                && !state
+                    .blacklisted_builds
+                    .contains(&(*pos, "wall".to_string()))
+        })
+        .collect()
+}
+
+/// Walkable cells outside the wall ring — everything at footprint distance 3
+/// or more: the mines, the vendors, the shops, the enemy half. "Can this role
+/// get out?" is exactly "can it reach one of these?".
+fn outside_cells(turn: &Turn, footprint: &[Pos]) -> Vec<Pos> {
+    let mut cells: Vec<Pos> = Vec::new();
+    for x in 0..turn.width {
+        for y in 0..turn.height {
+            let pos = Pos { x, y };
+            if turn.is_land(pos) && footprint_distance(pos, footprint) >= 3 {
+                cells.push(pos);
+            }
+        }
+    }
+    cells
+}
+
+/// Cut a door in our own wall line.
+///
+/// The ring is a closed box, and everything the economy runs on is outside it.
+/// While the wall crew is still building, the ring has gaps and the question
+/// never comes up; the moment the last cell is filled, every role inside is
+/// walled away from the ore with an empty pack and the whole day produces no
+/// command at all. That is issue #14 — "R18 gold 105, then 216 rounds
+/// untouched" — in its final form, and it repeats every day after the ring
+/// closes.
+///
+/// So a role that is inside, has an errand outside and can reach neither cuts
+/// its own way out. The opening is recorded in `door_cells` and `wall_gaps`
+/// stops offering it for the rest of the day, or the wall crew would re-seal it
+/// under the digger's feet every round (demolish, rebuild, demolish) and the
+/// day would be spent oscillating over one cell. At dusk `door_cells` stops
+/// being honoured, the cell becomes an ordinary gap again and the seal crew
+/// fills it: the door is a daytime fixture, the ring must be closed at night.
+fn open_door(
+    turn: &Turn,
+    state: &mut BotState,
+    role: &Unit,
+    claimed: &mut HashSet<Pos>,
+) -> Option<RoleCommand> {
+    // Past dusk the wall line is closing, not opening.
+    if turn.in_day_round >= economy::DUSK_ROUND || turn.walls().is_empty() {
+        return None;
+    }
+    // Day 1 is the fortification day. The ring goes up from the outside in and
+    // the crew walks in and out of the gaps it leaves; a door cut into that
+    // line is a hole the day does not get back (measured: five cells lost, the
+    // ring finished at R32 and burrowed through at R48-R57). From day 2 the
+    // ring stands and the economy has to live behind it.
+    if turn.day <= 1 {
+        return None;
+    }
+    let station = turn.station()?;
+    let footprint = station.footprint();
+    // Already outside, or standing on the wall line itself: nothing to cut.
+    if footprint_distance(role.pos, &footprint) > 1 {
+        return None;
+    }
+    // A way out already exists — the ring is incomplete, the door is open, or
+    // this role never was trapped. Never demolish a wall we do not have to.
+    let blocked = turn.blocked_for(role.id);
+    let outside = outside_cells(turn, &footprint);
+    if crate::path::step_toward_stands(turn, role.pos, &outside, &blocked).is_some() {
+        return None;
+    }
+    // Cut the nearest cell of our own ring, preferring the designated gate:
+    // that is the cell the night crew expects to have to re-seal, and keeping
+    // the door in one place means the ring is never opened in two.
+    let gate = wall_gate(turn);
+    let target = turn
+        .walls()
+        .into_iter()
+        .map(|wall| wall.pos)
+        .filter(|pos| chebyshev(role.pos, *pos) == 1)
+        .filter(|pos| footprint_distance(*pos, &footprint) == 2)
+        .min_by_key(|pos| (gate != Some(*pos), pos.x, pos.y))?;
+    if !claimed.insert(target) {
+        return None; // a teammate is already cutting this round
+    }
+    state.door_cells.insert(target);
+    crate::log::event(
+        "door_open",
+        serde_json::json!({
+            "round": turn.round_no,
+            "role": role.id,
+            "target": target,
+            "gate": gate == Some(target),
+        }),
+    );
+    Some(RoleCommand::remove(target))
+}
+
 /// Walk to the nearest mine and collect. Stone is preferred while the wall
-/// line needs it; distance always beats ore value.
+/// line still needs the load this role is carrying; distance always beats ore
+/// value.
 fn mine_flow(
     turn: &Turn,
     state: &BotState,
@@ -710,9 +1085,30 @@ fn mine_flow(
     stone_demand: i64,
     claimed: &mut HashSet<Pos>,
 ) -> Option<RoleCommand> {
-    let (mine, ore) = economy::choose_mine(turn, state, role.pos, stone_demand, claimed)?;
-    // Collect an adjacent mine of the preferred ore directly.
-    if let Some(mine_pos) = nearest_adjacent_mine(turn, role, &ore, claimed) {
+    // Fetch stone only while the TEAM is short of the gaps still open.
+    // `stone_demand` is the gap count, not this role's shortfall: two workers
+    // splitting a 20-cell ring hold 10 each, so a per-pack test keeps both of
+    // them digging stone long after the ring has all the stone it can use,
+    // and the sellable ore that funds the rest of the day never gets mined.
+    let want_stone = stone_demand > 0 && economy::team_ores(turn, STONE) < stone_demand;
+    let (mine, ore) = economy::choose_mine(
+        turn,
+        state,
+        role.pos,
+        if want_stone { stone_demand } else { 0 },
+        claimed,
+    )?;
+    // Collect an adjacent mine of the preferred ore directly. A mine a
+    // teammate has merely RESERVED as a walking target is still collectable by
+    // a role already standing next to it: the reservation decides who walks
+    // there, not who may dig. Without the second look the role stands on the
+    // ore with an empty pack, refuses to collect because someone else claimed
+    // the cell, cannot walk to it either (it is already on a stand, so the
+    // path search returns "no step"), and produces no command at all for the
+    // rest of the day — issue #13's idle role, caused by a claim.
+    let adjacent = nearest_adjacent_mine(turn, role, &ore, claimed)
+        .or_else(|| nearest_adjacent_mine(turn, role, &ore, &HashSet::new()));
+    if let Some(mine_pos) = adjacent {
         claimed.insert(mine_pos);
         return Some(RoleCommand::collect(mine_pos));
     }
@@ -804,21 +1200,118 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
     // slot: it is still completed early, but only after the two dependable
     // no-cooldown weapons can defend the base.
     let build_order: [(usize, &str); 3] = [(0, "gatling"), (1, "railgun"), (2, "rocket")];
+    // Cells that a standing weapon must be able to be OPERATED from. Three guns
+    // packed onto adjacent ring cells steal each other's only standing room —
+    // the middle one then has no adjacent free cell at all, and a weapon nobody
+    // can man is a weapon that never fires (issues #12/#13/#14: "炮塔全程无人
+    // 操控"). Reserve every existing tower's operating cells up front and refuse
+    // a new site that would take one, or that would have fewer than two of its
+    // own left once the neighbours are built out.
+    let mut reserved: HashSet<Pos> = HashSet::new();
+    for tower in turn.towers() {
+        reserved.extend(tower_stand_cells(turn, tower.pos));
+    }
+    // Cell occupancy splits in two for the corridor question. A unit standing
+    // somewhere is transient — it will move — but the station and a built
+    // tower are there for good, and only those can strand a corridor cell.
+    // Reading a teammate's position as permanent is what let the rocket land
+    // on the one cell that cut the base interior in half.
+    let mut permanent: HashSet<Pos> = footprint.iter().copied().collect();
+    for tower in turn.towers() {
+        permanent.insert(tower.pos);
+    }
     let mut gaps: Vec<(Pos, String)> = Vec::new();
     let mut used: HashSet<Pos> = HashSet::new();
     for (have_idx, kind) in build_order {
         if have[have_idx] > 0 {
             continue;
         }
-        let site = cells.iter().copied().find(|pos| {
-            !used.contains(pos) && !state.blacklisted_builds.contains(&(*pos, kind.to_string()))
-        });
+        let mut taken = occupied.clone();
+        taken.extend(used.iter().copied());
+        taken.extend(reserved.iter().copied());
+        let mut fixed = permanent.clone();
+        fixed.extend(used.iter().copied());
+        // Operability is a PREFERENCE, never a veto. Two guns on a corner base
+        // eat most of the five ring cells it has, and a strict "two standing
+        // cells or nothing" test then rejects the third site outright — the
+        // base ends the day with two guns while the third slot waits for a
+        // cell that will never free up. A gun with a single standing cell still
+        // fires; a gun that was never built never does, and `gatling -> railgun
+        // -> rocket` is a hard requirement. So the strict search runs first and
+        // the fallback is exactly the pre-existing test: any free, non-
+        // blacklisted ring cell. The fallback can therefore never site FEWER
+        // guns than the plain search did.
+        let pick = |require_operable: bool| -> Option<Pos> {
+            cells.iter().copied().find(|pos| {
+                !used.contains(pos)
+                    && !state.blacklisted_builds.contains(&(*pos, kind.to_string()))
+                    && (!require_operable
+                        || (!reserved.contains(pos)
+                            && operating_cells(turn, *pos, &taken).len() >= 2
+                            && !strands_corridor(turn, &footprint, &fixed, *pos)))
+            })
+        };
+        let site = pick(true).or_else(|| pick(false));
         if let Some(pos) = site {
             used.insert(pos);
+            reserved.extend(operating_cells(turn, pos, &taken));
             gaps.push((pos, kind.to_string()));
         }
     }
     gaps
+}
+
+/// Would putting a tower on `site` strand a ROLE in the ring-1 corridor?
+///
+/// The band between the station and the wall is the only walkable corridor
+/// inside the base, and a weapon sits on it. Two guns two cells apart leave the
+/// cell between them with no ring-1 neighbour at all, and a role standing there
+/// can reach nothing for the rest of the day: no gun, no gate, no way out. That
+/// is issue #13's "0 角色站桩闲置", and it also stops the ring from ever
+/// closing, because `wall_would_trap` sees the stranded role as the reason not
+/// to seal.
+///
+/// The test is about occupants, not geometry: an empty pocket costs nothing
+/// (nobody is in it, and anyone who walks in can walk back out the way they
+/// came), while vetoing every geometric pocket rejects the third gun's only
+/// site from some base positions and leaves the base with two towers.
+fn strands_corridor(turn: &Turn, footprint: &[Pos], taken: &HashSet<Pos>, site: Pos) -> bool {
+    let band: Vec<Pos> = ring_cells(footprint, 1);
+    let free: Vec<Pos> = band
+        .iter()
+        .copied()
+        .filter(|pos| *pos != site && !taken.contains(pos))
+        .collect();
+    turn.controllable().iter().any(|role| {
+        band.contains(&role.pos)
+            && !free
+                .iter()
+                .any(|other| *other != role.pos && chebyshev(*other, role.pos) == 1)
+    })
+}
+
+/// Cells a weapon standing at `site` could be operated from, treating `taken`
+/// as occupied. Mirrors `tower_stand_cells` for a tower that does not exist
+/// yet, so a build site can be accepted or rejected before any gold is spent.
+fn operating_cells(turn: &Turn, site: Pos, taken: &HashSet<Pos>) -> Vec<Pos> {
+    let Some(station) = turn.station() else {
+        return Vec::new();
+    };
+    let footprint = station_footprint(station.pos);
+    let all: Vec<Pos> = crate::model::neighbours(site)
+        .into_iter()
+        .filter(|pos| turn.is_land(*pos) && !taken.contains(pos))
+        .collect();
+    let inner: Vec<Pos> = all
+        .iter()
+        .copied()
+        .filter(|pos| footprint_distance(*pos, &footprint) <= 1)
+        .collect();
+    if inner.len() >= 2 {
+        inner
+    } else {
+        all
+    }
 }
 
 fn wall_gate(turn: &Turn) -> Option<Pos> {
@@ -833,7 +1326,11 @@ fn wall_gate(turn: &Turn) -> Option<Pos> {
 }
 
 fn update_wall_gate(turn: &Turn, state: &mut BotState, pairs: &[(i64, i64)]) {
-    if state.wall_gate_sealed || turn.day != 1 || turn.in_day_round < economy::DUSK_ROUND {
+    // The seal checkpoint is dusk on EVERY day, not just the first. The ring is
+    // re-opened each morning by `open_door` (the ore is outside it), so without
+    // a daily seal the wall line the crew spends the day rebuilding is a wall
+    // line with a hole in it.
+    if state.wall_gate_sealed || turn.in_day_round < economy::DUSK_ROUND {
         return;
     }
     let Some(station) = turn.station() else {
@@ -880,6 +1377,11 @@ pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
     cells
         .into_iter()
         .filter(|pos| state.wall_gate_sealed || *pos != gate)
+        // A cell the economy cut open this morning is a door, not a hole: the
+        // gap list must not send the wall crew to re-seal it under the digger's
+        // feet all day. From dusk the door stops being honoured and the cell is
+        // an ordinary gap again, so the ring is closed before the robots come.
+        .filter(|pos| turn.in_day_round >= economy::DUSK_ROUND || !state.door_cells.contains(pos))
         .filter(|pos| {
             turn.is_land(*pos)
                 && !existing_walls.contains(pos)

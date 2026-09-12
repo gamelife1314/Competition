@@ -10,10 +10,21 @@ use crate::model::{chebyshev, footprint_distance, Turn, Unit, UnitKind};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
 
-/// Greedy pairing: every living tower gets the closest free controller.
-/// A pioneer busy with a self-evolution task must stay at the task point and
-/// is therefore excluded. Towers under the heaviest pressure pair first so a
-/// long walk never starves the position that matters most.
+/// Greedy pairing: every living tower gets the closest free controller that
+/// can actually REACH it. A pioneer busy with a self-evolution task must stay
+/// at the task point and is therefore excluded. Towers under the heaviest
+/// pressure pair first so a long walk never starves the position that matters
+/// most.
+///
+/// Distance alone is not enough once the ring is up. The station, the other
+/// towers and the wall line between them can leave a gun whose nearest
+/// controller sits in a pocket with no route to it: the role then spends the
+/// night in `walk_or_remove_wall` returning nothing (issue #13's "0 角色站桩
+/// 闲置") while the gun never fires, and `wall_would_trap` refuses to close the
+/// ring because THAT role — already cut off — would still be cut off
+/// afterwards. Preferring a reachable tower fixes the cause instead of the
+/// symptom. When no controller can reach the gun the nearest one is still
+/// taken, so the pairing is never worse than the distance-only one.
 pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
     let mut towers = turn.towers();
     towers.sort_by_cached_key(|tower| std::cmp::Reverse(combat::threat_load(turn, tower)));
@@ -27,16 +38,25 @@ pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
         if controllers.is_empty() {
             break;
         }
-        let mut best_index = 0usize;
-        let mut best_dist = i32::MAX;
-        for (index, role) in controllers.iter().enumerate() {
-            let dist = chebyshev(role.pos, tower.pos);
-            if dist < best_dist {
-                best_dist = dist;
-                best_index = index;
+        let stands = tower_stand_cells(turn, tower.pos);
+        let nearest = |wanted: &dyn Fn(&Unit) -> bool| -> Option<usize> {
+            let mut best: Option<(i32, usize)> = None;
+            for (index, role) in controllers.iter().enumerate() {
+                if !wanted(role) {
+                    continue;
+                }
+                let dist = chebyshev(role.pos, tower.pos);
+                if best.map(|(best_dist, _)| dist < best_dist).unwrap_or(true) {
+                    best = Some((dist, index));
+                }
             }
-        }
-        let role = controllers.remove(best_index);
+            best.map(|(_, index)| index)
+        };
+        let reachable = |role: &Unit| crate::brain::can_reach_any(turn, role, &stands);
+        let index = nearest(&reachable)
+            .or_else(|| nearest(&|_| true))
+            .expect("controllers is non-empty");
+        let role = controllers.remove(index);
         pairs.push((role.id, tower.id));
     }
     pairs
@@ -365,18 +385,9 @@ fn spare_night(
 /// this round). Uses only the cells at footprint distance <= 1 — hugging the
 /// station — so the role never stops on the wall line or out near the mines.
 fn shelter(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) -> bool {
-    let Some(station) = turn.station() else {
-        return false;
-    };
-    let footprint = station.footprint();
-    let mut stands: Vec<Pos> = Vec::new();
-    for cell in &footprint {
-        for around in crate::model::neighbours(*cell) {
-            if turn.is_land(around) && crate::model::footprint_distance(around, &footprint) <= 1 {
-                stands.push(around);
-            }
-        }
-    }
+    // The same set the day planner retreats to and the wall gate measures
+    // "everyone is inside" against; sharing it keeps the three in step.
+    let mut stands: Vec<Pos> = crate::brain::interior_cells(turn);
     if stands.is_empty() {
         return false;
     }

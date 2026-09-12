@@ -193,7 +193,10 @@ fn the_three_tower_sites_sit_on_the_inner_ring_from_every_base() {
         let unique: HashSet<Pos> = gaps.iter().map(|(pos, _)| *pos).collect();
         assert_eq!(unique.len(), 3, "{name} stacked two towers on one cell");
         for (pos, _) in &gaps {
-            assert!(turn.is_land(*pos), "{name} tower site off the board: {pos:?}");
+            assert!(
+                turn.is_land(*pos),
+                "{name} tower site off the board: {pos:?}"
+            );
             assert_eq!(
                 footprint_distance(*pos, &footprint),
                 1,

@@ -204,6 +204,20 @@ pub struct BotState {
     pub summon_orders_today: i32,
     /// Walls placed this day; capped so wall-building never monopolizes the day.
     pub walls_built_today: i64,
+    /// Distinct cells fortified today. The cap is measured against THIS, not
+    /// against the number of placements: a wall that a role demolished to get
+    /// out — or that the night's robots knocked down — has to be rebuildable
+    /// without spending the day's fortification budget twice, or the ring stays
+    /// open for the rest of the day with the budget "used up".
+    pub walled_cells_today: HashSet<Pos>,
+
+    /// Ring cells the economy deliberately cut open today so a role inside the
+    /// wall line could reach the ore. The ring is a closed box — once the last
+    /// wall is up, nothing inside can get out and the ore is all outside — so
+    /// the day needs a door and the night needs it shut. Honoured only while the
+    /// sun is up: from dusk these cells are ordinary gaps again and the seal
+    /// crew fills them. Cleared at day rollover.
+    pub door_cells: HashSet<Pos>,
 
     /// day -> official news text (dedup)
     pub official_seen: HashMap<i64, String>,
@@ -292,7 +306,11 @@ impl BotState {
             self.llm_used_today = 0;
             self.summon_orders_today = 0;
             self.walls_built_today = 0;
+            self.walled_cells_today.clear();
             self.harass_done_today = false;
+            // Yesterday's door was sealed at dusk; today may need a new one.
+            self.door_cells.clear();
+            self.wall_gate_sealed = false;
         }
         self.last_round = turn.round_no;
 
