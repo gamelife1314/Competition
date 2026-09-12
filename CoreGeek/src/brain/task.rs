@@ -13,7 +13,7 @@ use crate::state::{BotState, TaskStage};
 const MAX_WINDOW_ERRORS: i32 = 2;
 
 /// The last `roundNo` of the day `round_no` falls in.
-fn turn_end_of_day(round_no: i64) -> i64 {
+pub(crate) fn turn_end_of_day(round_no: i64) -> i64 {
     let round_no = round_no.max(1);
     ((round_no - 1) / crate::model::ROUNDS_PER_DAY + 1) * crate::model::ROUNDS_PER_DAY
 }

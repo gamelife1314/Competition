@@ -294,6 +294,17 @@ pub struct BotState {
     /// stand, then remains sealed for the rest of the half.
     pub wall_gate_sealed: bool,
 
+    /// Set the first time the radius-2 ring around the station has no holes.
+    ///
+    /// A ring that has been closed before and has holes NOW is not being
+    /// expanded, it is BREACHED — the robots knocked it down, and every round it
+    /// stays open is a round the station spends taking hits (issue #21: walls
+    /// 17 → 7 and the station 1500 → 20 across D2 night, -30 residual). The
+    /// later-day fortification budget exists to stop wall work from starving the
+    /// economy while the ring is being BUILT; it must not ration its repair.
+    /// Never cleared: the ring can only become breached again.
+    pub ring_ever_complete: bool,
+
     /// Compact telemetry baselines used to report deltas rather than dumping
     /// full protocol payloads every round.
     pub prev_total_score: Option<i64>,
@@ -529,6 +540,7 @@ impl BotState {
         let ended_by_timeout = turn.error_codes.iter().any(|code| *code == 1)
             || turn.round_no >= self.task.timeout_round;
         if ended_by_timeout {
+            self.retire_dead_task_point();
             self.finish_task(false, "timeout");
             return;
         }
@@ -571,6 +583,39 @@ impl BotState {
                 self.finish_task(true, "confirmed_success");
             }
         }
+    }
+
+    /// A session that timed out without ever running a command never had a
+    /// window to use, so the point it was accepted at is dead ground: the
+    /// pioneer is standing in its neighbourhood, the point still reads
+    /// `isValid`, and nothing about the judger's sandbox will have changed by
+    /// the next round. Re-accepting it walks straight back into the same
+    /// timeout — issue #21's four timed-out sessions, each burning its whole
+    /// `timeout_rounds` budget on the identical dead point while a live one sat
+    /// elsewhere on the map.
+    ///
+    /// This is NOT the `cmdRounds=0` premature exit (which stays fixed): the
+    /// judger ended this session first — the refusal is recorded afterwards, and
+    /// only for a point whose session never got a single command out. A session
+    /// that DID run commands hit a working window and is free to be retried.
+    fn retire_dead_task_point(&mut self) {
+        if !self.task.cmd_history.is_empty() {
+            return;
+        }
+        let Some(point) = self.task.point else {
+            return;
+        };
+        let until = crate::brain::task::turn_end_of_day(self.task.accepted_round);
+        crate::log::event(
+            "task_point_retired",
+            serde_json::json!({
+                "session": self.task.session_id,
+                "point": point,
+                "round": self.task.accepted_round,
+                "until": until,
+            }),
+        );
+        self.task_refusals.insert(point, until);
     }
 
     pub fn finish_task(&mut self, success: bool, reason: &str) {

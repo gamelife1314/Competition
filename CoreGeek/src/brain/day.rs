@@ -110,8 +110,17 @@ const SEAL_GRACE: i64 = 8;
 /// blocked cell or a detour. Mirrors the three rounds `preposition_round` keeps.
 const PIONEER_RETREAT_SLACK: i64 = 2;
 
-fn wall_daily_cap(day: i64) -> i64 {
-    if day == 1 {
+/// How many ring cells this day's fortification budget covers.
+///
+/// Day 1 is the build-out: the whole shell is allowed, because an open ring is
+/// what the robots walk through. Later days keep a maintenance budget so wall
+/// work cannot permanently starve the economy — EXCEPT when the ring has been
+/// closed before and is open now. That is a breach, not upkeep: the 6-cell
+/// budget cannot even re-close a ring the night took 10 walls out of, and the
+/// half-spent budget is paid for by the station (issue #21: -30 residual, base
+/// 1500 → 20 HP).
+fn wall_daily_cap(day: i64, ring_ever_complete: bool) -> i64 {
+    if day == 1 || ring_ever_complete {
         D1_WALL_CAP
     } else {
         LATER_WALL_CAP
@@ -133,7 +142,15 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let pairs = night::stable_pairs(turn, state);
     update_wall_gate(turn, state, &pairs);
     let wall_gaps = wall_gaps(turn, state);
-    let wall_cap = wall_daily_cap(turn.day);
+    // Ring integrity, remembered across days. An EMPTY gap list with walls
+    // standing means the shell is closed — the door the economy cut this
+    // morning is filtered out of `wall_gaps` while it is still light, so this
+    // does not read a deliberate door as a hole. From then on `wall_daily_cap`
+    // treats holes as breach repair (see `BotState::ring_ever_complete`).
+    if wall_gaps.is_empty() && !turn.walls().is_empty() {
+        state.ring_ever_complete = true;
+    }
+    let wall_cap = wall_daily_cap(turn.day, state.ring_ever_complete);
     // On D1 carry enough stone to finish the complete radius-2 shell. Later
     // days use a bounded maintenance budget. `stone_demand` counts the GAPS
     // still open, not the shortfall against what is already carried: stone in a
@@ -452,7 +469,8 @@ fn worker_day(
     //    could no longer reach its night weapon — the gate stays open until
     //    everyone has retreated inside, so we never wall ourselves out.
     let on_wall_duty = (Some(role.id) != economy_id || shared_wall_duty)
-        && (state.walled_cells_today.len() as i64) < wall_daily_cap(turn.day);
+        && (state.walled_cells_today.len() as i64)
+            < wall_daily_cap(turn.day, state.ring_ever_complete);
     // (shared_wall_duty is passed in from `plan`: day 1 keeps both workers on
     // the ring until it closes — see the comment there.)
     if role.count_item(STONE) > 0

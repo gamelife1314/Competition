@@ -1287,6 +1287,179 @@ fn task_empty_loop_does_not_end_prematurely() {
 }
 
 #[test]
+fn a_task_that_timed_out_without_running_anything_retires_its_point() {
+    // Issue #21: four of the eight sessions ended in `timeout` with cmdRounds=0
+    // — accept, wait, expire. Nothing about the judger's sandbox changes round
+    // to round, so re-accepting the same point just buys the next timeout: the
+    // point is retired for the rest of the day. This does NOT re-open the
+    // `cmdRounds=0` premature exit (which stays fixed): the judger ended this
+    // session first, and the pioneer is free to take a LIVE point instead.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 3;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "统计 /tmp/selfEvolutionTask 下的文件数量".into();
+    state.task.accepted_round = 10;
+    state.task.timeout_round = 40;
+    state.task.point = Some(Pos { x: 10, y: 10 });
+    state.task.stage = coregeek::state::TaskStage::WaitingDescription;
+
+    let turn = turn_from(world_full(
+        40,
+        vec![pioneer_with(vec![])],
+        vec![],
+        vec![task_point(10, 10, true, 0)],
+        vec![],
+    ));
+    state.observe(&turn);
+    assert!(!state.task.active, "the timeout ends the session");
+    assert_eq!(
+        state.task_refusals.get(&Pos { x: 10, y: 10 }).copied(),
+        Some(130),
+        "the point that never opened a window is refused through end of day 1"
+    );
+}
+
+#[test]
+fn a_task_that_ran_commands_is_not_retired_by_a_timeout() {
+    // The other half: a session that got commands executed hit a WORKING
+    // window, so the point stays available — a timeout there is this script's
+    // failure, not the point's, and the next session may well solve it.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 4;
+    state.task.description = "count files".into();
+    state.task.accepted_round = 10;
+    state.task.timeout_round = 40;
+    state.task.point = Some(Pos { x: 10, y: 10 });
+    state.task.cmd_history = vec!["ls /tmp/selfEvolutionTask".into()];
+    state.task.stage = coregeek::state::TaskStage::Planning;
+
+    let turn = turn_from(world_full(
+        40,
+        vec![pioneer_with(vec![])],
+        vec![],
+        vec![task_point(10, 10, true, 0)],
+        vec![],
+    ));
+    state.observe(&turn);
+    assert!(!state.task.active);
+    assert!(
+        state.task_refusals.is_empty(),
+        "a point whose window worked is still worth re-accepting"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #21: the ring was breached on D2 night (walls 17 → 7) and the station
+// bled from 1500 to 20 with it (-30 residual). Rebuilding it is not "upkeep".
+// ---------------------------------------------------------------------------
+
+/// Every radius-2 ring cell around the 2x2 station at `(sx, sy)`, as walls,
+/// minus the cells in `missing`.
+fn ring_world(round_no: i64, sx: i32, sy: i32, missing: &[(i32, i32)], roles: Vec<Value>) -> Value {
+    // Footprint: x in sx..=sx+1, y in sy-1..=sy (see `station_footprint`), so
+    // the radius-2 shell is the perimeter of x in sx-2..=sx+3, y in sy-3..=sy+2.
+    let (x0, x1, y0, y1) = (sx - 2, sx + 3, sy - 3, sy + 2);
+    let mut walls = Vec::new();
+    let mut id = 20000;
+    for x in x0..=x1 {
+        for y in y0..=y1 {
+            if x != x0 && x != x1 && y != y0 && y != y1 {
+                continue; // interior, not the shell
+            }
+            if missing.contains(&(x, y)) {
+                continue;
+            }
+            id += 1;
+            walls.push(wall(id, x, y, 1, 5000));
+        }
+    }
+    let mut all = vec![station(sx, sy, 1)];
+    all.extend(walls);
+    all.extend(roles);
+    day_world_at(round_no, all, 0, vec![], vec![])
+}
+
+/// A day-2 stone carrier standing one step from the gap at (13, 19).
+fn breach_roles() -> Vec<Value> {
+    vec![json!({
+        "id": 10010, "pos": {"x": 12, "y": 19}, "roleType": "worker",
+        "health": 220, "attackPower": 0, "attackRange": 0,
+        "backPackCapability": 100, "backpack": ["stone"]
+    })]
+}
+
+/// Ring cells left open in the breach fixtures: the one the carrier is next to
+/// (13,19) plus seven others. The gate (13,18) is left standing so the fixture
+/// is about the breach and nothing else.
+fn breach_holes() -> Vec<(i32, i32)> {
+    vec![
+        (13, 19),
+        (8, 17),
+        (9, 17),
+        (10, 17),
+        (11, 17),
+        (12, 17),
+        (8, 22),
+        (9, 22),
+    ]
+}
+
+#[test]
+fn a_breached_ring_is_repaired_past_the_maintenance_budget() {
+    // Day 2, six ring cells already fortified today: the later-day budget is
+    // spent. But the ring WAS closed (day 1 sealed it) and these eight cells
+    // are holes the night punched in it — the crew must keep closing them. The
+    // old 6-cell budget left the ring open with the stations's HP paying for it.
+    let day_two = 135; // day 2, in_day_round 5
+    let complete = turn_from(ring_world(day_two, 10, 20, &[], vec![]));
+    let mut state = BotState::default();
+    coregeek::brain::day::plan(&complete, &mut state);
+    assert!(
+        state.ring_ever_complete,
+        "a ring with no holes is remembered as closed"
+    );
+
+    for cell in 0..6 {
+        state.walled_cells_today.insert(Pos { x: cell, y: 0 });
+    }
+    let breached = turn_from(ring_world(day_two, 10, 20, &breach_holes(), breach_roles()));
+    let plan = coregeek::brain::day::plan(&breached, &mut state);
+    let cmd = plan
+        .commands
+        .get(&10010)
+        .expect("the stone carrier is still on the wall line");
+    assert_eq!(cmd.action, "build", "a breached ring outranks the budget");
+    assert_eq!(
+        cmd.targetPos.as_ref().and_then(|t| t.first()).copied(),
+        Some(Pos { x: 13, y: 19 }),
+        "and it closes the hole it is standing next to"
+    );
+}
+
+#[test]
+fn a_ring_that_was_never_closed_keeps_the_maintenance_budget() {
+    // Same day, same holes, same spent budget — but this ring has never been
+    // closed, so this is build-out and the 6-cell budget still binds. Otherwise
+    // the cap the economy depends on would be gone on every later day.
+    let mut state = BotState::default();
+    for cell in 0..6 {
+        state.walled_cells_today.insert(Pos { x: cell, y: 0 });
+    }
+    let breached = turn_from(ring_world(135, 10, 20, &breach_holes(), breach_roles()));
+    let plan = coregeek::brain::day::plan(&breached, &mut state);
+    assert!(
+        plan.commands.get(&10010).is_none(),
+        "the maintenance budget still stops build-out for the day"
+    );
+    assert!(
+        !state.ring_ever_complete,
+        "a holed ring is not a closed one"
+    );
+}
+
+#[test]
 fn build_prompt_includes_task_environment_path() {
     // The empty-loop came from the LLM guessing `cat task_X.md` in the root
     // directory. The prompt must point it at /tmp/selfEvolutionTask/ and tell
