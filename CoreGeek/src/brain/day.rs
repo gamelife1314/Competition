@@ -5,16 +5,18 @@
 use std::collections::HashSet;
 
 use crate::brain::{economy, night, stand_cells, task, tower_stand_cells, treasure, walk_or_remove_wall, walk_toward, Plan};
-use crate::model::{chebyshev, footprint_distance, station_footprint, Turn, Unit, DAY_ROUNDS, STONE, WEAPON_BUILD_COST};
+use crate::model::{chebyshev, footprint_distance, station_footprint, Turn, Unit, STONE, WEAPON_BUILD_COST};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::{BotState, TaskSession};
 
 /// First day round (in_day_round) when a controller must drop everything and
-/// walk to its tower, so it arrives adjacent (chebyshev <= 1) by the first
-/// night round. `dist - 1` moves are needed (one per round) plus three rounds
-/// of slack for blocked cells, detours and the now-thicker wall line.
+/// walk to its tower, so it arrives adjacent (chebyshev <= 1) BEFORE dusk
+/// (round 55). Dusk is the sell/upgrade window; a tower still operator-less
+/// by then is a gun that never fires — battle pk575060 spent 17/20 night
+/// rounds walking back. `dist - 1` moves are needed (one per round) plus
+/// three rounds of slack for blocked cells, detours and the wall line.
 fn preposition_round(dist: i32) -> i64 {
-    (DAY_ROUNDS - 1 - dist as i64 - 3).max(0)
+    (economy::DUSK_ROUND - 1 - dist as i64 - 3).max(0)
 }
 /// Stones to carry before walking out to the wall line (same as the demo).
 const STONE_BATCH: i64 = 6;
@@ -116,7 +118,29 @@ fn worker_day(
         plan.push(role.id, cmd);
         return;
     }
-    // 3. Build walls (stone) BEFORE weapons: the wall ring protects the base
+    // 3. Pre-position near the assigned tower. This outranks walls, weapons
+    //    and the economy once the deadline hits: a tower with no operator by
+    //    dusk is a weapon that never fires (battle pk575060 lost 17/20 night
+    //    rounds to walking back). Once past the deadline the role locks to the
+    //    tower — late-day economy is deliberately sacrificed for a manned gun.
+    if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == role.id).map(|(_, tower)| *tower) {
+        if let Some(tower) = turn.role_by_id(tower_id) {
+            let dist = chebyshev(role.pos, tower.pos);
+            if turn.in_day_round >= preposition_round(dist) {
+                if dist > 1 {
+                    let stands = tower_stand_cells(turn, tower.pos);
+                    if let Some(cmd) = walk_or_remove_wall(turn, role, &stands, claimed) {
+                        plan.push(role.id, cmd);
+                        return;
+                    }
+                }
+                // Already adjacent (or no walkable step): hold position so a
+                // late mine/wall errand can't drag the role away from the gun.
+                return;
+            }
+        }
+    }
+    // 4. Build walls (stone) BEFORE weapons: the wall ring protects the base
     //    and the roles standing behind it. Capped to a minimal daily ring and
     //    skipped by the dedicated economy worker, so the wall line never
     //    monopolizes the whole day. Building also stops the moment any role
@@ -165,7 +189,7 @@ fn worker_day(
             }
         }
     }
-    // 4. Build weapons (gold) once the wall line is underway — but keep a
+    // 5. Build weapons (gold) once the wall line is underway — but keep a
     //    gold reserve so the main weapon's level-2 upgrade is never starved.
     if economy::may_build_weapon(turn) {
         for (site, kind) in tower_gaps {
@@ -179,14 +203,14 @@ fn worker_day(
             }
         }
     }
-    // 5. Shopping (dedicated buyer) — upgrades come after survival.
+    // 6. Shopping (dedicated buyer) — upgrades come after survival.
     if buyer_id == Some(role.id) && !shopping.is_empty() {
         if let Some(cmd) = buyer_flow(turn, role, shopping, claimed) {
             plan.push(role.id, cmd);
             return;
         }
     }
-    // 6. Mine the nearest ore (stone first while walls are wanted). Mining
+    // 7. Mine the nearest ore (stone first while walls are wanted). Mining
     //    pauses during dusk so the ore we hold is converted to gold instead.
     if turn.in_day_round < economy::DUSK_ROUND && !role.backpack_full() {
         if let Some(cmd) = mine_flow(turn, state, role, stone_demand, claimed) {
@@ -194,27 +218,11 @@ fn worker_day(
             return;
         }
     }
-    // 7. Sell ore for gold.
+    // 8. Sell ore for gold.
     if economy::should_sell(turn, state, role, stone_demand) {
         if let Some(cmd) = sell_flow(turn, state, role, stone_demand, claimed) {
             plan.push(role.id, cmd);
             return;
-        }
-    }
-    // 8. Pre-position near the assigned tower only in the final rounds, so
-    //    the first night round is spent firing instead of walking. Use the
-    //    inner stand cells (never walled over) and demolish a wall of ours if
-    //    the ring has already sealed us out.
-    if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == role.id).map(|(_, tower)| *tower) {
-        if let Some(tower) = turn.role_by_id(tower_id) {
-            let dist = chebyshev(role.pos, tower.pos);
-            if dist > 1 && turn.in_day_round >= preposition_round(dist) {
-                let stands = tower_stand_cells(turn, tower.pos);
-                if let Some(cmd) = walk_or_remove_wall(turn, role, &stands, claimed) {
-                    plan.push(role.id, cmd);
-                    return;
-                }
-            }
         }
     }
     // 9. Repair walls damaged overnight (cheap: 10g per fix) when standing
@@ -250,35 +258,41 @@ fn pioneer_day(
         plan.push(pioneer.id, cmd);
         return;
     }
-    // 3. Accept a fresh task when a point is ready (walk there first).
+    // 3. Pre-position near the assigned tower once the deadline hits: the
+    //    pioneer walks to its tower BEFORE accepting a new task or chasing
+    //    treasure, so it is not stranded far away when night falls. Once the
+    //    deadline passes the role locks to the tower (wall demolition stays
+    //    worker-only, so only walk_toward is used here).
+    if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == pioneer.id).map(|(_, tower)| *tower) {
+        if let Some(tower) = turn.role_by_id(tower_id) {
+            let dist = chebyshev(pioneer.pos, tower.pos);
+            if turn.in_day_round >= preposition_round(dist) {
+                if dist > 1 {
+                    let stands = tower_stand_cells(turn, tower.pos);
+                    if let Some(cmd) = walk_toward(turn, pioneer, &stands, claimed) {
+                        plan.push(pioneer.id, cmd);
+                        return;
+                    }
+                }
+                // Already adjacent (or no walkable step): hold at the tower.
+                return;
+            }
+        }
+    }
+    // 4. Accept a fresh task when a point is ready (walk there first).
     if let Some(cmd) = state.next_task_point(turn, pioneer, claimed) {
         plan.push(pioneer.id, cmd);
         return;
     }
-    // 4. Vouchers in the backpack.
+    // 5. Vouchers in the backpack.
     if let Some(cmd) = voucher_flow(turn, pioneer, claimed) {
         plan.push(pioneer.id, cmd);
         return;
     }
-    // 5. Treasure hunt.
+    // 6. Treasure hunt.
     if let Some(cmd) = treasure::plan_pioneer(turn, state, pioneer, claimed, plan) {
         plan.push(pioneer.id, cmd);
         return;
-    }
-    // 6. Pre-position at the assigned tower (distance-aware deadline) so the
-    //    first night round is spent firing, not walking. The pioneer uses the
-    //    inner stand cells (never walled over); wall demolition stays worker-only.
-    if let Some(tower_id) = pairs.iter().find(|(controller, _)| *controller == pioneer.id).map(|(_, tower)| *tower) {
-        if let Some(tower) = turn.role_by_id(tower_id) {
-            let dist = chebyshev(pioneer.pos, tower.pos);
-            if dist > 1 && turn.in_day_round >= preposition_round(dist) {
-                let stands = tower_stand_cells(turn, tower.pos);
-                if let Some(cmd) = walk_toward(turn, pioneer, &stands, claimed) {
-                    plan.push(pioneer.id, cmd);
-                    return;
-                }
-            }
-        }
     }
     // 7. Loiter next to a task point so we catch refreshes immediately.
     loiter_at_task_point(turn, pioneer, claimed, plan);
@@ -308,6 +322,7 @@ impl BotState {
                 accepted_round: turn.round_no,
                 timeout_round: turn.round_no + timeout,
                 point: Some(candidate.pos),
+                task_type: candidate.task_type.clone(),
                 ..Default::default()
             };
             return Some(RoleCommand::accept_task());
@@ -563,11 +578,15 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
             _ => {}
         }
     }
-    let kinds = ["gatling", "railgun", "rocket"];
+    // Build order: gatling (cheap, fast) → rocket (AOE vs. night waves) →
+    // railgun (single-target snipe). Battle pk575060 was lost to an enemy
+    // gatling+rocket+railgun line while we fielded only gatling+railgun —
+    // the missing rocket's splash was the difference.
+    let build_order: [(usize, &str); 3] = [(0, "gatling"), (2, "rocket"), (1, "railgun")];
     let mut gaps: Vec<(Pos, String)> = Vec::new();
     let mut used: HashSet<Pos> = HashSet::new();
-    for (idx, kind) in kinds.iter().enumerate() {
-        if have[idx] > 0 {
+    for (have_idx, kind) in build_order {
+        if have[have_idx] > 0 {
             continue;
         }
         let site = cells.iter().copied().find(|pos| {
@@ -603,9 +622,14 @@ pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
     ];
     let mut cells: Vec<Pos> = ring_cells(&footprint, 3);
     cells.extend(ring_cells(&footprint, 2));
-    // Furthest from the gate first: the open corridor is the LAST thing a
-    // closing ring would block, so this order keeps roles able to return.
-    cells.sort_by_key(|pos| std::cmp::Reverse(chebyshev(*pos, gate[0])));
+    // U-shaped build order: furthest-from-the-gate cells go up first (the far
+    // wall and the two flanks of the U), the cells nearest the gate last — the
+    // entrance corridor is the last thing a closing U would block, so roles
+    // can always return. A deterministic tiebreak (x then y) keeps the flanks
+    // growing together instead of one side racing ahead.
+    cells.sort_by_key(|pos| {
+        (std::cmp::Reverse(chebyshev(*pos, gate[0])), pos.x, pos.y)
+    });
 
     let existing_walls: HashSet<Pos> = turn.walls().iter().map(|wall| wall.pos).collect();
     let occupied: HashSet<Pos> =

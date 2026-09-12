@@ -56,8 +56,9 @@ fn result_parsing() {
 
     let output = "querying...\nANSWER: {\"temp\": 21}\n[TRUNCATED]";
     assert_eq!(extract_answer(output).as_deref(), Some("{\"temp\": 21}"));
+    // Raw stdout with no ANSWER marker is exploratory output, not an answer.
     let output = "only line";
-    assert_eq!(extract_answer(output).as_deref(), Some("only line"));
+    assert_eq!(extract_answer(output), None);
     assert_eq!(extract_answer(""), None);
 }
 

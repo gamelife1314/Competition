@@ -82,7 +82,7 @@ pub fn plan_pioneer(turn: &Turn, state: &mut BotState, pioneer: &Unit, plan: &mu
         TaskStage::Planning => {
             // SOP fast path: a cached script for a similar task runs first.
             if state.task.cmd_history.is_empty() {
-                if let Some(sop) = state.find_sop(&state.task.description.clone()) {
+                if let Some(sop) = state.find_sop(&state.task.task_type, &state.task.description) {
                     let script = sop.script.clone();
                     state.task.stage = TaskStage::HavePlan { cmd: script };
                     return plan_pioneer(turn, state, pioneer, plan);
@@ -140,6 +140,7 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
     prompt.push_str("1. 给出可直接执行的命令或脚本（放在 ```bash 或 ```python 代码块中），完成全部子任务。\n");
     prompt.push_str("2. 脚本最后一行必须打印 `ANSWER: <最终答案>`，多字段答案用 JSON 表示。\n");
     prompt.push_str("3. 脚本要可复用：把可变参数（如城市名）写在开头变量里。\n");
+    prompt.push_str("4. 尽量在一个脚本内完成全部步骤（find 找文件 → cat 读取 → 计算 → 打印 ANSWER），不要分多轮试探；只有带 `ANSWER:` 标记的输出才会被当作答案提交。\n");
     if !state.task.result_history.is_empty() {
         prompt.push_str("\n上次执行输出（请修正错误）：\n");
         let start = state.task.result_history.len().saturating_sub(2);
@@ -231,8 +232,9 @@ pub fn strip_status_line(result: &str) -> &str {
     result
 }
 
-/// Find the answer: prefer an explicit "ANSWER:" marker line, else the last
-/// non-empty output line.
+/// Find the answer: only an explicit "ANSWER:" (or "答案:") marker line is
+/// ever an answer. Raw stdout — a `find`/`ls` file listing, a traceback, any
+/// unmarked line — is exploratory output and must NOT be submitted.
 pub fn extract_answer(output: &str) -> Option<String> {
     let trimmed = output.trim_end_matches("[TRUNCATED]").trim();
     if trimmed.is_empty() {
@@ -251,12 +253,6 @@ pub fn extract_answer(output: &str) -> Option<String> {
             if !answer.is_empty() {
                 return Some(answer.to_string());
             }
-        }
-    }
-    for line in trimmed.lines().rev() {
-        let line = line.trim();
-        if !line.is_empty() && !line.starts_with("Traceback") {
-            return Some(truncate(line, 400));
         }
     }
     None

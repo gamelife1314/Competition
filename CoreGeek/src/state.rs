@@ -49,6 +49,7 @@ pub struct TaskSession {
     pub accepted_round: i64,
     pub timeout_round: i64,
     pub point: Option<Pos>,
+    pub task_type: String,
     pub description: String,
     pub description_round: i64,
     pub stage: TaskStage,
@@ -60,6 +61,7 @@ pub struct TaskSession {
 
 #[derive(Debug, Clone, Default)]
 pub struct SopEntry {
+    pub task_type: String,
     pub keywords: Vec<String>,
     pub script: String,
 }
@@ -355,7 +357,7 @@ impl BotState {
         if keywords.is_empty() {
             return None;
         }
-        Some(SopEntry { keywords, script })
+        Some(SopEntry { task_type: self.task.task_type.clone(), keywords, script })
     }
 
     /// Cache the last executed task command as an SOP (deduped) once it has
@@ -375,7 +377,16 @@ impl BotState {
         }
     }
 
-    pub fn find_sop(&self, description: &str) -> Option<&SopEntry> {
+    pub fn find_sop(&self, task_type: &str, description: &str) -> Option<&SopEntry> {
+        // Exact task-type reuse first: the same self-evolution task category
+        // runs the same kind of script, so its cached SOP is trusted without a
+        // keyword comparison (this lets a second 自进化类1 task reuse the first
+        // one's working script immediately).
+        if !task_type.is_empty() {
+            if let Some(entry) = self.sop_cache.iter().rev().find(|entry| entry.task_type == task_type) {
+                return Some(entry);
+            }
+        }
         let keywords = keywords_of(description);
         if keywords.is_empty() {
             return None;

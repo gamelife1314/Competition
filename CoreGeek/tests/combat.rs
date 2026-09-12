@@ -921,3 +921,66 @@ fn build_prompt_includes_task_environment_path() {
     assert!(prompt.contains("find /tmp/selfEvolutionTask/"), "prompt suggests listing files first");
     assert!(prompt.contains(&state.task.description), "prompt still carries the task description");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #9: pre-positioning before dusk, rocket second, strict answer parsing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worker_prepositions_to_tower_before_dusk() {
+    // Round 50 (in_day 49): a worker 15 cells from its tower must drop the
+    // adjacent mine and walk, so it is adjacent BEFORE dusk (round 55). The old
+    // deadline (66 - dist) would have left it mining here and walking back all
+    // night — the cause of the 17/20 fired:false rounds in battle pk575060.
+    let turn = turn_from(day_world_at(
+        50,
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker(10010, 25, 25),
+        ],
+        0,
+        vec![],
+        vec![zone(25, 24, "iron")], // adjacent, tempting economy
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("worker acts");
+    assert_eq!(cmd.action, "move", "worker prepositions toward its tower before dusk");
+    assert_ne!(cmd.action, "collect", "far worker ignores the adjacent mine");
+}
+
+#[test]
+fn rocket_is_built_second() {
+    // Battle pk575060 fielded only gatling+railgun while the enemy had
+    // gatling+rocket+railgun; the missing rocket's AOE splash was decisive.
+    // The build order must therefore be gatling → rocket → railgun.
+    let turn = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
+    let state = BotState::default();
+    let gaps = coregeek::brain::day::tower_gaps(&turn, &state);
+    let kinds: Vec<&str> = gaps.iter().map(|(_, kind)| kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        vec!["gatling", "rocket", "railgun"],
+        "tower build order is gatling → rocket → railgun"
+    );
+}
+
+#[test]
+fn exploratory_cmd_output_is_not_an_answer() {
+    // `find`/`ls` stdout is exploration, not a solution. A cmd result that is a
+    // plain file listing must NOT be submitted as an answer — the task goes
+    // back to Planning for another script instead of scoring a wrong answer.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.stage = coregeek::state::TaskStage::WaitingCmdResult { attempts: 0 };
+    coregeek::brain::task::on_cmd_result(
+        &mut state,
+        "[exitCode:0]\ntask_1.md\ninput.txt\n/tmp/selfEvolutionTask/data.csv",
+    );
+    assert!(
+        matches!(state.task.stage, coregeek::state::TaskStage::Planning),
+        "find/ls output must not be treated as an answer"
+    );
+    assert!(state.task.best_answer.is_empty(), "no answer was extracted");
+}

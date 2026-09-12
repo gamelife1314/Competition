@@ -227,7 +227,10 @@ pub fn should_sell(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i64
         return true;
     }
     let half_full = role.capacity > 0 && role.backpack.len() as i64 * 2 >= role.capacity;
-    if role.backpack_full() || ores >= SELL_BATCH || half_full {
+    // A pack of 15+ items forces a vendor run regardless of ore type — a
+    // nearly-full miner that keeps digging for "one more stack" stalls gold.
+    let force_sell = role.backpack.len() as i64 >= 15;
+    if role.backpack_full() || ores >= SELL_BATCH || half_full || force_sell {
         return true;
     }
     // Surplus stones: the wall line is complete, convert dead weight to gold.
