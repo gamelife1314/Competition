@@ -262,12 +262,36 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         if plan.commands.contains_key(&role.id) {
             continue;
         }
+        // …except a pioneer holding a task. It is not idle: it is standing
+        // exactly where 任务书 5.3 requires it to stand. That rule lists
+        // "离开己方任务点周围一格内" among the four ways a self-evolution task
+        // ENDS, and `plan_pioneer` emits no command for most of the session
+        // (waiting for the LLM, for the sandbox verdict, for the submission
+        // verdict), so this backstop used to walk the pioneer home the round
+        // after it accepted. The judger ended the task on that first step and
+        // refused every later `executeCmd` with "[JUDGER_ERROR] executeCmd
+        // 仅在自进化任务执行期间可用" — issue #17's two sessions, both burned
+        // to zero while the opponent took 345 from four completed tasks.
+        if holds_task_point(state, role) {
+            continue;
+        }
         if let Some(cmd) = fallback_toward_station(turn, role) {
             plan.push(role.id, cmd);
         }
     }
 
     plan
+}
+
+/// Is this role pinned to a task point this round?
+///
+/// Only the pioneer can hold a self-evolution task (`validate` admits
+/// `acceptTask` for pioneers alone), and only while the task is live with a
+/// point to hold. A session whose point was never delivered still freezes the
+/// role: it is mid-accept, and stepping away would end the task before it
+/// started.
+fn holds_task_point(state: &BotState, role: &Unit) -> bool {
+    state.task.active && role.kind == crate::model::UnitKind::Pioneer
 }
 
 /// Last resort for a role that produced no command: close on the station.
@@ -661,6 +685,23 @@ fn pioneer_day(
     if state.task.active {
         if let Some(cmd) = task::plan_pioneer(turn, state, pioneer, plan) {
             plan.push(pioneer.id, cmd);
+            return;
+        }
+        // Nothing to send this round — which is most rounds. HOLD THE POINT:
+        // 任务书 5.3 ends the task on "离开己方任务点周围一格内", so standing
+        // still is the job, and the one move still worth making is the one that
+        // puts the pioneer back inside that cell after something nudged it off.
+        // The `plan` backstop is blocked from walking it home by
+        // `holds_task_point`; without that pairing the pioneer was walked off
+        // the point the round after it accepted and issue #17's sessions died
+        // with every `executeCmd` refused.
+        if let Some(point) = state.task.point {
+            if chebyshev(pioneer.pos, point) > 1 {
+                let stands = stand_cells(turn, point);
+                if let Some(cmd) = walk_toward(turn, pioneer, &stands, claimed) {
+                    plan.push(pioneer.id, cmd);
+                }
+            }
         }
         return;
     }

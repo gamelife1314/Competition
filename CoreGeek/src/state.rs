@@ -87,6 +87,17 @@ pub struct TaskSession {
     /// into it and burned both timeouts to zero points — so two in a row end
     /// the session locally instead of re-planning into the same closed door.
     pub judger_window_errors: i32,
+    /// Round in which a fresh `llmResp` was consumed. `executeCmd` sent in
+    /// that same round comes back
+    /// `[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用` — see
+    /// `brain::task::plan_pioneer` for the evidence — so the command is held
+    /// back until the round after it.
+    pub llm_resp_round: Option<i64>,
+    /// The command whose sandbox run produced an answer. That is the only
+    /// script worth caching for the next task of the same kind: it demonstrably
+    /// reached the sandbox and ran to completion, whereas an unrun command (a
+    /// `[JUDGER_ERROR]`, a timeout) or an answer-less run teaches nothing.
+    pub sop_cmd: Option<String>,
 }
 
 /// A cached, parameterised script for one task fingerprint. The body keeps
@@ -441,6 +452,10 @@ impl BotState {
                 && cmd_key != self.task.cmd_consumed_request_round;
             if llm_new {
                 self.task.llm_consumed_request_round = llm_key;
+                // The round the ANSWER arrives in is the one round the judger
+                // will not run a command for (see `task::plan_pioneer`), so it
+                // has to be remembered: a round number is all the planner gets.
+                self.task.llm_resp_round = Some(turn.round_no);
                 crate::log::event(
                     "llm_resp",
                     serde_json::json!({"session": self.task.session_id, "requestRound": llm_key, "chars": turn.llm_resp.len()}),
@@ -572,16 +587,26 @@ impl BotState {
                 }),
             );
         }
-        // A lack of an error is not proof that a script worked. Cache only
-        // after the multi-signal success probe confirms completion.
-        if success {
+        // A lack of an error is not proof that a script worked, so the
+        // multi-signal success probe still owns the cache. But a script the
+        // sandbox RAN and answered with is reusable whether or not the answer
+        // was accepted — and that reuse is the whole point of 自进化: a session
+        // that has to spend an LLM round-trip before its first command cannot
+        // finish inside the 2-15 round timeouts of issues #18/#19. Only the
+        // command that actually produced an answer qualifies (`sop_cmd`), never
+        // one that was refused or timed out.
+        if success || self.task.sop_cmd.is_some() {
             self.cache_sop();
         }
         self.task = TaskSession::default();
     }
 
     fn extract_sop(&self) -> Option<SopEntry> {
-        let script = self.task.cmd_history.last()?.clone();
+        let script = self
+            .task
+            .sop_cmd
+            .clone()
+            .or_else(|| self.task.cmd_history.last().cloned())?;
         if script.is_empty() {
             return None;
         }

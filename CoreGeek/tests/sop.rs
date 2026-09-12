@@ -37,6 +37,120 @@ fn task_world(round_no: i64) -> Value {
     })
 }
 
+/// `task_world` with the LLM's answer delivered in this round.
+fn llm_world(round_no: i64, resp: &str) -> Value {
+    let mut world = task_world(round_no);
+    world["llmResp"] = json!(resp);
+    world
+}
+
+#[test]
+fn the_command_waits_out_the_round_the_llm_answers() {
+    // Issues #18/#19: six sessions per match, every command back as
+    // `[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用`, first command to
+    // last, while `phaseTask` carried the task and the judger timed the session
+    // out on its own clock — so the task WAS running and the refusal was never
+    // "no task". The loop fired the command in exactly one phase of the round
+    // cycle, the round carrying the LLM's answer, and every re-plan walked
+    // straight back into it. The answer round is not an execution round: the
+    // command goes out the round after, which costs one round and is the only
+    // round of the cycle that was never being probed.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 1;
+    state.task.timeout_round = 101;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "统计 /tmp/selfEvolutionTask 下的文件数量".into();
+    state.task.stage = TaskStage::Planning;
+    state.task.llm_request_round = Some(5);
+
+    let turn = turn_from(llm_world(6, "```bash\nls /tmp/selfEvolutionTask | wc -l\n```"));
+    state.observe(&turn);
+    assert!(
+        matches!(state.task.stage, TaskStage::HavePlan { .. }),
+        "the answer is turned into a plan, got {:?}",
+        state.task.stage
+    );
+
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut plan = Plan::default();
+    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    assert!(
+        plan.execute_cmd.is_none(),
+        "no command is sent while the LLM's answer is the round's payload: {:?}",
+        plan.execute_cmd
+    );
+    assert!(state.task.cmd_history.is_empty(), "nothing was executed");
+    assert!(
+        matches!(state.task.stage, TaskStage::HavePlan { .. }),
+        "the plan is held, not discarded"
+    );
+
+    // The next round has no answer in it: this is the round the sandbox runs in.
+    let turn = turn_from(task_world(7));
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut plan = Plan::default();
+    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    assert_eq!(
+        plan.execute_cmd.as_deref(),
+        Some("ls /tmp/selfEvolutionTask | wc -l"),
+        "the held command goes out one round later"
+    );
+    assert_eq!(state.task.cmd_history.len(), 1, "and it is recorded once");
+    assert!(matches!(
+        state.task.stage,
+        TaskStage::WaitingCmdResult { .. }
+    ));
+}
+
+#[test]
+fn a_command_the_sandbox_ran_is_reused_even_when_its_answer_was_rejected() {
+    // 自进化 is reuse, and reuse is what makes the short tasks winnable: a
+    // session that must spend an LLM round-trip before its first command cannot
+    // finish inside the 2-15 round timeouts of issues #18/#19 at all. What
+    // earns the cache is proof that the sandbox RAN the script — an
+    // `[exitCode:N]` verdict on a run that printed an answer — never the mere
+    // absence of an error, which is also what a command that never ran looks
+    // like.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "count files in directory".into();
+    state.task.cmd_history = vec!["ls | wc -l".into()];
+    state.task.stage = TaskStage::WaitingCmdResult { attempts: 0 };
+    state.task.cmd_request_round = Some(4);
+    coregeek::brain::task::on_cmd_result(&mut state, "[exitCode:0]\nANSWER: 41");
+    assert_eq!(
+        state.task.sop_cmd.as_deref(),
+        Some("ls | wc -l"),
+        "the command that answered is the one the sandbox ran"
+    );
+    state.finish_task(false, "timeout");
+    assert!(
+        !state.sop_cache.is_empty(),
+        "a script the sandbox ran is worth reusing next task"
+    );
+
+    // A session whose only verdicts were refusals caches nothing.
+    let mut refused = BotState::default();
+    refused.task.active = true;
+    refused.task.task_type = "自进化类1".into();
+    refused.task.description = "count files in directory".into();
+    refused.task.cmd_history = vec!["ls | wc -l".into()];
+    refused.task.stage = TaskStage::WaitingCmdResult { attempts: 0 };
+    refused.task.cmd_request_round = Some(4);
+    coregeek::brain::task::on_cmd_result(
+        &mut refused,
+        "[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用",
+    );
+    refused.finish_task(false, "timeout");
+    assert!(
+        refused.sop_cache.is_empty(),
+        "a command that never ran teaches the next task nothing"
+    );
+}
+
 fn sop(task_type: &str, keywords: &[&str], template: &str) -> SopEntry {
     SopEntry {
         task_type: task_type.into(),

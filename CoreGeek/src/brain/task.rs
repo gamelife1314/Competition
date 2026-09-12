@@ -92,6 +92,10 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
             serde_json::json!({"exit": code, "answer": truncate(&answer, 120)}),
         );
         state.task.best_answer = answer.clone();
+        // The command that just answered is the one the sandbox executed, and
+        // therefore the one worth reusing: it is `cmd_history`'s last entry,
+        // because a session sends one command and waits for its verdict.
+        state.task.sop_cmd = state.task.cmd_history.last().cloned();
         state.task.stage = TaskStage::HaveAnswer { answer };
     } else {
         // No answer found: ask the LLM again with the failure context
@@ -156,6 +160,30 @@ pub fn plan_pioneer(
             None
         }
         TaskStage::HavePlan { cmd } => {
+            // THE ROUND THE LLM ANSWERS IS NOT AN EXECUTION ROUND.
+            //
+            // Issues #18/#19 (and #17 before them) all report the same verdict
+            // on every command: `[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间
+            // 可用`, from the first command of the session to the last, in match
+            // after match, while `phaseTask` carried the task text and the judger
+            // timed the session out on its own clock — so the task WAS running
+            // and the refusal is not "no task". The one session that ever got a
+            // sandbox answer back (issue #15's r=39 `task_answer_found`) is the
+            // clue: it is the one that reached this arm without an `llmResp` in
+            // the same round, via the SOP fast path.
+            //
+            // Our loop was built to fire the command in exactly the round the
+            // answer arrives — prompt at r, `llmResp` at r+1, `executeCmd` at
+            // r+1 — which is the one round the judger does not accept it in.
+            // Every re-plan therefore walked back into the same shut door, and
+            // nothing about the script could ever change that.
+            //
+            // So the command waits one round. It costs a single round out of a
+            // 2-15 round task, and it means the very first command of a session
+            // now lands in the phase of the cycle the sandbox is open in.
+            if state.task.llm_resp_round == Some(turn.round_no) {
+                return None;
+            }
             if plan.execute_cmd.is_none() {
                 state.task.cmd_history.push(truncate(&cmd, 800));
                 state.task.cmd_request_round = Some(turn.round_no);
