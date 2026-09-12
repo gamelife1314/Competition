@@ -49,6 +49,9 @@ const LATER_WALL_CAP: i64 = 6;
 /// close the last hole in the ring. Long enough for a round trip from any
 /// tower post, short enough that the gun is manned again well before night.
 const SEAL_GRACE: i64 = 8;
+/// Slack on top of the walk home before the pioneer's dusk recall fires, for a
+/// blocked cell or a detour. Mirrors the three rounds `preposition_round` keeps.
+const PIONEER_RETREAT_SLACK: i64 = 2;
 
 fn wall_daily_cap(day: i64) -> i64 {
     if day == 1 {
@@ -520,18 +523,32 @@ fn pioneer_day(
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
 ) {
-    // 1. Active tasks yield at the hard dusk defense checkpoint when the
-    // pioneer is required to operate a tower. This mirrors night arbitration
-    // and releases it early enough to traverse the wall gate before sealing.
-    if state.task.active
-        && turn.in_day_round >= economy::DUSK_ROUND
-        && night::operator_shortage(turn)
-    {
+    // 0. Dusk recall. The gate seal waits for EVERY role to be inside the ring,
+    //    and the pioneer is the one role whose work — task points, treasure,
+    //    the shop — is always outside it. Issue #15: `wall_gate_open:
+    //    controllers_not_retreated` for fifteen straight rounds while the
+    //    pioneer accepted a fresh task at r=58 and again at r=69, one round
+    //    before nightfall; the gate cell was never walled, the ring kept a
+    //    robot-sized hole all night, and the controllers standing behind it
+    //    were picked off one at a time. The recall round is measured from where
+    //    the pioneer IS, so it tightens as the day goes on and an errand
+    //    accepted at r=40 is not still being walked at r=54.
+    //
+    //    This subsumes the older "abort at dusk when a tower would go unmanned"
+    //    checkpoint: it fires strictly earlier (the walk home is already
+    //    subtracted) and for every pioneer, paired or not.
+    let recalled = turn.in_day_round >= pioneer_recall_round(turn, pioneer);
+    if state.task.active && recalled {
         crate::log::event(
             "task_defense_abort",
-            serde_json::json!({"round": turn.round_no, "session": state.task.session_id, "reason": "dusk_operator_shortage"}),
+            serde_json::json!({
+                "round": turn.round_no,
+                "session": state.task.session_id,
+                "dayRound": turn.in_day_round,
+                "reason": "dusk_recall",
+            }),
         );
-        state.finish_task(false, "dusk_defense");
+        state.finish_task(false, "dusk_recall");
     }
     if state.task.active {
         if let Some(cmd) = task::plan_pioneer(turn, state, pioneer, plan) {
@@ -575,12 +592,17 @@ fn pioneer_day(
             }
         }
     }
-    // 4. Accept a fresh task when a point is ready (walk there first).
-    if let Some(cmd) = state.next_task_point(turn, pioneer, claimed) {
-        plan.push(pioneer.id, cmd);
-        return;
+    // 4. Accept a fresh task when a point is ready (walk there first). Not
+    //    once the dusk recall has fired: a task accepted now is a task that
+    //    keeps the pioneer at the point through the seal.
+    if !recalled {
+        if let Some(cmd) = state.next_task_point(turn, pioneer, claimed) {
+            plan.push(pioneer.id, cmd);
+            return;
+        }
     }
-    // 5. Vouchers in the backpack.
+    // 5. Vouchers in the backpack. Our own buildings, so this stays available
+    //    after the recall — it is an errand on the way home, not out of it.
     if let Some(cmd) = voucher_flow(turn, pioneer, claimed) {
         plan.push(pioneer.id, cmd);
         return;
@@ -590,15 +612,20 @@ fn pioneer_day(
         plan.push(pioneer.id, cmd);
         return;
     }
-    // 6. Treasure hunt.
-    if let Some(cmd) = treasure::plan_pioneer(turn, state, pioneer, claimed, plan) {
-        plan.push(pioneer.id, cmd);
-        return;
+    // 6. Treasure hunt. Outdoors, so the same cutoff as the task point.
+    if !recalled {
+        if let Some(cmd) = treasure::plan_pioneer(turn, state, pioneer, claimed, plan) {
+            plan.push(pioneer.id, cmd);
+            return;
+        }
     }
-    // 7. Loiter next to a task point so we catch refreshes immediately.
-    loiter_at_task_point(turn, pioneer, claimed, plan);
-    if plan.commands.contains_key(&pioneer.id) {
-        return;
+    // 7. Loiter next to a task point so we catch refreshes immediately — until
+    //    the recall round, after which loitering IS the thing being recalled.
+    if !recalled {
+        loiter_at_task_point(turn, pioneer, claimed, plan);
+        if plan.commands.contains_key(&pioneer.id) {
+            return;
+        }
     }
     // 7b. No task point to wait at either: run the economy. With nothing to
     //     fight for the pioneer used to walk to the station and stand there for
@@ -676,6 +703,22 @@ impl BotState {
         let stands = stand_cells(turn, candidate.pos);
         walk_toward(turn, pioneer, &stands, claimed)
     }
+}
+
+/// Day-round from which the pioneer stops taking on anything outside the wall
+/// line and heads home: `DUSK_ROUND` less the walk back, less a small slack.
+///
+/// See the dusk recall in `pioneer_day` for why this exists. The walk is
+/// measured from the pioneer's CURRENT cell, so the deadline is a rolling one
+/// — the further out it has drifted, the earlier it has to turn around, and an
+/// errand it cannot finish and still be home by dusk is never started.
+fn pioneer_recall_round(turn: &Turn, pioneer: &Unit) -> i64 {
+    let walk = crate::brain::interior_cells(turn)
+        .iter()
+        .map(|cell| chebyshev(pioneer.pos, *cell))
+        .min()
+        .unwrap_or(0) as i64;
+    (economy::DUSK_ROUND - 1 - walk - PIONEER_RETREAT_SLACK).max(0)
 }
 
 fn loiter_at_task_point(turn: &Turn, pioneer: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) {

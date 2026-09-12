@@ -285,3 +285,133 @@ fn positional_parameter_binding_prefers_the_first_mention() {
     );
     let _ = Pos { x: 0, y: 0 };
 }
+
+// ---------------------------------------------------------------------------
+// Issue #15: what the judger is actually handed, and when a task is dropped.
+// ---------------------------------------------------------------------------
+
+/// Daytime world with a pioneer and an active task session, ready for
+/// `plan_pioneer` to drive one round of the answer stage.
+fn task_at(round_no: i64, description: &str, answer: &str) -> (Turn, BotState) {
+    let turn = turn_from(task_world(round_no));
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 1;
+    state.task.timeout_round = 500;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = description.into();
+    state.task.stage = TaskStage::HaveAnswer {
+        answer: answer.into(),
+    };
+    (turn, state)
+}
+
+#[test]
+fn a_single_field_wrapper_is_unwrapped_before_submission() {
+    use coregeek::brain::task::submittable_answer;
+
+    // Issue #15 lost a task whose sandbox had already printed the right value:
+    // the answer we submitted was `{"token":"fc1e78eb2a5a"}` while the judger
+    // compared against the bare `fc1e78eb2a5a`. Our own prompt asks for JSON
+    // only to carry *multiple* fields, so a one-key wrapper around a scalar is
+    // our formatting, not the task's — unless the task text names that key, in
+    // which case the wrapper is exactly what was asked for.
+    assert_eq!(
+        submittable_answer("从沙箱中取出访问令牌", "{\"token\":\"fc1e78eb2a5a\"}"),
+        "fc1e78eb2a5a"
+    );
+    assert_eq!(submittable_answer("统计行数", "{\"count\":42}"), "42");
+    assert_eq!(submittable_answer("是否通过", "{\"ok\":true}"), "true");
+    // The task named the field: keep the shape it asked for.
+    assert_eq!(
+        submittable_answer("输出 token", "{\"token\":\"fc1e78eb2a5a\"}"),
+        "{\"token\":\"fc1e78eb2a5a\"}"
+    );
+    // Two fields is a real JSON answer, never unwrapped.
+    assert_eq!(
+        submittable_answer("统计", "{\"name\":\"a.txt\",\"count\":3}"),
+        "{\"name\":\"a.txt\",\"count\":3}"
+    );
+    // Non-JSON and empty scalars pass through untouched.
+    assert_eq!(submittable_answer("统计", "fc1e78eb2a5a"), "fc1e78eb2a5a");
+    assert_eq!(
+        submittable_answer("统计", "{\"token\":\"\"}"),
+        "{\"token\":\"\"}"
+    );
+}
+
+#[test]
+fn the_submitted_payload_is_the_bare_value_the_judger_compares() {
+    // The same thing one layer up: what reaches `submitAnswer` is the unwrapped
+    // value, so the logged payload and the judged payload cannot disagree.
+    let (turn, mut state) = task_at(6, "从沙箱中取出访问令牌", "{\"token\":\"fc1e78eb2a5a\"}");
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut plan = Plan::default();
+    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan)
+        .expect("a single-field answer still submits");
+    assert_eq!(cmd.action, "submitAnswer");
+    let payload = cmd
+        .taskAnswer
+        .as_ref()
+        .expect("submitAnswer carries the answer");
+    assert_eq!(
+        payload, "fc1e78eb2a5a",
+        "the judger compares against the bare value, not our JSON wrapper"
+    );
+}
+
+#[test]
+fn a_repeatedly_rejected_answer_abandons_the_task() {
+    use coregeek::state::MAX_WRONG_ANSWERS;
+
+    // Issue #15: the opponent "直接放弃并把开拓者投入防御" while all five of our
+    // sessions burned their whole timeout on a task that had already been
+    // judged wrong. Three rejections is the evidence; the fourth attempt is not
+    // the one, and the pioneer is worth more on the wall line.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 1;
+    state.task.timeout_round = 500;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "统计 /tmp/selfEvolutionTask 下的文件数量".into();
+
+    let rejected = |round_no: i64| {
+        turn_from(json!({
+            "roundNo": round_no,
+            "mapInfo": {"width": 41, "height": 32, "zones": []},
+            "teamOur": {
+                "type": "challenger", "goldNum": 0, "totalScore": 0, "playerTasks": [],
+                "roles": [{
+                    "id": 10011, "pos": {"x": 14, "y": 14}, "roleType": "pioneer",
+                    "health": 200, "attackPower": 0, "attackRange": 0,
+                    "backPackCapability": 40, "backpack": []
+                }]
+            },
+            "teamEnemy": {"roles": []},
+            "robot": {"roles": []},
+            "errors": [{"errorCode": 2, "description": "答案错误"}],
+        }))
+    };
+
+    for round_no in 1..MAX_WRONG_ANSWERS as i64 {
+        // Each submission is judged wrong: the answer goes back to planning and
+        // the task survives, because one bad guess proves nothing.
+        state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
+        state.observe(&rejected(round_no));
+        assert!(
+            state.task.active,
+            "the task is still alive after {round_no} rejected answer(s)"
+        );
+        assert_eq!(state.task.wrong_answers, round_no as i32);
+    }
+
+    state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
+    state.observe(&rejected(MAX_WRONG_ANSWERS as i64 + 1));
+    assert!(
+        !state.task.active,
+        "{MAX_WRONG_ANSWERS} rejected answers must end the task instead of \
+         burning the rest of the timeout"
+    );
+}

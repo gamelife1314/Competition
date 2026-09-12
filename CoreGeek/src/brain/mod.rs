@@ -380,9 +380,17 @@ pub fn interior_cells(turn: &Turn) -> Vec<Pos> {
 /// Walkable cells from which a controller can OPERATE a tower, restricted to
 /// the inside of the wall ring. Plain `stand_cells` would also return the
 /// tower's outer neighbours (footprint distance 2) — those sit exactly on the
-/// wall ring and get walled over, which is what trapped workers outside. The
-/// wall layout leaves at least two inner cells per tower, so a weapon can
-/// never be fully enclosed.
+/// wall ring and get walled over, which is what trapped workers outside.
+///
+/// An inner cell is used whenever one exists at all, not merely when two do.
+/// The old "two or nothing" fallback handed the controller an outer cell the
+/// moment a gun had only one inner neighbour, and an outer cell is the wall
+/// line: the operator then stands in front of the wall it is supposed to be
+/// behind, and the wall crew can never fill the cell under its feet. That is
+/// issue #15 — "操控者在墙的外侧…直接暴露在怪物攻击范围内". A gun manned from a
+/// single inner cell still fires; a gun manned from the wall ring is a hole in
+/// the ring. `all` remains the answer only for a tower with no inner cell at
+/// all, where standing outside is the only way to shoot at all.
 pub fn tower_stand_cells(turn: &Turn, tower_pos: Pos) -> Vec<Pos> {
     let all = stand_cells(turn, tower_pos);
     let Some(station) = turn.station() else {
@@ -394,10 +402,10 @@ pub fn tower_stand_cells(turn: &Turn, tower_pos: Pos) -> Vec<Pos> {
         .copied()
         .filter(|pos| crate::model::footprint_distance(*pos, &footprint) <= 1)
         .collect();
-    if inner.len() >= 2 {
-        inner
-    } else {
+    if inner.is_empty() {
         all
+    } else {
+        inner
     }
 }
 

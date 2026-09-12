@@ -43,6 +43,11 @@ pub enum TaskStage {
     },
 }
 
+/// Rejected answers after which a task is abandoned rather than retried. A
+/// session that has been judged wrong three times has consumed its own
+/// evidence; the pioneer goes back to the wall line and the guns.
+pub const MAX_WRONG_ANSWERS: i32 = 3;
+
 #[derive(Debug, Clone, Default)]
 pub struct TaskSession {
     pub active: bool,
@@ -446,6 +451,15 @@ impl BotState {
                 self.task.point_closed_round = None;
                 let failed_type = self.task.task_type.clone();
                 self.drop_sop_for(&failed_type);
+                // Fast abandon. The opponent's edge in issue #15 was that it
+                // dropped a failing task immediately and "把开拓者投入防御",
+                // while all five of our sessions burned their entire timeout.
+                // Three rejected answers is enough evidence that the fourth
+                // attempt is not the one; the pioneer is worth more on the wall
+                // line than on a task that has already failed three times.
+                if self.task.wrong_answers >= MAX_WRONG_ANSWERS {
+                    self.finish_task(false, "wrong_answers");
+                }
             } else if self.task.submitted_round.is_some() && !turn.error_codes.is_empty() {
                 self.task.post_submit_error = true;
             }

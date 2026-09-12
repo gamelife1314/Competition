@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
-use coregeek::brain::{can_reach_any, interior_cells, night, tower_stand_cells};
+use coregeek::brain::{can_reach_any, interior_cells, night, stand_cells, tower_stand_cells};
 use coregeek::model::{footprint_distance, station_footprint, Turn};
 use coregeek::protocol::{Pos, Request};
 use coregeek::state::BotState;
@@ -176,5 +176,94 @@ fn pairing_prefers_a_controller_that_can_reach_the_gun() {
         pairs,
         vec![(10003, 10020)],
         "gun 10020 went to a controller that cannot reach it"
+    );
+}
+
+/// The two placements where the ring runs into the board edge, and one where it
+/// does not (the same three boards `tests/spawn.rs` sweeps).
+const BASES: [(&str, (i32, i32)); 3] = [
+    ("top_left", (0, 1)),
+    ("bottom_right", (39, 31)),
+    ("mid_map", (10, 24)),
+];
+
+/// Every on-board cell exactly one ring out from the station footprint — the
+/// only band a tower is allowed to sit on.
+fn gun_sites(base: (i32, i32)) -> Vec<Pos> {
+    let footprint = station_footprint(Pos {
+        x: base.0,
+        y: base.1,
+    });
+    let mut sites = Vec::new();
+    for x in -1..42 {
+        for y in -1..33 {
+            let pos = Pos { x, y };
+            if pos.x < 0 || pos.y < 0 || pos.x >= 41 || pos.y >= 32 {
+                continue;
+            }
+            if !footprint.contains(&pos) && footprint_distance(pos, &footprint) == 1 {
+                sites.push(pos);
+            }
+        }
+    }
+    sites
+}
+
+#[test]
+fn a_gun_is_never_manned_from_the_wall_ring() {
+    // Issue #15: "操控者在墙的外侧". A controller standing on the radius-2 shell
+    // is on the wrong side of the line it is supposed to be behind — the first
+    // robot through the gate reaches it before it reaches the gun, and the wall
+    // crew can never fill the cell under its feet. So the cells a gun may be
+    // operated from are the inner band whenever that band has a cell at all;
+    // only a gun with no inner cell may be worked from outside. (The old rule
+    // needed *two* inner cells before it dropped the outer ones. Every legal
+    // board in this sweep already has two — the base's own cells are land and
+    // supply a second — so this test guards the property rather than a board
+    // that used to fail; the boundary is what a future caller could hit.)
+    let mut withheld = 0usize;
+    for (name, base) in BASES {
+        let footprint = station_footprint(Pos {
+            x: base.0,
+            y: base.1,
+        });
+        for site in gun_sites(base) {
+            let turn = turn_from(world(vec![
+                station(base.0, base.1),
+                gatling(10020, site.x, site.y),
+            ]));
+            let stands = tower_stand_cells(&turn, site);
+            let inner: Vec<Pos> = stands
+                .iter()
+                .copied()
+                .filter(|cell| footprint_distance(*cell, &footprint) <= 1)
+                .collect();
+            if inner.is_empty() {
+                // Nowhere behind the line to stand: outside is the only option.
+                continue;
+            }
+            for cell in &stands {
+                assert!(
+                    footprint_distance(*cell, &footprint) <= 1,
+                    "issue #15: a gun at {site:?} ({name}) can be manned from \
+                     {cell:?}, which is {} ring(s) out — past the wall line",
+                    footprint_distance(*cell, &footprint)
+                );
+            }
+            // Non-vacuity: this gun's plain neighbourhood really does contain
+            // outer cells, so the sweep is exercising the filter rather than
+            // boards where every neighbour happens to be inner already.
+            if stand_cells(&turn, site)
+                .iter()
+                .any(|cell| footprint_distance(*cell, &footprint) > 1)
+            {
+                withheld += 1;
+            }
+        }
+    }
+    assert!(
+        withheld > 0,
+        "no gun in the sweep had an outer neighbour to withhold, so the \
+         assertion above never ran"
     );
 }

@@ -3,9 +3,7 @@
 
 use std::collections::HashSet;
 
-use crate::brain::{
-    combat, stand_cells, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan,
-};
+use crate::brain::{combat, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan};
 use crate::model::{chebyshev, footprint_distance, Turn, Unit, UnitKind};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
@@ -221,16 +219,15 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                     moved = true;
                 }
             }
-            // Last resort: if the inner stand cells are walled over, any
-            // walkable cell adjacent to the tower still lets the operator fire.
-            if !moved {
-                let any_stands = stand_cells(turn, tower.pos);
-                if let Some(cmd) = walk_or_remove_wall(turn, controller, &any_stands, &mut claimed)
-                {
-                    plan.push(controller.id, cmd);
-                    moved = true;
-                }
-            }
+            // No third fallback onto plain `stand_cells`. The inner cells are
+            // the ones behind the wall line, and everything `stand_cells` adds
+            // beyond them is the wall ring itself — a controller parked there
+            // is outside the wall it should be behind (issue #15), and the cell
+            // under its feet can never be walled. `walk_or_remove_wall` above
+            // already demolishes our own wall when the inner cells are sealed
+            // off, so the gun is still reached the honest way. A controller
+            // that cannot get there at all reports `controller_stuck` instead
+            // of standing in the open all night.
             idle_reason = if moved {
                 "controller_walking"
             } else {

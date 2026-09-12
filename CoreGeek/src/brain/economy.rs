@@ -494,10 +494,27 @@ fn is_night_readiness(name: &str) -> bool {
 /// push a sale past nightfall.
 pub fn sell_batch(turn: &Turn, state: &BotState, role: &Unit) -> i64 {
     let travel = vendor_travel(turn, role.pos);
-    if travel <= NEAR_VENDOR || purchase_urgent(turn, state, role) {
+    if travel <= NEAR_VENDOR
+        || purchase_urgent(turn, state, role)
+        || funding_next_weapon(turn, role)
+    {
         return SELL_BATCH;
     }
     (SELL_BATCH + (travel - NEAR_VENDOR) / 2).min(MAX_SELL_BATCH)
+}
+
+/// Is this role sitting on a load the team's next weapon is waiting for?
+///
+/// A far vendor is worth one bigger load only when the load can afford to
+/// wait. While the team cannot yet pay for its next gun the gold is the
+/// bottleneck, not the walk, and the amortized batch is the thing standing
+/// between the ore and the build: issue #15's economy produced its first coin
+/// at r=27 — by which time the window for the second and third weapon had
+/// already closed — with a worker parked on a full pack waiting for a load
+/// worth the trip. Nothing to sell means nothing to decide, so an empty pack
+/// leaves the batch alone.
+fn funding_next_weapon(turn: &Turn, role: &Unit) -> bool {
+    turn.towers().len() < 3 && turn.gold < WEAPON_BUILD_COST && total_ores(role) > 0
 }
 
 /// Whether we may spend 25g building another weapon this round. Build 1-2
@@ -511,6 +528,16 @@ pub fn may_build_weapon(turn: &Turn, state: &BotState) -> bool {
     }
     if towers.iter().any(|tower| tower.level >= 2) {
         return turn.gold >= WEAPON_BUILD_COST + WEAPON_UPGRADE_RESERVE;
+    }
+    // Gold plentiful: the third slot no longer competes with the level-2
+    // voucher, it is funded ALONGSIDE it. The gate is the voucher's full price
+    // on top of the build, so the reserve the two-tower rule exists to protect
+    // is still intact after the 25 gold is spent — the third gun costs the day
+    // nothing it was saving for. Issue #15: "may_build_weapon 判定逻辑未在金币
+    // 充裕时触发第3座建造", and the opponent's three guns out-shot our two for
+    // the whole first night.
+    if turn.gold >= WEAPON_BUILD_COST + WEAPON_VOUCHER1_PRICE {
+        return true;
     }
     // Two level-1 towers with neither upgraded: the gold is normally held for
     // the level-2 step. But when that step is clearly out of reach before dusk

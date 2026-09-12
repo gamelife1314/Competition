@@ -148,12 +148,28 @@ pub fn plan_pioneer(
                 state.task.stage = TaskStage::Planning;
                 return None;
             }
+            // The exact bytes handed to the judger. Issue #15: the logged
+            // `task_answer_found` and the submitted payload had drifted apart
+            // (a corrected/merged answer replaced the recorded one between the
+            // two), which made a scored-zero task impossible to diagnose from
+            // the log. One event per submission, carrying what was actually
+            // sent, closes that gap for good.
+            let payload = submittable_answer(&state.task.description, &answer);
+            crate::log::event(
+                "task_answer_submit",
+                serde_json::json!({
+                    "session": state.task.session_id,
+                    "round": turn.round_no,
+                    "answer": truncate(&payload, 160),
+                    "rewritten": payload != answer,
+                }),
+            );
             state.task.submitted_round = Some(turn.round_no);
             state.task.phase_missing_rounds = 0;
             state.task.point_closed_round = None;
             state.task.post_submit_error = false;
             state.task.stage = TaskStage::WaitingSubmit { attempts: 0 };
-            Some(RoleCommand::submit_answer(&answer))
+            Some(RoleCommand::submit_answer(&payload))
         }
         TaskStage::WaitingSubmit { attempts } => {
             // Do not re-plan merely because the success verdict is implicit.
@@ -304,6 +320,43 @@ pub fn extract_answer(output: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// The answer as the judger should receive it.
+///
+/// Our own prompt tells the model "多字段答案用 JSON 表示" — JSON is for the
+/// multi-field case. A one-key wrapper around a scalar is therefore the BOT's
+/// formatting, not the task's: issue #15 lost a task whose sandbox had already
+/// printed the right token, because the payload submitted was
+/// `{"token":"fc1e78eb2a5a"}` while the judger was comparing against the bare
+/// value. So a single-field object is unwrapped — but only when the task text
+/// never names that field, because when it does, the wrapper is exactly what
+/// was asked for and unwrapping it would break a legitimate multi-field answer.
+pub fn submittable_answer(description: &str, answer: &str) -> String {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(answer)
+    else {
+        return answer.to_string();
+    };
+    if map.len() != 1 {
+        return answer.to_string();
+    }
+    let Some((key, value)) = map.iter().next() else {
+        return answer.to_string();
+    };
+    if description.to_lowercase().contains(&key.to_lowercase()) {
+        return answer.to_string(); // the task named this field: keep the shape
+    }
+    let bare = match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        _ => return answer.to_string(),
+    };
+    if bare.trim().is_empty() {
+        answer.to_string()
+    } else {
+        bare
+    }
 }
 
 /// True when the answer describes the parsing step instead of the result —

@@ -2287,3 +2287,111 @@ fn schema_gate_passes_a_complete_answer_and_an_unknown_schema() {
         "an unknown schema never blocks a submission"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #15: the third weapon vs. the upgrade reserve, and a cash-starved
+// economy that would not sell what it was carrying.
+// ---------------------------------------------------------------------------
+
+/// `n` ores in a worker's pack at `(x, y)`.
+fn laden_worker(id: i64, x: i32, y: i32, n: usize) -> Value {
+    json!({
+        "id": id, "pos": {"x": x, "y": y}, "roleType": "worker",
+        "health": 220, "attackPower": 0, "attackRange": 0,
+        "backPackCapability": 100,
+        "backpack": vec!["iron"; n]
+    })
+}
+
+fn two_l1_with_gold(gold: i64, in_day: i64) -> Turn {
+    turn_from(day_world_at(
+        day_round(in_day),
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            railgun(10030, 12, 10, 1),
+        ],
+        gold,
+        vec![],
+        vec![],
+    ))
+}
+
+#[test]
+fn a_funded_voucher_does_not_block_the_third_weapon() {
+    // Issue #15: "may_build_weapon 判定逻辑未在金币充裕时触发第3座建造" — the
+    // opponent's three guns out-shot our two for the whole first night. The
+    // old rule held the entire purse for WeaponUpgradeVoucher1 whenever the
+    // main weapon was still level 1, even when the purse covered the voucher
+    // AND the 25-gold build at once, so the rocket pad was never laid.
+    let state = BotState::default();
+    let both = coregeek::model::WEAPON_BUILD_COST + coregeek::brain::economy::WEAPON_VOUCHER1_PRICE;
+    assert!(
+        coregeek::brain::economy::may_build_weapon(&two_l1_with_gold(both, 5), &state),
+        "{both} gold covers the third weapon and the upgrade voucher together"
+    );
+    // The reserve the two-tower rule exists to protect survives the build:
+    // 125 - 25 = 100 is exactly the voucher's price.
+    assert_eq!(
+        both - coregeek::model::WEAPON_BUILD_COST,
+        coregeek::brain::economy::WEAPON_VOUCHER1_PRICE,
+        "the gate is set so the voucher is still affordable after the build"
+    );
+
+    // One gold short and the reserve wins: the upgrade is the better purchase,
+    // so the third weapon waits rather than eating into the voucher.
+    assert!(
+        !coregeek::brain::economy::may_build_weapon(&two_l1_with_gold(both - 1, 5), &state),
+        "{} gold cannot cover both, so the voucher keeps the reserve",
+        both - 1
+    );
+}
+
+#[test]
+fn a_cash_starved_team_sells_its_pack_instead_of_waiting_for_a_load() {
+    // Issue #15: the economy produced its first coin at r=27 — by which time
+    // the window for the second and third weapon had closed — because a worker
+    // stood on three ore waiting for the amortized batch an eleven-round walk
+    // to the vendor is worth. The batch is an optimization; the next gun is
+    // not.
+    let state = BotState::default();
+    let pack = |n: usize, gold: i64| {
+        turn_from(day_world_at(
+            day_round(5),
+            vec![
+                station(10, 20, 1),
+                gatling(10020, 10, 10, 1),
+                laden_worker(10010, 12, 12, n),
+            ],
+            gold,
+            vec![voucher("WeaponUpgradeVoucher1", 100)],
+            vec![zone(0, 0, "vendor")],
+        ))
+    };
+
+    let broke = pack(3, 0);
+    assert_eq!(
+        coregeek::brain::economy::sell_batch(&broke, &state, broke.role_by_id(10010).unwrap()),
+        coregeek::brain::economy::SELL_BATCH,
+        "three ore in hand beat six ore promised by a walk we cannot afford"
+    );
+
+    // Once the team can pay for the next gun the walk is a cost again, and the
+    // bigger load is worth carrying — the old amortization, unchanged.
+    let funded = pack(3, coregeek::model::WEAPON_BUILD_COST);
+    let funded_batch =
+        coregeek::brain::economy::sell_batch(&funded, &state, funded.role_by_id(10010).unwrap());
+    assert!(
+        funded_batch > coregeek::brain::economy::SELL_BATCH,
+        "with the next gun already paid for the far vendor is worth a load ({funded_batch})"
+    );
+
+    // Nothing to sell means nothing to decide: an empty pack leaves the batch
+    // alone (this is the constraint that keeps the far-vendor test honest).
+    let empty = pack(0, 0);
+    assert!(
+        coregeek::brain::economy::sell_batch(&empty, &state, empty.role_by_id(10010).unwrap())
+            > coregeek::brain::economy::SELL_BATCH,
+        "an empty pack is not a reason to shorten the batch"
+    );
+}
