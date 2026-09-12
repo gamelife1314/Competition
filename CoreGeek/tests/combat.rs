@@ -833,3 +833,91 @@ fn worker_keeps_gold_reserve_for_weapon_upgrade() {
         "gold reserved for the upgrade: no third level-1 weapon"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #8: task empty-loop, economy stall, night survivability, wall cap
+// ---------------------------------------------------------------------------
+
+#[test]
+fn should_sell_relaxes_batch_threshold() {
+    // 5 ores used to be below SELL_BATCH=8; now it sells, so a miner carrying
+    // a small stack never sits idle with gold trapped in its backpack.
+    let turn = turn_from(day_world_at(
+        5,
+        vec![
+            station(10, 20, 1),
+            json!({
+                "id": 10010, "pos": {"x": 5, "y": 5}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100,
+                "backpack": ["iron", "iron", "iron", "iron", "iron"]
+            }),
+        ],
+        0,
+        vec![],
+        vec![zone(0, 0, "vendor")],
+    ));
+    let state = BotState::default();
+    let role = turn.role_by_id(10010).unwrap();
+    assert!(
+        coregeek::brain::economy::should_sell(&turn, &state, role, 6),
+        "5 ores must trigger a sell (SELL_BATCH relaxed from 8 to 5)"
+    );
+
+    // A half-full backpack (>= capacity/2) also sells, even below the batch.
+    let half: Vec<Value> = (0..50).map(|_| json!("iron")).collect();
+    let turn2 = turn_from(day_world_at(
+        5,
+        vec![
+            station(10, 20, 1),
+            json!({
+                "id": 10010, "pos": {"x": 5, "y": 5}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100,
+                "backpack": half
+            }),
+        ],
+        0,
+        vec![],
+        vec![zone(0, 0, "vendor")],
+    ));
+    let role2 = turn2.role_by_id(10010).unwrap();
+    assert!(
+        coregeek::brain::economy::should_sell(&turn2, &state, role2, 6),
+        "half-full backpack triggers a sell"
+    );
+}
+
+#[test]
+fn task_empty_loop_does_not_end_prematurely() {
+    // WaitingDescription with no description yet and no command run: the task
+    // must NOT be abandoned just because a few rounds passed — that was the
+    // acceptTask → end (cmdRounds=0) spin. It only ends on timeout.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.accepted_round = 10;
+    state.task.timeout_round = 300;
+    state.task.stage = coregeek::state::TaskStage::WaitingDescription;
+
+    let turn = turn_from(day_world_at(16, vec![pioneer_with(vec![])], 0, vec![], vec![]));
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut plan = coregeek::brain::Plan::default();
+    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+
+    assert!(state.task.active, "an empty task must not be abandoned");
+    assert!(cmd.is_none(), "no command until the description arrives");
+}
+
+#[test]
+fn build_prompt_includes_task_environment_path() {
+    // The empty-loop came from the LLM guessing `cat task_X.md` in the root
+    // directory. The prompt must point it at /tmp/selfEvolutionTask/ and tell
+    // it to list files first.
+    let mut state = BotState::default();
+    state.task.description = "请统计 /tmp 下的文件数量".into();
+    let turn = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
+    let prompt = coregeek::brain::task::build_prompt(&state, &turn);
+    assert!(prompt.contains("/tmp/selfEvolutionTask/"), "prompt names the task directory");
+    assert!(prompt.contains("find /tmp/selfEvolutionTask/"), "prompt suggests listing files first");
+    assert!(prompt.contains(&state.task.description), "prompt still carries the task description");
+}

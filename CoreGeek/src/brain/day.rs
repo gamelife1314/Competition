@@ -18,6 +18,10 @@ fn preposition_round(dist: i32) -> i64 {
 }
 /// Stones to carry before walking out to the wall line (same as the demo).
 const STONE_BATCH: i64 = 6;
+/// Max walls placed per day: a minimal defensible ring is enough — after that
+/// workers switch to the economy (mine → sell → buy upgrades) instead of
+/// spending the whole day on the wall line.
+const WALL_DAILY_CAP: i64 = 6;
 
 pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let mut plan = Plan::default();
@@ -25,7 +29,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
 
     let tower_gaps = tower_gaps(turn, state);
     let wall_gaps = wall_gaps(turn, state);
-    let stone_demand = (wall_gaps.len() as i64 - economy::team_ores(turn, STONE)).max(0);
+    // Only ever want enough stone for the day's wall cap — beyond that, stone
+    // is dead weight to sell.
+    let wall_demand = (wall_gaps.len() as i64).min(WALL_DAILY_CAP);
+    let stone_demand = (wall_demand - economy::team_ores(turn, STONE)).max(0);
     // Gold reserved for finishing the tower build-out is untouchable by the
     // shopping list — defenses come before consumables.
     let build_reserve = tower_gaps.len() as i64 * WEAPON_BUILD_COST;
@@ -40,6 +47,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     } else {
         workers.last().map(|unit| unit.id)
     };
+    // With two workers, the LAST one is the dedicated economy worker: it skips
+    // wall duty and focuses on mine → sell → shop, so the wall line never
+    // monopolizes both workers.
+    let economy_id = if workers.len() >= 2 { workers.last().map(|unit| unit.id) } else { None };
     if !shopping.is_empty() {
         crate::log::event(
             "shopping",
@@ -64,6 +75,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             stone_demand,
             &shopping,
             buyer_id,
+            economy_id,
             &pairs,
             &mut claimed,
             &mut plan,
@@ -87,6 +99,7 @@ fn worker_day(
     stone_demand: i64,
     shopping: &[economy::Need],
     buyer_id: Option<i64>,
+    economy_id: Option<i64>,
     pairs: &[(i64, i64)],
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
@@ -104,10 +117,13 @@ fn worker_day(
         return;
     }
     // 3. Build walls (stone) BEFORE weapons: the wall ring protects the base
-    //    and the roles standing behind it. Building stops the moment any role
+    //    and the roles standing behind it. Capped to a minimal daily ring and
+    //    skipped by the dedicated economy worker, so the wall line never
+    //    monopolizes the whole day. Building also stops the moment any role
     //    could no longer reach its night weapon — the gate stays open until
     //    everyone has retreated inside, so we never wall ourselves out.
-    if role.count_item(STONE) > 0 && !wall_gaps.is_empty() && roles_can_reach(turn, pairs) {
+    let on_wall_duty = Some(role.id) != economy_id && state.walls_built_today < WALL_DAILY_CAP;
+    if role.count_item(STONE) > 0 && !wall_gaps.is_empty() && on_wall_duty && roles_can_reach(turn, pairs) {
         // Build immediately when already standing next to a safe gap.
         let adjacent_site = wall_gaps
             .iter()
@@ -119,6 +135,7 @@ fn worker_day(
             .copied();
         if let Some(site) = adjacent_site {
             claimed.insert(site);
+            state.walls_built_today = state.walls_built_today.saturating_add(1);
             crate::log::event(
                 "wall_build",
                 serde_json::json!({"role": role.id, "target": site, "stone": role.count_item(STONE)}),
@@ -135,10 +152,13 @@ fn worker_day(
                 }
                 if let Some(cmd) = build_or_walk(turn, role, *site, "wall", claimed) {
                     claimed.insert(*site);
-                    crate::log::event(
-                        "wall_build",
-                        serde_json::json!({"role": role.id, "target": *site, "stone": role.count_item(STONE)}),
-                    );
+                    if cmd.action == "build" {
+                        state.walls_built_today = state.walls_built_today.saturating_add(1);
+                        crate::log::event(
+                            "wall_build",
+                            serde_json::json!({"role": role.id, "target": *site, "stone": role.count_item(STONE)}),
+                        );
+                    }
                     plan.push(role.id, cmd);
                     return;
                 }

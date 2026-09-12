@@ -38,6 +38,8 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
         );
         state.task.best_answer = answer.clone();
         state.task.stage = TaskStage::HaveAnswer { answer };
+        // Cache the working command immediately so the next task reuses it.
+        state.cache_sop();
     } else {
         // No answer found: ask the LLM again with the failure context
         // (result_history carries it into the next prompt).
@@ -71,11 +73,10 @@ pub fn plan_pioneer(turn: &Turn, state: &mut BotState, pioneer: &Unit, plan: &mu
 
     match state.task.stage.clone() {
         TaskStage::WaitingDescription => {
-            // Accepted but phaseTask not delivered yet; if it never arrives,
-            // abandon so the pioneer regains freedom.
-            if turn.round_no.saturating_sub(state.task.accepted_round) > 3 {
-                state.finish_task();
-            }
+            // Accepted but phaseTask not delivered yet. Do NOT abandon here —
+            // ending on an empty command history produced the cmdRounds=0
+            // spin. The task only ends on timeout (timeout_round) or an
+            // explicit error code, enforced in absorb_task_events.
             None
         }
         TaskStage::Planning => {
@@ -128,9 +129,11 @@ pub fn plan_pioneer(turn: &Turn, state: &mut BotState, pioneer: &Unit, plan: &mu
     }
 }
 
-fn build_prompt(state: &BotState, _turn: &Turn) -> String {
+pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
     let mut prompt = String::new();
     prompt.push_str("你在一个隔离沙盒中执行任务，沙盒可运行基础 shell 与 python3（无外网）。\n");
+    prompt.push_str("环境说明：任务相关文件（如 task_X.md、输入数据）都放在 /tmp/selfEvolutionTask/ 目录下。\n");
+    prompt.push_str("请先用 `find /tmp/selfEvolutionTask/ -maxdepth 3` 或 `ls -R /tmp/selfEvolutionTask/` 查看有哪些文件，再 `cat /tmp/selfEvolutionTask/<对应文件名>` 读取内容；不要直接 `cat task_X.md`（根目录没有该文件）。\n");
     prompt.push_str("任务描述：\n");
     prompt.push_str(&state.task.description);
     prompt.push_str("\n\n要求：\n");

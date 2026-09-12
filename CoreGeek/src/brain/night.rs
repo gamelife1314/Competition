@@ -197,6 +197,12 @@ fn spare_night(
         plan.push(role.id, cmd);
         return;
     }
+    // Retreat inside the wall ring next to the station BEFORE anything that
+    // keeps the role out in the open — a lone spare next to a mine or wall is
+    // easy to focus down. Once inside we fall through to item usage.
+    if shelter(turn, role, claimed, plan) {
+        return;
+    }
     // Burn summon orders (harassment works at night too).
     const ORDERS: [&str; 4] = [
         "BossRobotSummonOrder",
@@ -212,7 +218,8 @@ fn spare_night(
             return;
         }
     }
-    // Patch damaged walls when no robot is breathing down our neck.
+    // Patch damaged walls when no robot is breathing down our neck. Only walls
+    // adjacent to the role are ever targeted, so this is safe from inside.
     if let Some(wall_pos) = combat::repair_target(turn, role, 3) {
         plan.push(role.id, RoleCommand::use_item_at("WallFixer", wall_pos));
         return;
@@ -241,40 +248,45 @@ fn spare_night(
             return;
         }
     }
-    // No night mining: every spare role shelters next to the base. Mining at
-    // night drags a worker outside the walls where it can die.
-    shelter(turn, role, claimed, plan);
+    // (Shelter already ran above; reaching here means the role is inside the
+    // ring and has nothing else to throw at the robots.)
 }
 
-fn shelter(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) {
-    let Some(station) = turn.station() else { return };
+/// Move a spare role inside the wall ring, right next to the station. Returns
+/// true when a movement command was issued (the caller should stop planning
+/// this round). Uses only the cells at footprint distance <= 1 — hugging the
+/// station — so the role never stops on the wall line or out near the mines.
+fn shelter(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) -> bool {
+    let Some(station) = turn.station() else { return false };
     let footprint = station.footprint();
-    let robot_positions: Vec<Pos> =
-        turn.robots.iter().filter(|robot| robot.health > 0).map(|robot| robot.pos).collect();
-    let already_safe = footprint_distance_to(role.pos, &footprint) <= 2
-        && robot_positions.iter().all(|robot| chebyshev(*robot, role.pos) >= 4);
-    if already_safe {
-        return;
-    }
     let mut stands: Vec<Pos> = Vec::new();
     for cell in &footprint {
         for around in crate::model::neighbours(*cell) {
-            if turn.is_land(around)
-                && footprint_distance_to(around, &footprint) <= 2
-                && robot_positions.iter().all(|robot| chebyshev(*robot, around) >= 3)
-            {
+            if turn.is_land(around) && crate::model::footprint_distance(around, &footprint) <= 1 {
                 stands.push(around);
             }
         }
     }
     if stands.is_empty() {
-        return;
+        return false;
     }
+    if stands.iter().any(|stand| *stand == role.pos) {
+        return false; // already hugging the station
+    }
+    // Prefer the corner furthest from the nearest robot.
+    stands.sort_by_cached_key(|stand| {
+        let nearest = turn
+            .robots
+            .iter()
+            .filter(|robot| robot.health > 0)
+            .map(|robot| chebyshev(*stand, robot.pos))
+            .min()
+            .unwrap_or(i32::MAX);
+        std::cmp::Reverse(nearest)
+    });
     if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
         plan.push(role.id, cmd);
+        return true;
     }
-}
-
-fn footprint_distance_to(pos: Pos, footprint: &[Pos]) -> i32 {
-    crate::model::footprint_distance(pos, footprint)
+    false
 }

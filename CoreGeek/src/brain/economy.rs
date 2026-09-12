@@ -8,7 +8,7 @@ use crate::state::BotState;
 
 /// Sell a stack once this many ore accumulate — small enough that gold flows
 /// every few rounds instead of sitting in a full backpack until dusk.
-pub const SELL_BATCH: i64 = 8;
+pub const SELL_BATCH: i64 = 5;
 pub const STONE_BUFFER: i64 = 2;
 
 /// First day round (in_day_round) of the "dusk" window: mining stops and every
@@ -226,7 +226,8 @@ pub fn should_sell(turn: &Turn, state: &BotState, role: &Unit, stone_demand: i64
     if turn.in_day_round >= DUSK_ROUND {
         return true;
     }
-    if role.backpack_full() || ores >= SELL_BATCH {
+    let half_full = role.capacity > 0 && role.backpack.len() as i64 * 2 >= role.capacity;
+    if role.backpack_full() || ores >= SELL_BATCH || half_full {
         return true;
     }
     // Surplus stones: the wall line is complete, convert dead weight to gold.

@@ -101,6 +101,8 @@ pub struct BotState {
     pub last_round: i64,
     pub llm_used_today: i32,
     pub summon_orders_today: i32,
+    /// Walls placed this day; capped so wall-building never monopolizes the day.
+    pub walls_built_today: i64,
 
     /// day -> official news text (dedup)
     pub official_seen: HashMap<i64, String>,
@@ -164,6 +166,7 @@ impl BotState {
             self.current_day = turn.day;
             self.llm_used_today = 0;
             self.summon_orders_today = 0;
+            self.walls_built_today = 0;
             self.harass_done_today = false;
         }
         self.last_round = turn.round_no;
@@ -336,18 +339,10 @@ impl BotState {
                 }),
             );
         }
-        if self.task.active && !self.task.description.is_empty() {
-            // Cache the SOP when we did produce a working command.
-            if let TaskStage::HavePlan { .. } = &self.task.stage {
-            } else if let Some(entry) = self.extract_sop() {
-                if !self.sop_cache.iter().any(|old| old.script == entry.script) {
-                    self.sop_cache.push(entry);
-                }
-                if self.sop_cache.len() > 32 {
-                    self.sop_cache.remove(0);
-                }
-            }
-        }
+        // Cache the working command as an SOP (if any) so the next task reuses
+        // it. The immediate success path already cached it via `cache_sop`;
+        // this also covers a task that timed out right after producing an answer.
+        self.cache_sop();
         self.task = TaskSession::default();
     }
 
@@ -361,6 +356,23 @@ impl BotState {
             return None;
         }
         Some(SopEntry { keywords, script })
+    }
+
+    /// Cache the last executed task command as an SOP (deduped) once it has
+    /// produced an answer. Called both on success and at task end, so a
+    /// working script immediately helps the NEXT task instead of only being
+    /// remembered after the task formally finishes.
+    pub fn cache_sop(&mut self) {
+        if self.task.best_answer.is_empty() {
+            return; // the command never produced an answer: don't cache it
+        }
+        let Some(entry) = self.extract_sop() else { return };
+        if !self.sop_cache.iter().any(|old| old.script == entry.script) {
+            self.sop_cache.push(entry);
+        }
+        if self.sop_cache.len() > 32 {
+            self.sop_cache.remove(0);
+        }
     }
 
     pub fn find_sop(&self, description: &str) -> Option<&SopEntry> {
