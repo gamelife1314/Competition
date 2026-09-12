@@ -31,6 +31,16 @@ fn main() {
         "startup",
         serde_json::json!({"port": port, "version": env!("CARGO_PKG_VERSION")}),
     );
+    // Build metadata: rustc version + opt-level, useful for reproducing a
+    // specific bot build from match logs.
+    coregeek::log::event(
+        "build_info",
+        serde_json::json!({
+            "rustc": option_env!("RUSTC_VERSION").unwrap_or("unknown"),
+            "profile": "release",
+            "edition": "2021",
+        }),
+    );
     let local_set = tokio::task::LocalSet::new();
     rt.block_on(local_set.run_until(coregeek::server::serve(listener)));
 }
