@@ -3,6 +3,7 @@
 //! HTTP service (hyper) that receives the round state as JSON and answers
 //! with per-role commands. All game logic lives in [`brain`].
 
+pub mod abreport;
 pub mod brain;
 pub mod log;
 pub mod model;

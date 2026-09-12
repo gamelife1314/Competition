@@ -7,6 +7,7 @@ pub mod news;
 pub mod night;
 pub mod task;
 pub mod treasure;
+pub mod verify;
 
 use std::collections::{HashMap, HashSet};
 
@@ -63,14 +64,18 @@ fn decide(raw_body: &[u8]) -> Result<String, String> {
 
     let sanitized = crate::validate::sanitize(&turn, plan.commands);
 
-    // Join last round's failures with the commands that caused them before
-    // overwriting `last_issued` — key feedback for post-match tuning.
+    // Last round's command map, captured before it is overwritten: both the
+    // failure join below and the volley review read it.
+    let previous_issued = std::mem::take(&mut state.last_issued);
+
+    // Join last round's failures with the commands that caused them — key
+    // feedback for post-match tuning.
     let failures: Vec<serde_json::Value> = turn
         .last_action_results
         .iter()
         .filter(|(_id, ok)| !**ok)
         .filter_map(|(id, _ok)| {
-            state.last_issued.get(id).map(|cmd| {
+            previous_issued.get(id).map(|cmd| {
                 serde_json::json!({
                     "role": id,
                     "action": cmd.action,
@@ -80,6 +85,11 @@ fn decide(raw_body: &[u8]) -> Result<String, String> {
             })
         })
         .collect();
+
+    // Attack-result verification: the judger's verdict on last night's volleys
+    // joined with the robot HP the same round left behind. `prev_robot_hp` is
+    // still last round's snapshot here — `log_round` overwrites it at the tail.
+    let volley = verify::review_volley(&turn, &previous_issued, &state.prev_robot_hp);
 
     // Remember what we actually sent for next round's failure feedback.
     let mut issued: HashMap<i64, IssuedCmd> = HashMap::new();
@@ -105,6 +115,7 @@ fn decide(raw_body: &[u8]) -> Result<String, String> {
         &mut state,
         &sanitized,
         &failures,
+        &volley,
         &plan.prompt,
         &plan.execute_cmd,
         started,
@@ -124,6 +135,7 @@ fn log_round(
     state: &mut BotState,
     sanitized: &std::collections::BTreeMap<String, RoleCommand>,
     failures: &[serde_json::Value],
+    volley: &verify::VolleyReview,
     prompt: &Option<String>,
     execute_cmd: &Option<String>,
     started: std::time::Instant,
@@ -227,6 +239,7 @@ fn log_round(
             "roles": roles,
             "cmds": cmds,
             "failures": failures,
+            "volley": volley.summary(),
             "errors": turn.error_codes,
             "phaseTask": crate::log::brief(&turn.phase_task, 160),
             "lastCmdResult": crate::log::brief(&turn.last_cmd_result, 160),
@@ -250,6 +263,22 @@ fn log_round(
             "ms": started.elapsed().as_micros() as f64 / 1000.0,
         }),
     );
+    // Two actionable volley outcomes get their own record so a captured match
+    // can be grepped for them directly instead of reconstructed from `round`.
+    if !volley.rejected_towers().is_empty() || volley.no_robot_damage_round() {
+        crate::log::event(
+            "volley_review",
+            json!({
+                "round": turn.round_no,
+                "day": turn.day,
+                "rejected": volley.rejected_towers(),
+                "noRobotDamage": volley.no_robot_damage_round(),
+                "volleys": volley.summary()["volleys"].clone(),
+                "damage": volley.robot_damage(),
+                "kills": volley.kills,
+            }),
+        );
+    }
     state.prev_total_score = Some(turn.total_score);
     state.prev_robot_hp = robot_hp;
     state.prev_robot_kind = turn
