@@ -1,11 +1,12 @@
 # 对战数据交付规范（workflow agent 接口）
 
-> **版本 v9** · 本文档是内网自动对战 workflow 的**交付规范**。
+> **版本 v10** · 本文档是内网自动对战 workflow 的**交付规范**。
 > 读者：拉代码 → 发起对战 → 抓日志 → 分析对局 → 生成改进 issue 的 code agent。
-> 与上一版的区别：v8 的 §7 是**反向提问**（我列六个机制问题，请你跑配方后作答）；v9 把它换成
-> **正面清单**——issue 正文要给我哪五部分、每部分怎么取、长什么样，全部给示例。你不需要回答
-> 我任何问题，把 §7 的六张表填出来交给我是唯一的要求。§6 是你可以自己跑一遍的自检清单；
-> §8 是同一份内容的机器可读版本。
+> 与上一版的区别：v9 的 §7 只有六张表；v10 把表 5（封门）加厚了——`wall_gate_open` 现在带
+> `away`/`stuck`，能直接读出**门卡在谁身上**，并且明确了"这个窗口总共只有 15 回合，15 行
+> = 整夜没封"。其余部分与 v9 相同：§7 是正面清单（issue 正文要给我哪五部分、怎么取、
+> 长什么样，全部给示例），你不需要回答我任何问题，把六张表填出来交给我是唯一的要求。
+> §6 是你可以自己跑一遍的自检清单；§8 是同一份内容的机器可读版本。
 
 ---
 
@@ -270,6 +271,8 @@ issue 头部请给这一行（我直接 grep）：
 8. §7.3 的六张表**每张都跑过**（哪怕命中 0 行也要有那张表和一个 0），且每张表都不是
    一句结论；行多的那张，原始 tsv 已落盘且 issue 里给了路径。
 9. issue 正文里**没有**任何"请你回答"式的反向提问——不存在这样的问题。
+10. 表 5 命中 15 行的那天，写的是"**整夜没封**"而不是"开了 15 回"；`away`/`stuck` 里出现的
+   角色 id 在表里点名了——门卡在谁身上是这张表存在的理由。
 
 ---
 
@@ -508,26 +511,33 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="round") | select(.data.errors)
 
 #### 表 5 · 封门
 
-**我用它判断**：城门开了几回合。每天黄昏（`dayRound >= 55`）检查一次"所有人归队了吗"，
-归队就封（`wall_gate_seal`），没归队就开（`wall_gate_open`）并**每回合重报**直到封上——
-所以 `wall_gate_open` 的行数**就是**那天门开着没封上的回合数。这个数直接对应城墙能不能撑住。
+**我用它判断**：城门开了几回合，以及**卡在谁身上**。每天黄昏（`dayRound >= 55`）检查一次
+"所有人归队了吗"，归队就封（`wall_gate_seal`），没归队就开（`wall_gate_open`）并**每回合重报**
+直到封上——所以 `wall_gate_open` 的行数**就是**那天门开着没封上的回合数。这个数直接对应城墙能不能撑住。
+
+**关键：这个窗口总共只有 15 回合**（`dayRound` 55..69，之后就是夜里了）。所以**一行都没封上
+= 15 行**，意思是**整夜门都开着**，不是"开了 15 回"。看到 15 就要当成城墙不存在来读。
+
+`away` 是没归队的角色（`[id, x, y]`）；`stuck` 是其中**根本走不回岗位**的那几个——被墙或机器人
+隔开，永远到不了。"在路上"只是门晚封一两回合，"stuck"是整夜不封。两个字段空了会被裁掉。
 
 ```sh
 grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_seal" or .event=="wall_gate_open")
-  | [.data.round, (((.data.round-1)/130)|floor)+1, ((.data.round-1)%130)+1, .event] | @tsv'
+  | [.data.round, (((.data.round-1)/130)|floor)+1, ((.data.round-1)%130)+1, .event,
+     ((.data.away // []) | tostring), ((.data.stuck // []) | tostring)] | @tsv'
 ```
 
-示例输出（回合 / 第几天 / 当天第几回合 / 事件）：
+示例输出（回合 / 第几天 / 当天第几回合 / 事件 / 没归队的 / 走不回去的）：
 
 ```text
-185	2	56	wall_gate_open
-186	2	57	wall_gate_open
-187	2	58	wall_gate_open
-188	2	59	wall_gate_seal
+185	2	56	wall_gate_open	[[10004,13,26]]	[]
+186	2	57	wall_gate_open	[[10004,13,26]]	[]
+187	2	58	wall_gate_open	[[10002,33,13]]	[10002]
+188	2	59	wall_gate_seal	[]	[]
 ```
 
 ```sh
-# 每天开了几回合（一行一天，最快看出哪天没封上）
+# 每天开了几回合（一行一天，最快看出哪天没封上；15 就是整夜没封）
 grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | (((.data.round-1)/130)|floor)+1' \
   | sort -n | uniq -c
 ```
@@ -536,8 +546,21 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | (((.data.round-
 
 ```text
       3 1
-      9 2
+     15 2
       2 4
+```
+
+```sh
+# 卡在谁身上：哪个角色、在哪、卡了几回合（整场累计）
+grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | .data.away[]? | @tsv' \
+  | awk -F'\t' '{c[$1]++; last[$1]=$2","$3} END {for (id in c) print id, c[id], last[id]}' | sort -k2 -nr
+```
+
+示例输出（角色 / 没归队的回合数 / 最后一次出现的位置）：
+
+```text
+10004	5	13,26
+10002	2	33,13
 ```
 
 ---
@@ -636,7 +659,9 @@ receipt.tasks_ours[].score：拿不到——对局详情页只有总分，没有
 - `night_recall` 与 `night_withdraw` **并入** `night_debug` 的 `pairs[].reason`；
 - `round` 里的块（`towers`/`roles`/`wall`/`task`/…）**改为变化才写**，缺键 = 沿用上次的值，
   当回合重写了哪些块由 `round.data.chg` 列出（§2 规则 2）；
-- `round` 记录**不再带 `ts`**（回合号就是时钟）。
+- `round` 记录**不再带 `ts`**（回合号就是时钟）；
+- `wall_gate_open` **开始带 `away`/`stuck`**（谁没归队、谁走不回岗位），并去掉了固定的
+  `reason:"controllers_not_retreated"`；老批次里它只有 `reason`，读不出卡在谁身上。
 
 ---
 
@@ -647,7 +672,7 @@ agent_request:
   target: workflow-driver
   repo: gamelife1314/Competition
   action: deliver_battle_data
-  version: 9
+  version: 10
   model: >
     We see the board (per-round state, both sides' units, our own score/gold) but never the
     result. Process data is ours to emit — transport it verbatim. Outcome, identity, version
@@ -770,10 +795,16 @@ agent_request:
               - grep '^{' ours.jsonl | jq -r 'select(.event=="round") | select(.data.errors) | [.data.round, (.data.errors|join(",")), (.data.errorDescs // [] | join(" | "))] | @tsv'
           - id: gate
             name: 封门
-            tells: how many rounds the gate stayed open — the dusk check runs every round from dayRound 55 until it seals, so the wall_gate_open row count IS the number of rounds that day the ring had a hole
+            tells: how many rounds the gate stayed open AND who it was waiting on — the dusk check runs every round from dayRound 55 to 69, a window of exactly 15 rounds, so 15 rows in one day means the gate never sealed at all and the ring had a hole all night
+            fields:
+              away: "[id, x, y] per role that is neither home nor on the operating cells of the tower it mans tonight"
+              stuck: "the subset of away that cannot walk to its post at all — walled off from its gun, so the gate will never seal; absent when empty"
+            gotchas:
+              - the window is 15 rounds (dayRound 55..69), so 15 rows is the maximum, not a count of seal attempts
             recipes:
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_seal" or .event=="wall_gate_open") | [.data.round, (((.data.round-1)/130)|floor)+1, ((.data.round-1)%130)+1, .event] | @tsv'
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_seal" or .event=="wall_gate_open") | [.data.round, (((.data.round-1)/130)|floor)+1, ((.data.round-1)%130)+1, .event, ((.data.away // []) | tostring), ((.data.stuck // []) | tostring)] | @tsv'
               - grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | (((.data.round-1)/130)|floor)+1' | sort -n | uniq -c
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | .data.away[]? | @tsv' | awk -F'\t' '{c[$1]++; last[$1]=$2","$3} END {for (id in c) print id, c[id], last[id]}' | sort -k2 -nr
           - id: night_debug
             name: 夜间塔况
             tells: what each tower spent the night doing; reason carries the whole verdict, and the record is written every round on purpose so that the COUNT of controller_withdrawn is the finding

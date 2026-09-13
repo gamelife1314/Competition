@@ -129,10 +129,9 @@ const TASK_MIN_ATTEMPT_ROUNDS: i64 = 12;
 /// costs prompt → answer → command → verdict, so five rounds apiece) with
 /// nothing submitted has produced no evidence that the fourth is the one. The
 /// pioneer is one of the three controllers the wall gate seal waits for, and
-/// issue #26 lost its base to nine rounds of `wall_gate_open`
-/// (`controllers_not_retreated`). Only a session with NOTHING submitted
-/// qualifies: one wrong answer is evidence the loop is working, and
-/// `MAX_WRONG_ANSWERS` already governs that case.
+/// issue #26 lost its base to nine rounds of `wall_gate_open`. Only a session
+/// with NOTHING submitted qualifies: one wrong answer is evidence the loop is
+/// working, and `MAX_WRONG_ANSWERS` already governs that case.
 const MAX_STERILE_ROUNDS: i64 = 15;
 
 /// How many ring cells this day's fortification budget covers.
@@ -817,8 +816,9 @@ fn pioneer_day(
 ) {
     // 0. Dusk recall. The gate seal waits for EVERY role to be inside the ring,
     //    and the pioneer is the one role whose work — task points, treasure,
-    //    the shop — is always outside it. Issue #15: `wall_gate_open:
-    //    controllers_not_retreated` for fifteen straight rounds while the
+    //    the shop — is always outside it. Issue #15: `wall_gate_open` for
+    //    fifteen straight rounds — the whole dusk window, so the gate never
+    //    sealed — while the
     //    pioneer accepted a fresh task at r=58 and again at r=69, one round
     //    before nightfall; the gate cell was never walled, the ring kept a
     //    robot-sized hole all night, and the controllers standing behind it
@@ -1956,24 +1956,72 @@ fn update_wall_gate(turn: &Turn, state: &mut BotState, pairs: &[(i64, i64)]) {
         return;
     };
     let footprint = station.footprint();
-    let all_retreated = turn.controllable().iter().all(|role| {
-        footprint_distance(role.pos, &footprint) <= 1
-            || night_goal(turn, pairs, role.id)
-                .map(|stands| stands.contains(&role.pos))
-                .unwrap_or(false)
-    });
-    if all_retreated {
-        state.wall_gate_sealed = true;
-        crate::log::event(
-            "wall_gate_seal",
-            serde_json::json!({"round": turn.round_no, "dayRound": turn.in_day_round}),
-        );
-    } else {
-        crate::log::event(
-            "wall_gate_open",
-            serde_json::json!({"round": turn.round_no, "reason": "controllers_not_retreated"}),
-        );
+    match gate_open_record(turn, pairs, &footprint) {
+        None => {
+            state.wall_gate_sealed = true;
+            crate::log::event(
+                "wall_gate_seal",
+                serde_json::json!({"round": turn.round_no, "dayRound": turn.in_day_round}),
+            );
+        }
+        Some(record) => crate::log::event("wall_gate_open", record),
     }
+}
+
+/// The `wall_gate_open` record — who the dusk seal is still waiting on, or
+/// `None` when nobody is and the gate may close.
+///
+/// The decision and the record are the same computation on purpose. The record
+/// used to name the class ("controllers_not_retreated") and never the culprit,
+/// so the fifteen open rounds of the dusk window — which is the whole window,
+/// i.e. a gate that never sealed at all — could not be attributed from the log
+/// to anyone. That question cost issue #15 a match and a half, and its answer
+/// was "the pioneer is standing at a task point", which is only visible if the
+/// record carries positions.
+///
+/// `away` is `[id, x, y]` for every controllable role that is neither home nor
+/// on the operating cells of the tower it will man tonight; `stuck` names the
+/// subset that cannot walk to its post at all. The two are different failures:
+/// a role on its way in is a gate that seals a round or two later, while a role
+/// walled off from its gun is a gate that never seals, and it is the case the
+/// wall crew is supposed to make impossible (`wall_would_trap`). Both lists are
+/// empty when there is nothing to say, and `log::event` prunes the empty one
+/// out, so a round with a single role walking home costs one short line.
+///
+/// `footprint` is passed in rather than looked up because a missing station is
+/// not "everyone is home": the caller has already decided what to do about a
+/// base that is gone, and this function must not answer it by accident.
+pub fn gate_open_record(
+    turn: &Turn,
+    pairs: &[(i64, i64)],
+    footprint: &[Pos],
+) -> Option<serde_json::Value> {
+    let mut away: Vec<serde_json::Value> = Vec::new();
+    let mut stuck: Vec<i64> = Vec::new();
+    for role in turn.controllable() {
+        if footprint_distance(role.pos, footprint) <= 1 {
+            continue; // home: this one is not what the seal is waiting on
+        }
+        let stands = night_goal(turn, pairs, role.id);
+        if stands
+            .as_ref()
+            .map_or(false, |stands| stands.contains(&role.pos))
+        {
+            continue; // already on the operating cells of the tower it mans
+        }
+        away.push(serde_json::json!([role.id, role.pos.x, role.pos.y]));
+        if stands.map_or(false, |stands| !crate::brain::can_reach_any(turn, role, &stands)) {
+            stuck.push(role.id);
+        }
+    }
+    if away.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "round": turn.round_no,
+        "away": away,
+        "stuck": stuck,
+    }))
 }
 
 /// Desired D1 wall cells: one radius-2 shell around the station. One gate cell

@@ -1,8 +1,10 @@
 //! The pioneer's dusk recall.
 //!
 //! Issue #15 lost a match on day 1 with the wall gate still open at nightfall:
-//! `wall_gate_open: controllers_not_retreated` on fifteen consecutive rounds
-//! from r=56 to r=70, because the pioneer "在 dusk（r=55）之后仍可接任务" — it
+//! `wall_gate_open` on fifteen consecutive rounds — which is the entire dusk
+//! window, so the gate never sealed at all, and the record of the day did not
+//! name the role holding it open. The cause was that the pioneer
+//! "在 dusk（r=55）之后仍可接任务" — it
 //! accepted a fresh task at r=58 and again at r=69, one round before night. The
 //! gate cell is the last cell of the ring and `update_wall_gate` refuses to
 //! release it while any role is still outside, so the ring kept a robot-sized
@@ -269,5 +271,109 @@ fn the_gate_seals_once_the_recalled_pioneer_is_inside() {
     assert!(
         state.wall_gate_sealed,
         "with everyone inside the ring the dusk seal must close the gate cell"
+    );
+}
+
+/// A board with one gun twenty-odd cells out and one worker sent to it — the
+/// shape that decides whether the seal has to wait for the operator or not.
+/// One worker and the pioneer stay home, so the only open question is the gun.
+///
+/// `walled_in` puts a wall on every cell around the gun, the way a ring built
+/// without asking `wall_would_trap` would.
+fn board_with_a_far_tower(controller: (i32, i32), walled_in: bool) -> Value {
+    let mut roles = vec![
+        role(10002, "worker", controller.0, controller.1),
+        role(10003, "worker", 11, 25),
+        role(10004, "pioneer", 9, 24),
+        role(30000, "gatling", 33, 10),
+    ];
+    if walled_in {
+        for (index, (dx, dy)) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            roles.push(json!({
+                "id": 40000 + index as i64, "pos": {"x": 33 + dx, "y": 10 + dy},
+                "roleType": "wall", "health": 3000, "level": 1,
+                "backPackCapability": 0, "backpack": []
+            }));
+        }
+    }
+    world(62, roles, vec![])
+}
+
+fn gate_record(turn: &Turn, state: &mut BotState) -> Option<Value> {
+    let pairs = coregeek::brain::night::stable_pairs(turn, state);
+    let footprint = station_footprint(Pos {
+        x: STATION.0,
+        y: STATION.1,
+    });
+    coregeek::brain::day::gate_open_record(turn, &pairs, &footprint)
+}
+
+#[test]
+fn the_open_gate_record_names_who_is_out_and_where_they_are() {
+    // Issue #15's shape, which cost a match and a half: both workers home and
+    // the pioneer standing at a task point. The record it replaces said
+    // "controllers_not_retreated" on fifteen consecutive rounds — the whole
+    // dusk window, which is the same as saying the gate never sealed — and
+    // named nobody, so the culprit had to be found by hand.
+    let turn = turn_from(board_with_workers_home(
+        62,
+        (13, 26),
+        vec![task_point((14, 26))],
+    ));
+    let mut state = task_at(
+        (14, 26),
+        TaskStage::HaveAnswer {
+            answer: "42".into(),
+        },
+    );
+    let record = gate_record(&turn, &mut state).expect("the pioneer is still outside");
+
+    assert_eq!(
+        record["away"],
+        json!([[10004, 13, 26]]),
+        "the id and the cell are the whole diagnosis: who, and how far out"
+    );
+    assert_eq!(record["round"], json!(63));
+    assert_eq!(
+        record["stuck"],
+        json!([]),
+        "a role on its way home is not a role walled off from its gun"
+    );
+}
+
+#[test]
+fn an_operator_on_its_post_is_not_someone_the_seal_is_waiting_for() {
+    // The gun is twenty-odd cells from the base and the worker is out at it,
+    // so by distance alone the gate would wait forever. It must not: the role
+    // is on the operating cells of the tower it mans, which is where the night
+    // needs it to be, and `wall_would_trap` has already guaranteed it can get
+    // back out.
+    let turn = turn_from(board_with_a_far_tower((32, 10), false));
+    let mut state = BotState::default();
+    assert_eq!(
+        gate_record(&turn, &mut state),
+        None,
+        "everyone is either home or on post, so the gate may close"
+    );
+}
+
+#[test]
+fn an_operator_that_cannot_reach_its_gun_is_named_as_stuck_not_merely_late() {
+    // The same post, walled in — and the operator three cells away from it.
+    // This is the difference the record exists to draw: "walking" is a gate
+    // that closes a round later, "stuck" is a gate that never closes, and only
+    // the second one is a defect in the wall crew.
+    let turn = turn_from(board_with_a_far_tower((33, 13), true));
+    let mut state = BotState::default();
+
+    let record = gate_record(&turn, &mut state).expect("the operator cannot reach its post");
+    assert_eq!(record["away"], json!([[10002, 33, 13]]));
+    assert_eq!(
+        record["stuck"],
+        json!([10002]),
+        "walled off from every operating cell of its own gun"
     );
 }
