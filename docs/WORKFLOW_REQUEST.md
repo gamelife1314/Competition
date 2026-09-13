@@ -2,7 +2,9 @@
 
 > 载体：本文档 + git commit message（`git log` 可见完整请求）。
 > 目标读者：驱动自动对战、下载日志、分析对局、生成「改进任务」issue 的内部 code agent / workflow。
-> 版本：v5（本文档为唯一入口，取代原 `AGENT_REQUEST.md`）。
+> 版本：v6（本文档为唯一入口，取代原 `AGENT_REQUEST.md`）。
+> v6 增量：请求六（任务健康度口径）、请求七（A/B 拨盘对战）、事件表更新（本轮新增事件）、
+> 请求四备注（`errorDescs` 已由我方日志自带）。
 
 ---
 
@@ -111,9 +113,13 @@
 ```
 
 **为什么最关键**：`errors[].description` 是判题器返回的**唯一 schema 提示来源**
-（我们的 `model.rs` 目前把它解析后丢弃了）。完整日志能让我们看到
+（我们的 `model.rs` 此前把它解析后丢弃了）。完整日志能让我们看到
 "提交了什么 → 判题器说了什么 → 对手怎么改对的"这个完整闭环，
 这是修复任务系统 0 分问题的核心证据。
+
+> **v6 备注（我方侧已完成）**：自本版本对应 commit 起，我方 `round` 事件自带
+> `errorDescs` 字段（每条判题器错误描述，截 120 字符）——你们可以直接从 JSONL 提取，
+> 不必再从协议层另抓。若 120 字符不够，请告诉我们需要的截断长度。
 
 ---
 
@@ -129,14 +135,51 @@
 
 | 事件 | 用途 |
 |---|---|
-| `round` | 每回合完整状态（cmds / failures / score / scoreAttr / scoreDelta） |
-| `night_debug` | 夜间控制器–炮塔配对、距离、冷却、是否开火 |
+| `round` | 每回合完整状态（cmds / failures / score / scoreAttr / scoreDelta / **errorDescs**） |
+| `night_debug` | 夜间控制器–炮塔配对、距离、冷却、是否开火、静默原因 |
 | `volley` | 齐射结果核对（fired/executed/damaged/kills/rejected） |
-| `task_*` | 任务接取/开始/提交/结束、session、阶段 |
+| `task_*` | 任务接取/开始/提交/结束、session、阶段；`task_answer_submit` 含**实际提交原文**；`task_answer_schema` 含缺/多字段；`task_fields` 含 FIELDS 侦察回显 |
+| `sop_reuse` / `sop_evicted` / `sop_replay_skipped` | SOP 缓存复用、二次判错淘汰、拒重放同字节脚本 |
 | `shopping` / `buy` | 采购意图、价格、可负担性、买家距离 |
-| `tower_plan` / `build_blacklisted` | 建造计划与失败黑名单 |
+| `tower_plan` / `build_blacklisted` | 建造计划与失败黑名单；`tower_plan.guard` 为第三塔资金守护 |
+| `pair_recomputed` / `night_withdraw` | 夜间配对重算原因、控制器撤退；撤退滞回状态 |
+| `door_reseal` / `wall_gate_*` | 门切开/黄昏重封/墙门封合 |
 | `robotEvents` | 机器人出生（id + spawnHp） |
 | `wall` | 墙数量与总血量变化 |
+
+---
+
+## 请求六：任务健康度的统计口径修正（重要）
+
+**现状问题**：当前分析把 `task_ended reason=timeout` 直接记为「任务失败 / 0 分」。
+但接口文档 `PlayerTask.timeoutRounds` 写明：**任务超时强制结束时，按「此前提交过的
+通过率最高的答案」结算积分与金币**——提交是累加制。一个 `timeout` session 只要提交过
+答案就有分（可能是几十分），把它记为 0 会误诊根因（v1 路线图 P1-5）。
+
+**请把任务健康度改为**：
+
+| 指标 | 定义 | 数据源（我方 JSONL） |
+|---|---|---|
+| 提交率 | `submittedRound` 非空的 session 比例 | `round.task.submittedRound` / `task_answer_submit` 事件 |
+| 平均通过率 | 各 session 最高通过率均值（判分侧的近似） | `totalScore` 增量归因 `scoreAttr.residual` |
+| 真零分 session | **从未提交**（cmdRounds=0 或 无 `task_answer_submit`） | 同上 |
+
+「提交率」应作为任务系统改进的第一验收指标（v1 目标 ≥ 80%），而不是「timeout 次数」。
+
+---
+
+## 请求七：A/B 拨盘对战实验
+
+自本版本对应 commit 起，决策器内置 `CG_TUNE_*` 环境变量拨盘（进程启动时读取，
+默认行为与当前 commit 完全一致）。请按 A/B 方式发起对战，验证以下假设：
+
+| 实验 | 环境变量 | A 组（默认） | B 组 | 观察指标（`round.scoreAttr`） |
+|---|---|---|---|---|
+| 清怪缺口驱动资金排序 | `CG_TUNE_CLEAR_GAP` | `0` | `1` | kill / survival / residual 三项与基地存活天数 |
+| 敌基地持续压制 | `CG_TUNE_STATION_FOCUS` | `1` | `0` | `volley.enemyStationHp` 下降速度、先拆胜场数 |
+
+**要求**：每组至少 5 场（请求二）、多对手、issue 中给出**分项得分对比**（不止总分），
+并标注每场使用的拨盘值（配合请求三的 base commit 字段）。
 
 ---
 
@@ -147,7 +190,7 @@ agent_request:
   target: workflow-driver
   repo: gamelife1314/Competition
   action: improve_workflow
-  version: 5
+  version: 6
   changes:
     - id: issue_header_stats
       desc: extend improvement-issue header with cumulative stats
@@ -176,12 +219,25 @@ agent_request:
         - analysis_report_md      # workflow/analysis/*.md in full
         - issue_body_untruncated  # raise the ~200-char cut to >=2000
         - structured_summary_json # see schema in the document above
+      note: our round event now carries errorDescs (judger error text) — extract directly
     - id: log_requirements_feedback
       desc: tell us which log fields/events the analysis needs
       request: >
         List (a) which information is currently missing and forces guesswork,
         (b) desired new event names and fields (with a JSON example),
         (c) which existing events are noise and can be dropped.
+    - id: task_health_metric
+      desc: score task health by submission rate + average pass rate, not "timeout = failure"
+      metrics:
+        - {name: submission_rate, source: "task_answer_submit events / task.submittedRound", target: ">= 80% of sessions"}
+        - {name: avg_pass_rate,   source: "scoreAttr.residual attribution"}
+        - {name: true_zero_sessions, definition: "sessions with NO submission (cmdRounds=0 or no task_answer_submit)"}
+    - id: ab_dial_experiments
+      desc: run A/B battles with CG_TUNE_* env overrides
+      experiments:
+        - {env: CG_TUNE_CLEAR_GAP, a: "0", b: "1", watch: "scoreAttr kill/survival/residual + station survival days"}
+        - {env: CG_TUNE_STATION_FOCUS, a: "1", b: "0", watch: "volley.enemyStationHp drop speed, first-kill wins"}
+      requirements: ">= 5 battles per group, multiple opponents, per-objective score breakdown in the issue, dial value recorded per battle"
 ```
 
 ---
