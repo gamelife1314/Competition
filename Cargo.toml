@@ -11,11 +11,11 @@
 # cargo test". Declaring the crate as a workspace member makes the bare command
 # work from the root while leaving `cd CoreGeek && cargo ...` working unchanged.
 #
-# `.cargo/config.toml` pins `target-dir` back to `CoreGeek/target`, so both
-# entry points and `CoreGeek/run.sh` keep finding the binary where they always
-# have. `CoreGeek/Cargo.lock` is kept (format version 3) for builds that copy
-# the crate out of the repository on its own; `Cargo.lock` here is a verbatim
-# copy of it and must stay byte-identical.
+# `CoreGeek/run.sh` passes `--target-dir` so the binary always lands in
+# `CoreGeek/target/release/coregeek` whether the crate is built from here or
+# from its own directory. `CoreGeek/Cargo.lock` is kept (format version 3) for
+# builds that copy the crate out of the repository on its own; `Cargo.lock`
+# here is a verbatim copy of it and must stay byte-identical.
 [workspace]
 members = ["CoreGeek"]
 resolver = "2"
