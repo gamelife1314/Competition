@@ -143,6 +143,31 @@ pub fn decide_with(state: &mut BotState, raw_body: &[u8]) -> Result<String, Stri
     serde_json::to_string(&response).map_err(|err| err.to_string())
 }
 
+/// `score3` — the survival objective — exactly as chapter 6 of the task book
+/// defines it: `Σ 10 × day` over the days the base has stood, with 存活系数
+/// dropping to 0 on the day the base falls and every day after.
+///
+/// It is a **sum**, and getting that wrong is quiet. At day 2 the objective is
+/// worth 10 + 20 = 30, not 20; a base that fell on day 3 keeps 10 + 20 = 30
+/// rather than losing everything; and surviving the full ten days is 550, not
+/// 100. `kill` beside it in `scoreAttr` is cumulative, and `residual` subtracts
+/// both from the running total — so a survival term that is not cumulative does
+/// not merely mislabel one column, it pushes the entire discrepancy into the
+/// residual, which is the column `abreport` reads as "task score plus estimate
+/// error". At day 10 the mistake is 450 points, larger than any task score this
+/// team has ever recorded, which is why the A/B report could show the task
+/// system improving while the task score stayed at zero.
+///
+/// `fell_day` is `None` while the base stands, and the day it went missing
+/// afterwards — the coefficient is 0 for that day, so the sum stops one day
+/// short of it.
+pub fn survival_score(day: i64, fell_day: Option<i64>) -> i64 {
+    match fell_day {
+        None => 5 * day * (day + 1),
+        Some(fell) => 5 * (fell - 1) * fell,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn log_round(
     turn: &Turn,
@@ -213,9 +238,10 @@ fn log_round(
     let enemy_wall_hp: i64 = turn.enemy_walls().iter().map(|wall| wall.health).sum();
     // Score attribution. Robots that leave the board score `score2`
     // (small/middle/large/BOSS = 1/2/4/10); the survival rule of chapter 6 is
-    // `10 x day` while the station stands. Both are accumulated here so the
-    // residual — task score (`score1`) plus estimate error — separates the
-    // three objectives and shows WHICH one a change actually moved.
+    // `Σ 10 x day` over the days the base has stood. Both are accumulated here
+    // so the residual — task score (`score1`) plus estimate error — separates
+    // the three objectives and shows WHICH one a change actually moved. See
+    // [`survival_score`] for why the survival term is a sum and not a term.
     let killed: i64 = state
         .prev_robot_hp
         .iter()
@@ -223,11 +249,14 @@ fn log_round(
         .map(|(id, _)| state.prev_robot_kind.get(id).copied().unwrap_or(0))
         .sum();
     state.cum_kill_score = state.cum_kill_score.saturating_add(killed);
-    let survival_score = if turn.station().is_some() {
-        turn.day * 10
-    } else {
-        0
-    };
+    // `score3` freezes on the day the base falls, so the day it happened has to
+    // be latched the first time we see the station gone: every round after it
+    // must report the same figure, and none of them can work it out from the
+    // current day alone.
+    if turn.station().is_none() {
+        state.station_fell_day.get_or_insert(turn.day);
+    }
+    let survival_score = survival_score(turn.day, state.station_fell_day);
     let residual = turn.total_score - state.cum_kill_score - survival_score;
     let pairs: serde_json::Value = state
         .night_pairs

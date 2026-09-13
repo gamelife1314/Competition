@@ -205,3 +205,32 @@ fn report_defaults_are_neutral() {
     assert_eq!(report.score1_proxy(), 0);
     assert_eq!(report.enemy_station_down_day, None);
 }
+
+/// The survival objective is the one figure in `scoreAttr` a reader is most
+/// likely to take as a single day's term rather than a running sum, because
+/// the mistake only shows up two days in. These are the task book's own
+/// numbers (chapter 6, `Σ 10 × day` with 存活系数 = 1 while the base stands):
+/// a base destroyed on day 3 keeps 10 + 20 = 30, and surviving the full half
+/// is worth 550.
+#[test]
+fn the_survival_objective_is_a_running_sum_not_one_days_term() {
+    use coregeek::brain::survival_score;
+
+    // Base standing: the sum of every day so far.
+    assert_eq!(survival_score(1, None), 10, "day 1: 10");
+    assert_eq!(survival_score(2, None), 30, "day 2: 10 + 20, not 20");
+    assert_eq!(survival_score(3, None), 60, "day 3: 10 + 20 + 30, not 30");
+    assert_eq!(survival_score(10, None), 550, "a full half is worth 550, not 100");
+
+    // Base gone: frozen one day short of the day it fell, for every round after.
+    assert_eq!(survival_score(3, Some(3)), 30, "fell on day 3: keeps days 1-2");
+    assert_eq!(survival_score(7, Some(3)), 30, "and keeps exactly that");
+    assert_eq!(survival_score(2, Some(2)), 10, "fell on day 2: keeps day 1");
+    assert_eq!(survival_score(1, Some(1)), 0, "fell on day 1: nothing accrued");
+
+    // The shape of the bug this replaced: `day * 10` is the day's *increment*
+    // for day 1 only. Reading it as the running total under-reports by 450 at
+    // day 10 — larger than any task score on record — and that difference lands
+    // in `residual`, which `abreport` presents as the task score.
+    assert!(survival_score(10, None) - 10 * 10 == 450);
+}

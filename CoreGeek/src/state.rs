@@ -362,6 +362,11 @@ pub struct BotState {
     /// Running estimate of earned kill score, used to split the total into
     /// kill / survival / residual (task) components.
     pub cum_kill_score: i64,
+    /// The day our station first went missing, latched once. `score3` keeps
+    /// every day up to but NOT including this one (存活系数 drops to 0 on the
+    /// day the base falls and after), so the rounds that follow cannot be
+    /// recomputed from the current day alone — they need the day it happened.
+    pub station_fell_day: Option<i64>,
     /// Last-written signatures of the change-gated blocks in the `round`
     /// record (`log::changed`). Purely a logging concern, but it has to survive
     /// from one round to the next, which makes this the only place it can live.
