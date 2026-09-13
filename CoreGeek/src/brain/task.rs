@@ -76,6 +76,21 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
     state.task.result_history.push(truncate(result, 1200));
     let output = strip_status_line(result);
     let code = exit_code(result);
+    // The reconnaissance echo travels with every run: the script reports the
+    // output schema it read in the sandbox task file, and the schema gate
+    // trusts that over anything the placeholder `phaseTask` text implies.
+    if let Some(fields) = extract_fields(output) {
+        if !fields.is_empty() && fields != state.task.discovered_fields {
+            crate::log::event(
+                "task_fields",
+                serde_json::json!({
+                    "session": state.task.session_id,
+                    "fields": fields,
+                }),
+            );
+            state.task.discovered_fields = fields;
+        }
+    }
     if let Some(answer) = extract_answer(output) {
         if is_meta_answer(&answer) {
             // A meta-description of the parsing step ({"status":"parsed",...})
@@ -218,14 +233,37 @@ pub fn plan_pioneer(
             None
         }
         TaskStage::HaveAnswer { answer } => {
-            // Schema check before submitting: an answer whose shape does not
-            // match what the task asked for scores nothing, and the round is
-            // better spent re-planning with the missing fields named. Inside
-            // the last few rounds the partial pass rate is worth more than the
-            // chance of a complete answer, so the check yields.
-            let gaps = answer_schema_gaps(&state.task.description, &answer);
-            let extras = answer_schema_extras(&state.task.description, &answer);
-            if (!gaps.is_empty() || !extras.is_empty()) && rounds_left > SCHEMA_GRACE {
+            // The red line, defence in depth: meta-descriptions, sentinels and
+            // exploratory output are filtered upstream of every path into this
+            // arm, but they are NEVER submitted no matter how they arrived —
+            // with submit-as-accumulating there is no later gate to catch them.
+            if is_meta_answer(&answer) || is_failure_answer(&answer) {
+                crate::log::event(
+                    "task_answer_blocked",
+                    serde_json::json!({
+                        "session": state.task.session_id,
+                        "answer": truncate(&answer, 60),
+                    }),
+                );
+                state.task.stage = TaskStage::Planning;
+                return None;
+            }
+            // SUBMIT-AS-ACCUMULATING. The judger scores every submission and
+            // keeps the highest pass rate (任务书 ch.5: 超时后"以之前提交过的
+            // 通过率最高的答案计算积分与金币"), so the answer in hand is banked
+            // the round it exists: a partially-correct submission raises the
+            // floor and costs nothing. The old pre-submit schema gate held the
+            // answer back whenever the schema looked incomplete — which is
+            // every session, since the schema is only fully known after the
+            // judger's verdict. Submit first, then let the rejection (or the
+            // recorded gap analysis) drive a replan that overwrites the banked
+            // answer with a better one. The red line stands: meta answers,
+            // sentinels and exploratory output never reach this arm
+            // (`on_cmd_result` and `partial_answer` filter them upstream).
+            let fields = schema_fields(state);
+            let gaps = schema_gaps(&fields, &answer);
+            let extras = schema_extras(&fields, &answer);
+            if !gaps.is_empty() || !extras.is_empty() {
                 crate::log::event(
                     "task_answer_schema",
                     serde_json::json!({
@@ -237,8 +275,6 @@ pub fn plan_pioneer(
                 );
                 state.task.schema_gaps = gaps;
                 state.task.schema_extras = extras;
-                state.task.stage = TaskStage::Planning;
-                return None;
             }
             // The exact bytes handed to the judger. Issue #15: the logged
             // `task_answer_found` and the submitted payload had drifted apart
@@ -246,7 +282,7 @@ pub fn plan_pioneer(
             // two), which made a scored-zero task impossible to diagnose from
             // the log. One event per submission, carrying what was actually
             // sent, closes that gap for good.
-            let payload = submittable_answer(&state.task.description, &answer);
+            let payload = submittable_answer_for(&fields, &state.task.description, &answer);
             crate::log::event(
                 "task_answer_submit",
                 serde_json::json!({
@@ -288,12 +324,19 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
     prompt.push_str(
         "1. 给出可直接执行的命令或脚本（放在 ```bash 或 ```python 代码块中），完成全部子任务。\n",
     );
-    prompt.push_str("2. 脚本最后一行必须打印 `ANSWER: <最终答案>`，多字段答案用 JSON 表示。\n");
-    prompt.push_str("3. 脚本要可复用：把可变参数（如城市名、文件名、数量）写成 `{{参数名}}` 占位符，参数名必须与任务描述里出现的字段名完全一致（例如描述里的“城市名”就用 `{{城市名}}`），脚本中不要写死具体取值；同一类任务下次会复用这段脚本并按新描述自动填参。\n");
-    prompt.push_str("4. 尽量在一个脚本内完成全部步骤（find 找文件 → cat 读取 → 计算 → 打印 ANSWER），不要分多轮试探；只有带 `ANSWER:` 标记的输出才会被当作答案提交。\n");
-    prompt.push_str("5. `ANSWER:` 后面必须是真实结果（数字/字符串/JSON）。找不到文件或算不出来时，**不要**打印 ANSWER 行，也不要用 `xxx`、`failed_to_extract`、`TODO`、`unknown`、`N/A` 之类的占位符占位——那会被判错并浪费一整轮；直接把报错信息打印到 stderr 即可，脚本会带着错误重试。\n");
-    prompt.push_str("6. `ANSWER:` 后面**只放任务要的那个值**：是数字就只放数字（不要带单位、不要加解释），是 Markdown 标题、表格或说明文字都不算答案。多字段答案只写任务描述里点名的字段，不要自行增加 `status`、`note`、`task_id` 这类字段——判分按要求的字段逐个比对，多写一个字段会被判错。\n");
-    prompt.push_str("7. 打印 ANSWER 前先自检一次：确认这个值确实由脚本从任务数据里算出来（而不是照着题面猜的或照抄示例），位数/单位/大小写与任务要求一致。\n");
+    prompt.push_str("2. 执行顺序固定为【侦察→作答】两段：先用 find/ls 定位并 cat 任务文件与相关文档（如 API_DOCS.md），确认接口地址、认证方式、输入数据、以及任务【要求输出的字段名】；再计算答案。侦察结论必须用一行 `FIELDS: 字段1,字段2` 打印出来（字段名以任务文件原文为准；单值答案打印 `FIELDS: value`）。即使本轮还算不出答案，也要先把已确认的字段通过 FIELDS 行打印出来——下一轮会带着它继续。\n");
+    prompt.push_str("3. 脚本最后一行必须打印 `ANSWER: <最终答案>`，多字段答案用 JSON 表示，且 JSON 的字段名必须与 FIELDS 行完全一致。\n");
+    prompt.push_str("4. 脚本要可复用：把可变参数（如城市名、文件名、数量）写成 `{{参数名}}` 占位符，参数名必须与任务描述里出现的字段名完全一致（例如描述里的“城市名”就用 `{{城市名}}`），脚本中不要写死具体取值；同一类任务下次会复用这段脚本并按新描述自动填参。\n");
+    prompt.push_str("5. 尽量在一个脚本内完成全部步骤（find 找文件 → cat 读取 → 计算 → 打印 FIELDS 与 ANSWER），不要分多轮试探；只有带 `ANSWER:` 标记的输出才会被当作答案提交。\n");
+    prompt.push_str("6. `ANSWER:` 后面必须是真实结果（数字/字符串/JSON）。找不到文件或算不出来时，**不要**打印 ANSWER 行，也不要用 `xxx`、`failed_to_extract`、`TODO`、`unknown`、`N/A` 之类的占位符占位——那会被判错并浪费一整轮；直接把报错信息打印到 stderr 即可，脚本会带着错误重试。\n");
+    prompt.push_str("7. `ANSWER:` 后面**只放任务要的那个值**：是数字就只放数字（不要带单位、不要加解释），是 Markdown 标题、表格或说明文字都不算答案。多字段答案只写任务文件里点名的字段，不要自行增加 `status`、`note`、`task_id` 这类字段——判分按要求的字段逐个比对，多写一个字段会被判错。\n");
+    prompt.push_str("8. 打印 ANSWER 前先自检一次：确认这个值确实由脚本从任务数据里算出来（而不是照着题面猜的或照抄示例），位数/单位/大小写与任务要求一致。\n");
+    if !state.task.discovered_fields.is_empty() {
+        prompt.push_str(&format!(
+            "\n已从任务文件确认的输出字段：{}。ANSWER 的 JSON 必须恰好包含这些字段，不多不少。\n",
+            state.task.discovered_fields.join("、")
+        ));
+    }
     if !state.task.result_history.is_empty() {
         prompt.push_str("\n上次执行输出（请修正错误）：\n");
         let start = state.task.result_history.len().saturating_sub(2);
@@ -421,6 +464,100 @@ pub fn extract_answer(output: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Parse the reconnaissance echo: a `FIELDS:` line naming the exact output
+/// fields the sandbox task file demands (P0-2). The placeholder `phaseTask`
+/// description names no fields, so the script — which has read the real task
+/// file inside the sandbox — is the only honest source of the schema. The
+/// last FIELDS line wins (a later script may correct an earlier guess).
+pub fn extract_fields(output: &str) -> Option<Vec<String>> {
+    let trimmed = output.trim_end_matches("[TRUNCATED]").trim();
+    for line in trimmed.lines().rev() {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("FIELDS:")
+            .or_else(|| line.strip_prefix("字段:"))
+            .or_else(|| line.strip_prefix("字段："));
+        let Some(rest) = rest else {
+            continue;
+        };
+        let fields: Vec<String> = rest
+            .split([',', '，', '、', ';', '；', ' ', '\t'])
+            .map(|token| {
+                token
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+            })
+            .filter(|token| !token.is_empty() && token.chars().count() <= 24)
+            .filter(|token| {
+                !matches!(token.to_lowercase().as_str(), "none" | "n/a" | "无" | "未知")
+            })
+            .map(|token| token.to_string())
+            .fold(Vec::new(), |mut acc, token| {
+                if !acc.contains(&token) {
+                    acc.push(token);
+                }
+                acc
+            });
+        return Some(fields.into_iter().take(8).collect());
+    }
+    None
+}
+
+/// The schema the answer is checked against: the sandbox-echoed FIELDS when
+/// a script has reported them, else the fields guessed from the task text.
+fn schema_fields(state: &BotState) -> Vec<String> {
+    if state.task.discovered_fields.is_empty() {
+        expected_fields(&state.task.description)
+    } else {
+        state.task.discovered_fields.clone()
+    }
+}
+
+/// The answer as the judger should receive it, given the schema a script has
+/// echoed. Two or more named fields mean the judger compares an object field
+/// by field, so the object is submitted untouched. A single named field means
+/// the answer IS that one value: a one-key wrapper around it is the bot's own
+/// formatting (issue #15 lost a task whose sandbox had printed the right
+/// token, because `{"token":"fc1e78eb2a5a"}` was submitted where the bare
+/// value was compared), so it is unwrapped. With no echo at all the legacy
+/// description heuristic decides.
+pub fn submittable_answer_for(fields: &[String], description: &str, answer: &str) -> String {
+    if fields.len() >= 2 {
+        return answer.to_string();
+    }
+    if fields.len() == 1 {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(answer)
+        {
+            if map.len() == 1 {
+                let bare = map
+                    .values()
+                    .next()
+                    .and_then(bare_scalar);
+                if let Some(bare) = bare {
+                    return bare;
+                }
+            }
+        }
+        return answer.to_string();
+    }
+    submittable_answer(description, answer)
+}
+
+/// A scalar rendered bare, or None when the value is structured/empty.
+fn bare_scalar(value: &serde_json::Value) -> Option<String> {
+    let bare = match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        _ => return None,
+    };
+    if bare.trim().is_empty() {
+        None
+    } else {
+        Some(bare)
+    }
 }
 
 /// The answer as the judger should receive it.
@@ -566,23 +703,27 @@ pub fn is_failure_answer(answer: &str) -> bool {
 /// Return the strongest structured result seen so far. Only explicit answer
 /// markers qualify; raw listings, tracebacks and task prose remain excluded.
 ///
-/// With no confirmed answer, every `ANSWER:` object in the command history is
-/// merged field-by-field so a run that only printed part of the result still
-/// earns its pass rate instead of submitting nothing.
+/// Every evidence-backed answer the session produced — the banked
+/// `best_answer` included — is merged field-by-field so the deadline
+/// submission covers the most schema fields: with submit-as-accumulating the
+/// judger keeps the highest pass rate ever submitted, so the fallback's job
+/// is to make the final attempt the union of everything the sandbox has
+/// already vouched for. No evidence, no submission (the red line).
 pub fn partial_answer(state: &BotState) -> Option<String> {
-    if !state.task.best_answer.is_empty()
-        && !is_meta_answer(&state.task.best_answer)
-        && !is_failure_answer(&state.task.best_answer)
-    {
-        return Some(state.task.best_answer.clone());
-    }
-    let answers: Vec<String> = state
+    let mut answers: Vec<String> = state
         .task
         .result_history
         .iter()
         .filter_map(|result| extract_answer(strip_status_line(result)))
         .filter(|answer| !is_meta_answer(answer) && !is_failure_answer(answer))
         .collect();
+    if !state.task.best_answer.is_empty()
+        && !is_meta_answer(&state.task.best_answer)
+        && !is_failure_answer(&state.task.best_answer)
+        && !answers.iter().any(|old| *old == state.task.best_answer)
+    {
+        answers.push(state.task.best_answer.clone());
+    }
     let best = answers.last()?.clone();
     Some(merge_json_fields(&answers).unwrap_or(best))
 }
@@ -608,10 +749,6 @@ pub fn merge_json_fields(answers: &[String]) -> Option<String> {
     }
     serde_json::to_string(&serde_json::Value::Object(merged)).ok()
 }
-
-/// Rounds of grace before a schema mismatch is submitted anyway: re-planning
-/// costs a round-trip, so past this point the partial pass rate wins.
-const SCHEMA_GRACE: i64 = 4;
 
 /// Field names the task text asks the answer to carry.
 ///
@@ -704,44 +841,72 @@ pub fn expected_fields(description: &str) -> Vec<String> {
     fields
 }
 
-/// Fields the task asked for that `answer` does not carry. Empty means "pass"
-/// — either the answer is complete or no schema could be derived.
-pub fn answer_schema_gaps(description: &str, answer: &str) -> Vec<String> {
-    let fields = expected_fields(description);
+/// Fields the schema asks for that `answer` does not carry. Empty means
+/// "pass" — either the answer is complete or the schema is too weak to check
+/// against (fewer than two fields), because a false positive here would
+/// reject a correct answer.
+pub fn schema_gaps(fields: &[String], answer: &str) -> Vec<String> {
     if fields.len() < 2 {
         return Vec::new();
     }
     let keys = json_keys(answer);
     let lower = answer.to_lowercase();
     fields
-        .into_iter()
+        .iter()
         .filter(|field| {
             let name = field.to_lowercase();
             !keys.iter().any(|key| *key == name) && !lower.contains(&name)
         })
+        .cloned()
         .collect()
 }
 
-/// Keys the answer carries that the task never asked for. Empty means "pass".
+/// Fields the task text asks for that `answer` does not carry — the
+/// description-derived wrapper of [`schema_gaps`].
+pub fn answer_schema_gaps(description: &str, answer: &str) -> Vec<String> {
+    schema_gaps(&expected_fields(description), answer)
+}
+
+/// Keys the answer carries that the schema never asked for. Empty means
+/// "pass".
 ///
-/// The other half of [`answer_schema_gaps`], and a scoring failure in its own
+/// The other half of [`schema_gaps`], and a scoring failure in its own
 /// right: the judger compares the submitted object against the schema it asked
 /// for, so an extra field is a wrong answer even when every required field is
 /// right. Issue #22's session 5 submitted
 /// `{"city": "Nanjing", "task_id": 2, "status": "completed"}` for a task that
 /// asked for two fields and got the `status` it invented on top. Same gate as
-/// the missing-field check: only when the task text names a real schema (two or
-/// more fields), and only when the answer is actually a JSON object — a bare
-/// scalar has no keys to be extra.
-pub fn answer_schema_extras(description: &str, answer: &str) -> Vec<String> {
-    if expected_fields(description).len() < 2 {
+/// the missing-field check: only with a real schema (two or more fields), and
+/// only when the answer is actually a JSON object — a bare scalar has no keys
+/// to be extra.
+pub fn schema_extras(fields: &[String], answer: &str) -> Vec<String> {
+    if fields.len() < 2 {
         return Vec::new();
     }
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(answer)
     else {
         return Vec::new();
     };
+    map.keys()
+        .filter(|key| {
+            let name = key.to_lowercase();
+            !fields.iter().any(|field| field.to_lowercase() == name)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Keys the answer carries that the task text never asked for — the
+/// description-derived wrapper of [`schema_extras`].
+pub fn answer_schema_extras(description: &str, answer: &str) -> Vec<String> {
+    if expected_fields(description).len() < 2 {
+        return Vec::new();
+    }
     let lower = description.to_lowercase();
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(answer)
+    else {
+        return Vec::new();
+    };
     map.keys()
         .filter(|key| !lower.contains(&key.to_lowercase()))
         .cloned()

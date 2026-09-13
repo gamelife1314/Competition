@@ -304,9 +304,11 @@ fn a_field_the_task_never_asked_for_is_a_wrong_answer() {
         "every required field is present — the extra one is the whole defect"
     );
 
-    // The judge: an answer that carries the invented field goes back to
-    // Planning with the field named in the next prompt; the same answer without
-    // it is submitted.
+    // The judge, after submit-as-accumulating (P0-1): the misshapen answer is
+    // BANKED immediately — the judger keeps the highest pass rate ever
+    // submitted, so holding it back can only lower the floor. The invented
+    // field is recorded for the next prompt, and the judger's rejection (or the
+    // recorded extras) drives the replan that overwrites the banked attempt.
     let mut state = BotState::default();
     state.task.active = true;
     state.task.session_id = 5;
@@ -319,13 +321,13 @@ fn a_field_the_task_never_asked_for_is_a_wrong_answer() {
     state.task.timeout_round = turn.round_no + 20;
     let pioneer = turn.pioneer().expect("the world has a pioneer");
     let mut plan = Plan::default();
+    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan)
+        .expect("the attempt is banked even with the shape wrong");
+    assert_eq!(cmd.action, "submitAnswer");
     assert!(
-        coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan).is_none(),
-        "nothing is submitted while the shape is wrong"
-    );
-    assert!(
-        matches!(state.task.stage, TaskStage::Planning),
-        "the session re-plans instead of submitting a guaranteed zero"
+        matches!(state.task.stage, TaskStage::WaitingSubmit { .. }),
+        "the session waits for the judger's verdict, got {:?}",
+        state.task.stage
     );
     assert_eq!(state.task.schema_extras, vec!["status"]);
     assert!(coregeek::brain::task::build_prompt(&state, &turn).contains("status"));
@@ -454,7 +456,7 @@ fn expected_fields_only_fires_on_an_explicit_schema() {
 }
 
 #[test]
-fn answer_missing_required_fields_is_sent_back_to_planning() {
+fn answer_missing_required_fields_is_banked_and_feedback_recorded() {
     let turn = turn_from(task_world(6));
     let mut state = BotState::default();
     state.task.active = true;
@@ -463,35 +465,68 @@ fn answer_missing_required_fields_is_sent_back_to_planning() {
     state.task.timeout_round = 260;
     state.task.task_type = "自进化类1".into();
     state.task.description = "统计结果，输出 JSON，包含 name 和 count".into();
-    // Exactly the class of answer that scored zero in issue #11: a description
-    // of the parsing step instead of the result.
+    // A genuinely incomplete answer: one of the two required fields.
     state.task.stage = TaskStage::HaveAnswer {
-        answer: "{\"status\":\"parsed\",\"content_length\":534}".into(),
+        answer: "{\"name\": \"a.txt\"}".into(),
     };
 
     let pioneer = turn.role_by_id(10011).unwrap();
     let mut plan = Plan::default();
-    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan)
+        .expect("the partial answer is banked, not held back");
 
-    assert!(
-        plan.commands.is_empty()
-            || plan
-                .commands
-                .values()
-                .all(|cmd| cmd.action != "submitAnswer"),
-        "a schema-mismatched answer is not submitted"
+    assert_eq!(
+        cmd.action, "submitAnswer",
+        "submit-as-accumulating: the judger keeps the best pass rate, so the partial attempt is banked"
     );
     assert!(
-        matches!(state.task.stage, TaskStage::Planning),
-        "and the round is spent re-planning, got {:?}",
+        matches!(state.task.stage, TaskStage::WaitingSubmit { .. }),
+        "then the session waits for the verdict, got {:?}",
         state.task.stage
     );
-    assert_eq!(state.task.schema_gaps, vec!["name", "count"]);
+    assert_eq!(
+        state.task.schema_gaps,
+        vec!["count"],
+        "the missing field is recorded for the replan that follows the rejection"
+    );
     let prompt = coregeek::brain::task::build_prompt(&state, &turn);
     assert!(
-        prompt.contains("name") && prompt.contains("count"),
-        "the retry prompt names the missing fields"
+        prompt.contains("count"),
+        "the retry prompt names the missing field"
     );
+}
+
+#[test]
+fn a_meta_or_sentinel_answer_is_never_submitted() {
+    // The red line, at the last gate it could ever cross: every production path
+    // into HaveAnswer filters meta/sentinel answers upstream, but even if one
+    // arrived there it is sent back to Planning, never submitted.
+    let turn = turn_from(task_world(6));
+    for answer in [
+        "{\"status\":\"parsed\",\"content_length\":534}",
+        "failed_to_extract",
+    ] {
+        let mut state = BotState::default();
+        state.task.active = true;
+        state.task.session_id = 1;
+        state.task.accepted_round = 6;
+        state.task.timeout_round = 260;
+        state.task.task_type = "自进化类1".into();
+        state.task.description = "统计结果，输出 JSON，包含 name 和 count".into();
+        state.task.stage = TaskStage::HaveAnswer {
+            answer: answer.into(),
+        };
+        let pioneer = turn.role_by_id(10011).unwrap();
+        let mut plan = Plan::default();
+        assert!(
+            coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan).is_none(),
+            "{answer:?} is never submitted"
+        );
+        assert!(
+            matches!(state.task.stage, TaskStage::Planning),
+            "{answer:?} goes back to Planning"
+        );
+    }
 }
 
 #[test]
@@ -519,7 +554,7 @@ fn answer_with_every_required_field_is_submitted() {
 #[test]
 fn schema_gaps_never_block_submission_near_the_timeout() {
     // Two rounds left: a partial answer still earns its pass rate, so the
-    // schema check must yield instead of gambling on a fresh plan.
+    // submission must go out instead of gambling on a fresh plan.
     let turn = turn_from(task_world(6));
     let mut state = BotState::default();
     state.task.active = true;
@@ -529,7 +564,7 @@ fn schema_gaps_never_block_submission_near_the_timeout() {
     state.task.task_type = "自进化类1".into();
     state.task.description = "统计结果，输出 JSON，包含 name 和 count".into();
     state.task.stage = TaskStage::HaveAnswer {
-        answer: "{\"status\":\"parsed\"}".into(),
+        answer: "{\"name\": \"a.txt\"}".into(),
     };
 
     let pioneer = turn.role_by_id(10011).unwrap();
@@ -550,6 +585,98 @@ fn partial_answer_merges_fields_observed_across_runs() {
     let value: Value = serde_json::from_str(&merged).expect("merged answer is JSON");
     assert_eq!(value["name"], json!("a.txt"));
     assert_eq!(value["count"], json!(7));
+}
+
+#[test]
+fn partial_answer_includes_the_banked_best_in_the_merge() {
+    // Submit-as-accumulating banks every attempt, so the deadline fallback must
+    // merge the banked best WITH the run history — a field that only ever
+    // appeared in best_answer is still evidence the sandbox produced.
+    let mut state = BotState::default();
+    state.task.result_history = vec!["[exitCode:0]\nANSWER: {\"name\": \"a.txt\"}".into()];
+    state.task.best_answer = "{\"count\": 7}".into();
+    let merged = partial_answer(&state).expect("a partial answer is built");
+    let value: Value = serde_json::from_str(&merged).expect("merged answer is JSON");
+    assert_eq!(value["name"], json!("a.txt"));
+    assert_eq!(value["count"], json!(7));
+
+    // A banked best that is a meta/sentinel value still never qualifies.
+    let mut state = BotState::default();
+    state.task.best_answer = "failed_to_extract".into();
+    assert!(partial_answer(&state).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// P0-2: the FIELDS echo — the schema read out of the sandbox task file.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fields_echo_is_parsed_from_command_output() {
+    use coregeek::brain::task::extract_fields;
+    assert_eq!(
+        extract_fields("[exitCode:0]\nFIELDS: city, temperature\nANSWER: {}"),
+        Some(vec!["city".to_string(), "temperature".to_string()])
+    );
+    // Chinese separators, a scalar answer, and no echo at all.
+    assert_eq!(
+        extract_fields("FIELDS: city、temperature"),
+        Some(vec!["city".to_string(), "temperature".to_string()])
+    );
+    assert_eq!(extract_fields("FIELDS: none"), Some(vec![]));
+    assert_eq!(extract_fields("just a file listing"), None);
+}
+
+#[test]
+fn discovered_fields_drive_the_schema_gate() {
+    // The placeholder description names no fields ("请阅读task_X.md，获取任务
+    // 信息"), so without the echo the gate has nothing to check against. Once
+    // the script reports the real schema from the sandbox file, an answer
+    // missing one of those fields is caught — and still banked.
+    let turn = turn_from(task_world(6));
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 6;
+    state.task.timeout_round = 260;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "请阅读task_1.md，获取任务信息".into();
+    state.task.discovered_fields = vec!["city".into(), "temperature".into()];
+    state.task.stage = TaskStage::HaveAnswer {
+        answer: "{\"city\": \"北京\"}".into(),
+    };
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut plan = Plan::default();
+    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan)
+        .expect("the incomplete answer is still banked");
+    assert_eq!(cmd.action, "submitAnswer");
+    assert_eq!(state.task.schema_gaps, vec!["temperature"]);
+    assert!(coregeek::brain::task::build_prompt(&state, &turn).contains("temperature"));
+}
+
+#[test]
+fn discovered_fields_drive_the_unwrap_decision() {
+    use coregeek::brain::task::submittable_answer_for;
+    // Two or more echoed fields: the judger compares an object — untouched.
+    let object = "{\"city\":\"Nanjing\",\"task_id\":2}";
+    assert_eq!(
+        submittable_answer_for(
+            &["city".into(), "task_id".into()],
+            "whatever",
+            object
+        ),
+        object
+    );
+    // One echoed field: the answer IS that value — a one-key wrapper is the
+    // bot's own formatting and comes off (issue #15's lesson).
+    assert_eq!(
+        submittable_answer_for(&["token".into()], "whatever", "{\"token\":\"abc123\"}"),
+        "abc123"
+    );
+    // No echo: the legacy description heuristic decides.
+    assert_eq!(
+        submittable_answer_for(&[], "统计行数", "{\"count\":42}"),
+        "42"
+    );
 }
 
 #[test]

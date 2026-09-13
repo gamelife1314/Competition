@@ -2909,7 +2909,12 @@ fn sop_reuse_requires_a_fingerprint_match_not_just_a_task_type() {
 }
 
 #[test]
-fn incomplete_answer_replans_while_there_is_still_time() {
+fn incomplete_answer_is_banked_with_feedback_for_the_replan() {
+    // Submit-as-accumulating (P0-1): an answer missing required fields is
+    // banked the round it exists — the judger keeps the highest pass rate ever
+    // submitted, so holding it back can only lower the floor. The missing
+    // fields are recorded so the replan that follows the rejection overwrites
+    // the banked attempt with a better one.
     let turn = turn_from(day_world_at(
         day_round(30),
         vec![pioneer_with(vec![])],
@@ -2927,14 +2932,13 @@ fn incomplete_answer_replans_while_there_is_still_time() {
     };
 
     let mut plan = coregeek::brain::Plan::default();
-    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan)
+        .expect("the partial answer is banked, not held back");
+    assert_eq!(cmd.action, "submitAnswer");
     assert!(
-        cmd.is_none(),
-        "an answer missing required fields is not submitted yet"
-    );
-    assert!(
-        matches!(state.task.stage, coregeek::state::TaskStage::Planning),
-        "the task re-plans instead"
+        matches!(state.task.stage, coregeek::state::TaskStage::WaitingSubmit { .. }),
+        "then the session waits for the verdict, got {:?}",
+        state.task.stage
     );
     assert_eq!(
         state.task.schema_gaps,
@@ -2946,8 +2950,8 @@ fn incomplete_answer_replans_while_there_is_still_time() {
         "the retry prompt asks for the missing fields"
     );
 
-    // Near the deadline the partial pass rate is worth more than the chance of
-    // a complete answer, so the schema gate yields.
+    // The deadline changes nothing: the banked partial is never traded for a
+    // gamble on a fresh plan, near the timeout or far from it.
     state.task.timeout_round = turn.round_no + 2;
     state.task.stage = coregeek::state::TaskStage::HaveAnswer {
         answer: "{\"城市\":\"上海\"}".into(),
@@ -2956,7 +2960,7 @@ fn incomplete_answer_replans_while_there_is_still_time() {
     assert_eq!(
         cmd.map(|command| command.action),
         Some("submitAnswer".to_string()),
-        "past the grace window the partial answer is submitted"
+        "the partial answer is submitted at the deadline too"
     );
 }
 

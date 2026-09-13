@@ -86,6 +86,12 @@ pub struct TaskSession {
     /// wrong on its own (`{"city":…,"task_id":…,"status":"completed"}` — issue
     /// #22's session 5). Fed back into the next prompt like `schema_gaps`.
     pub schema_extras: Vec<String>,
+    /// The output schema the sandbox task file actually demands, echoed back
+    /// by the script itself through a `FIELDS:` line (P0-2). The placeholder
+    /// `phaseTask` text ("请阅读task_X.md，获取任务信息") names no fields, so the
+    /// description-derived `expected_fields` is only a fallback guess — the
+    /// schema lives inside the sandbox and this is the channel that reads it.
+    pub discovered_fields: Vec<String>,
     /// Consecutive `[JUDGER_ERROR]` verdicts that name `executeCmd` as
     /// unavailable. That error is the judger telling us the task's execution
     /// window is shut — issue #17's two sessions fired four and one command
@@ -298,6 +304,18 @@ pub struct BotState {
     /// `brain::night::withdrawing`). Sorted. The pairing prefers a fit
     /// controller, so a change here invalidates it.
     pub night_pair_withdrawing: Vec<i64>,
+
+    /// P1-4 withdrawal hysteresis (additive; owned by the night-side change).
+    /// Controllers currently in a holdout: they have been withdrawn from their
+    /// gun for long enough that the pairing should stop handing it back to
+    /// them until they actually recover. Membership is maintained by
+    /// `brain::night` once that change lands; an empty set reproduces the
+    /// pre-hysteresis behaviour exactly.
+    pub withdraw_holdout: HashSet<i64>,
+    /// Controller id -> last round a robot was seen inside its threat radius.
+    /// The hysteresis uses this to tell "chronically threatened" (stay in
+    /// holdout) from "the danger has passed" (eligible to man a gun again).
+    pub withdraw_last_threat: HashMap<i64, i64>,
 
     /// D1 gate stays open until every controller has reached an inside/tower
     /// stand, then remains sealed for the rest of the half.
