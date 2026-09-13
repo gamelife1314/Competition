@@ -7,10 +7,11 @@
 //! comparison has to be per-objective, not on the final total alone.
 //!
 //! `brain::mod::log_round` already attributes the running total to
-//! `score2` (robots destroyed: 1/2/4/10) and `score3` (survival, `10 x day`
-//! while the station stands). What is left over is `score1` (tasks) plus the
-//! attribution error, so the report calls it `s1+err` rather than pretending to
-//! a precision it does not have.
+//! `score2` (robots destroyed: 1/2/4/10) and `score3` (survival, `Σ 10 x day`
+//! over the days the station has stood — a SUM, not a day's increment, so
+//! nothing here ever has to add the days up). What is left over is `score1`
+//! (tasks) plus the attribution error, so the report calls it `s1+err` rather
+//! than pretending to a precision it does not have.
 //!
 //! This module is pure: it turns log lines into structs and structs into a
 //! table. `src/bin/ab_report.rs` is the file-reading wrapper.
