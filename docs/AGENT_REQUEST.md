@@ -65,14 +65,61 @@
 
 ---
 
-## 三项请求汇总（机器可读）
+## 请求三：记录本次对战所基于的代码 commit
+
+### 现状
+
+issue 里没有说明这次对战用的是哪个版本的代码。
+
+### 请在报告头部增加
+
+| 字段 | 含义 | 示例 |
+|---|---|---|
+| 对战代码版本 | 发起该场对战时使用的 git commit（短 hash + 提交时间） | `b03b1c8 (2026-09-13 08:30)` |
+
+如果一批对战包含多个 commit，请分别为每场标记，或在批次头部列出涉及的 commit 列表。
+
+### 为什么需要
+
+自动 workflow 拉取代码、发起对战、下载日志、分析、生成 issue 之间存在**时间差**。
+我们这边也在持续改进（本地 agent 会不断 commit），所以：
+
+1. **日志与当前代码可能不匹配**：分析中提到的代码位置、行号、函数名，可能在我们当前的
+   HEAD 里已经不存在或已经改过，导致“照着 issue 去改却发现找不到代码”。
+2. **重复分析已修问题**：如果对战用的是旧 commit，issue 里的问题可能已经被后续 commit 修掉，
+   白白浪费一轮改进。
+3. **可复现性**：有了 base commit，可以 checkout 到那个版本重现日志，而不是对着
+   已变化的代码猜。
+4. **判断改进是否生效**：把 base commit 与战绩（请求一）关联起来，才能看出哪个 commit
+   之后胜率开始变化。
+
+### 建议输出格式
+
+```
+# 改进任务：自动对战分析报告
+
+生成时间: 2026-09-13 08:12:11
+对战代码版本: b03b1c8 (2026-09-13 08:30)
+当前排名: 12 / 64
+累计战绩: 8 胜 5 负 1 平
+胜率: 57.1%
+分析场次: 5 (胜 2 / 负 3 / 平或未知 0)
+
+历史对局代码版本（如涉及多个）：
+  pk575557: 8de90f3 (2026-09-13 08:26)
+  pk575412: b03b1c8 (2026-09-13 08:30)
+```
+
+---
+
+## 四项请求汇总（机器可读）
 
 ```yaml
 agent_request:
   target: workflow-driver
   repo: gamelife1314/Competition
   action: improve_workflow
-  version: 2
+  version: 3
   changes:
     - id: issue_header_stats
       desc: extend improvement-issue header with cumulative stats
@@ -87,11 +134,17 @@ agent_request:
       desc: raise the number of battles initiated per round
       from: 3
       to: 5
+    - id: battle_base_commit
+      desc: record the code commit each battle was fought on
+      add_fields:
+        - {name: battle_base_commit, desc: "git commit hash + time used to launch the battle", example: "b03b1c8 (2026-09-13 08:30)"}
+      per_battle: true
+      placement: after "生成时间" line
 ```
 
 ## English summary
 
-Please improve the battle workflow in two ways:
+Please improve the battle workflow in three ways:
 
 1. **Issue header stats** — extend the auto-generated improvement-issue header
    with cumulative battle statistics: current rank, cumulative wins, losses,
@@ -100,6 +153,14 @@ Please improve the battle workflow in two ways:
    from **3 to 5**. Three matches are too few to separate signal from noise
    (opponent strength, spawn side, map randomness dominate); the win rate only
    becomes meaningful with 5+ samples per round.
+3. **Battle base commit** — record the git commit each battle was fought on
+   (short hash + commit time), per battle when a batch spans several commits.
+   The workflow pulls code, runs battles, downloads logs, analyses, and files
+   the issue at different times, so by the time we read the issue our HEAD has
+   usually moved on: line numbers and function names may no longer exist, the
+   reported bug may already be fixed, and the log cannot be reproduced without
+   checking out the exact revision. With the base commit we can check out that
+   revision to reproduce, and correlate commits against win-rate changes.
 
 ---
 
