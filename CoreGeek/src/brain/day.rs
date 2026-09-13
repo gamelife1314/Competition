@@ -157,11 +157,33 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // backpack is committed to those gaps, and treating it as "demand already
     // met" made the carrier sell the ring's own stone out from under itself.
     let wall_demand = (wall_gaps.len() as i64).min(wall_cap);
-    let stone_demand = wall_demand;
+    // P0-3 门重封的石头保障：白天 `open_door` 切开的门在黄昏前不计入
+    // `wall_gaps`（白天它是通道，不是缺口），但黄昏必须重封。门不计入采石
+    // 需求时，一个"除门之外完好"的环会让全天 `want_stone=false`——没人备石，
+    // 黄昏 step 3 的封门分支要求包里有石头，于是门整夜敞开（v1 §5.5 的机制性
+    // 漏洞，与机器人打洞叠加后就是"墙环夜间重新开口"）。把门计入需求、但不
+    // 计入白天的 build 目标（wall_gaps 的过滤不动）。D1 无门机制，不动。
+    let open_doors = if turn.day > 1 {
+        state
+            .door_cells
+            .iter()
+            .filter(|door| !wall_gaps.contains(door))
+            .count() as i64
+    } else {
+        0
+    };
+    let stone_demand = wall_demand + open_doors;
     // Gold reserved for finishing the tower build-out is untouchable by the
     // shopping list — defenses come before consumables, but only for the 1-2
     // towers we actually build (never all three slots at once).
-    let build_reserve = tower_build_reserve(turn.towers().len(), tower_gaps.len());
+    let mut build_reserve = tower_build_reserve(turn.towers().len(), tower_gaps.len());
+    // P0-4 第三塔资金守护：fallback 窗口临近且升级不可达时，给第三塔守住 25 金。
+    // 没有资金守护时，小额采购（药/修墙包/墙券）会把金币常年压在 5–24，
+    // fallback 的 `gold >= 25` 永远凑不齐（#22/#23 连续 5+ 场第三塔缺席）。
+    let guard = !tower_gaps.is_empty() && economy::third_tower_guard(turn, state);
+    if guard {
+        build_reserve = build_reserve.max(WEAPON_BUILD_COST);
+    }
     let budget = economy::budget(turn, state, build_reserve);
 
     // Buyer assignment: a dedicated WORKER so voucher purchases are never
@@ -186,6 +208,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             "towers": turn.towers().len(),
             "gaps": tower_gaps.len(),
             "reserve": build_reserve,
+            "guard": guard,
             "wallGaps": wall_gaps.len(),
             "stoneDemand": stone_demand,
             "teamStone": economy::team_ores(turn, STONE),
@@ -398,6 +421,45 @@ fn worker_day(
                     return;
                 }
             }
+        }
+    }
+    // 3b. 黄昏封门（D2+，P0-3）：`open_door` 为白天经济切开的门，从黄昏起就是
+    //    普通缺口。step 3 要等 `wall_gate_sealed` 旗标（散兵未归队时不封），
+    //    step 5 受每日预算与批量闸限制——两条路都可能让门整夜敞开。带石工人从
+    //    黄昏起直接把门砌上，不必等散兵：他们还有指定的 gate 可以归队。窗口与
+    //    step 3 相同（黄昏 + SEAL_GRACE），一门炮也不会因此误了夜防。
+    if turn.day > 1
+        && role.count_item(STONE) > 0
+        && turn.in_day_round >= economy::DUSK_ROUND
+        && turn.in_day_round < economy::DUSK_ROUND + SEAL_GRACE
+    {
+        let mut doors: Vec<Pos> = state.door_cells.iter().copied().collect();
+        doors.sort_by_key(|site| chebyshev(role.pos, *site));
+        if let Some(site) = doors.into_iter().find(|site| {
+            turn.is_land(*site)
+                && !claimed.contains(site)
+                // The designated gate is also the preferred door: if step 3
+                // already sealed it this round, `door_cells` still lists it —
+                // never wall a cell that already has our wall in it.
+                && !turn.walls().iter().any(|wall| wall.pos == *site)
+                && !wall_would_trap(turn, pairs, state, *site)
+        }) {
+            claimed.insert(site);
+            if chebyshev(role.pos, site) == 1 {
+                state.walls_built_today = state.walls_built_today.saturating_add(1);
+                state.walled_cells_today.insert(site);
+                state.door_cells.remove(&site);
+                crate::log::event(
+                    "door_reseal",
+                    serde_json::json!({"round": turn.round_no, "role": role.id, "target": site}),
+                );
+                plan.push(role.id, RoleCommand::build(site, "wall"));
+                return;
+            }
+            if let Some(cmd) = build_or_walk(turn, role, site, "wall", claimed) {
+                plan.push(role.id, cmd);
+            }
+            return;
         }
     }
     // 4. Pre-position near the assigned tower. This outranks walls, weapons
@@ -1342,9 +1404,23 @@ fn open_door(
     if crate::path::step_toward_stands(turn, role.pos, &outside, &blocked).is_some() {
         return None;
     }
-    // Cut the nearest cell of our own ring, preferring the designated gate:
-    // that is the cell the night crew expects to have to re-seal, and keeping
-    // the door in one place means the ring is never opened in two.
+    // One door per day, and one is enough. A teammate's cut from THIS round is
+    // invisible in the turn's occupancy (the wall only comes down when the
+    // judger applies the command), so without this check every trapped role
+    // cuts its own hole in the same round — two stones spent, two cells to
+    // re-seal at dusk (measured in the day-2 simulation: two `door_open`
+    // events on the same round).
+    if !state.door_cells.is_empty() {
+        return None;
+    }
+    // Cut the nearest cell of our own ring — but NOT the designated gate. The
+    // gate is the cell the D1 crew seals from OUTSIDE while the ring goes up;
+    // once the towers stand on the inner band they can cover the gate's entire
+    // inside approach, so a door cut there can never be re-sealed from within
+    // (the day-2 simulation: towers on the band row, gate unreachable, open
+    // all night). Any other ring cell is inside-reachable by construction —
+    // the role cutting it is standing on a stand of it right now — which is
+    // exactly what the dusk reseal needs.
     let gate = wall_gate(turn);
     let target = turn
         .walls()
@@ -1352,7 +1428,7 @@ fn open_door(
         .map(|wall| wall.pos)
         .filter(|pos| chebyshev(role.pos, *pos) == 1)
         .filter(|pos| footprint_distance(*pos, &footprint) == 2)
-        .min_by_key(|pos| (gate != Some(*pos), pos.x, pos.y))?;
+        .min_by_key(|pos| (gate == Some(*pos), pos.x, pos.y))?;
     if !claimed.insert(target) {
         return None; // a teammate is already cutting this round
     }

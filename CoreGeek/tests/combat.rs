@@ -1875,15 +1875,16 @@ fn finish_task_caches_unrejected_answer() {
 }
 
 #[test]
-fn rejected_answer_drops_cached_sop_and_keeps_task_active() {
-    // A cached SOP for a task type whose answer was just rejected must be
-    // dropped, and the task must stay active for a retry (the "instant
-    // re-accept same type with stale state" loop).
+fn a_rejection_keeps_the_cached_sop_on_the_first_strike() {
+    // P1-3: a wrong answer no longer wipes the cache. The session did not run
+    // the cached template (no SOP fast path), so nothing is even charged; the
+    // task stays active for a retry with the cache intact.
     let mut state = BotState::default();
     state.sop_cache.push(coregeek::state::SopEntry {
         task_type: "自进化类1".into(),
         keywords: vec!["count".into(), "files".into()],
         template: "ls | wc -l".into(),
+        ..Default::default()
     });
     state.task.active = true;
     state.task.accepted_round = 5;
@@ -1906,7 +1907,130 @@ fn rejected_answer_drops_cached_sop_and_keeps_task_active() {
         matches!(state.task.stage, coregeek::state::TaskStage::Planning),
         "re-plan after rejection"
     );
-    assert!(state.sop_cache.is_empty(), "rejected type's SOP is dropped");
+    assert!(
+        !state.sop_cache.is_empty(),
+        "a template that did not run is never charged, let alone dropped"
+    );
+    assert_eq!(state.sop_cache[0].rejections, 0);
+}
+
+#[test]
+fn the_used_template_is_evicted_only_on_the_second_consecutive_strike() {
+    // P1-3 eviction rule: the template the session actually ran gets one
+    // strike — reuse with feedback; the second consecutive rejection evicts.
+    let run_session = |state: &mut BotState, round_no: i64| {
+        state.task.active = true;
+        state.task.accepted_round = round_no - 1;
+        state.task.timeout_round = round_no + 300;
+        state.task.task_type = "自进化类1".into();
+        state.task.description = "count files".into();
+        state.task.cmd_history = vec!["ls | wc -l".into()];
+        state.task.sop_used_template = Some("ls | wc -l".into());
+        state.task.stage = coregeek::state::TaskStage::WaitingSubmit { attempts: 0 };
+        let mut payload = day_world_at(round_no, vec![pioneer_with(vec![])], 0, vec![], vec![]);
+        payload["errors"] = json!([{"errorCode": 2}]);
+        let turn = turn_from(payload);
+        state.observe(&turn);
+        state.task = Default::default();
+    };
+
+    let mut state = BotState::default();
+    state.sop_cache.push(coregeek::state::SopEntry {
+        task_type: "自进化类1".into(),
+        keywords: vec!["count".into(), "files".into()],
+        template: "ls | wc -l".into(),
+        ..Default::default()
+    });
+
+    run_session(&mut state, 6);
+    assert_eq!(
+        state.sop_cache.len(),
+        1,
+        "first strike: the template survives for reuse with feedback"
+    );
+    assert_eq!(state.sop_cache[0].rejections, 1);
+    assert_eq!(
+        state.sop_cache[0].last_rejected.as_deref(),
+        Some("ls | wc -l"),
+        "the rejected bytes are remembered so they are never replayed"
+    );
+
+    run_session(&mut state, 40);
+    assert!(
+        state.sop_cache.is_empty(),
+        "second consecutive strike: the template is evicted"
+    );
+}
+
+#[test]
+fn a_template_carrying_a_strike_is_reused_only_with_new_bytes() {
+    // The rejected script must never be replayed verbatim: with a strike on
+    // record and a binding that produces the SAME bytes, find_sop passes the
+    // task to the LLM; a binding that produces new bytes (new parameters) is
+    // the feedback-driven retry and is allowed.
+    let mut entry = sop(
+        "自进化类1",
+        "统计城市名：北京 的人口",
+        "python3 report.py --city {{城市名}}",
+    );
+    entry.rejections = 1;
+    entry.last_rejected = Some("python3 report.py --city 北京".into());
+    let mut state = BotState::default();
+    state.sop_cache.push(entry);
+
+    assert!(
+        state
+            .find_sop("自进化类1", "任务：统计城市名：北京 的人口")
+            .is_none(),
+        "identical bytes are not replayed"
+    );
+    let rebound = state.find_sop("自进化类1", "任务：统计城市名：上海 的人口");
+    assert_eq!(
+        rebound.as_deref(),
+        Some("python3 report.py --city 上海"),
+        "new parameters are a new attempt"
+    );
+}
+
+#[test]
+fn a_confirmed_success_clears_the_templates_strikes() {
+    // Reuse with feedback converging: the rejected template is run again with
+    // new bytes and the multi-signal probe confirms the success — the strikes
+    // reset, because the script demonstrably works when its inputs are right.
+    let mut state = BotState::default();
+    state.sop_cache.push(coregeek::state::SopEntry {
+        task_type: "自进化类1".into(),
+        keywords: vec!["count".into(), "files".into()],
+        template: "ls | wc -l".into(),
+        rejections: 1,
+        last_rejected: Some("ls | wc -l".into()),
+    });
+    state.task.active = true;
+    state.task.accepted_round = 5;
+    state.task.timeout_round = 300;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "count files".into();
+    state.task.point = Some(Pos { x: 3, y: 3 });
+    state.task.sop_used_template = Some("ls | wc -l".into());
+    state.task.submitted_round = Some(6);
+    state.task.phase_missing_rounds = 2;
+    state.task.point_closed_round = Some(7);
+
+    let mut payload = day_world_at(8, vec![pioneer_with(vec![])], 0, vec![], vec![]);
+    payload["teamOur"]["playerTasks"] = json!([{
+        "taskType": "自进化类1",
+        "taskPosition": {"x": 3, "y": 3},
+        "coldDownRounds": 30,
+        "scoreReward": 40, "goldReward": 40,
+        "isValid": false, "timeoutRounds": 100
+    }]);
+    let turn = turn_from(payload);
+    state.observe(&turn);
+
+    assert!(!state.task.active, "the confirmed success closes the session");
+    assert_eq!(state.sop_cache.len(), 1, "the working template stays cached");
+    assert_eq!(state.sop_cache[0].rejections, 0, "strikes cleared");
+    assert!(state.sop_cache[0].last_rejected.is_none());
 }
 
 #[test]
@@ -2847,6 +2971,7 @@ fn sop(task_type: &str, description: &str, template: &str) -> coregeek::state::S
         task_type: task_type.into(),
         keywords: coregeek::state::keywords_of(description),
         template: template.into(),
+        ..Default::default()
     }
 }
 

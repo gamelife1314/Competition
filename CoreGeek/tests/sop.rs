@@ -356,6 +356,7 @@ fn sop(task_type: &str, keywords: &[&str], template: &str) -> SopEntry {
         task_type: task_type.into(),
         keywords: keywords.iter().map(|kw| kw.to_string()).collect(),
         template: template.into(),
+        ..Default::default()
     }
 }
 

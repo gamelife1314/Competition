@@ -904,6 +904,43 @@ fn stone_out_of_reach_becomes_a_day_of_ore_that_sells() {
 }
 
 #[test]
+fn a_door_cut_in_the_morning_is_resealed_before_night() {
+    // P0-3: day 2's economy lives outside the ring, so `open_door` cuts a cell
+    // through it in the morning. That cell used to stay open all night whenever
+    // nobody happened to carry a stone at dusk: the seal step waits for the
+    // `wall_gate_sealed` flag (stragglers keep it down) and the daily wall
+    // budget may already be spent — so the door was a robot-sized hole until
+    // the next morning (v1 §5.5). With the door now counted in the day's stone
+    // demand, a carrier keeps a stone back and walls the cell from dusk.
+    let mut world = run_day_one();
+    let ring = world.ring().len();
+    assert!(
+        world.wall_count() >= ring - 1,
+        "day 1 did not finish the ring, so the door question is not being tested"
+    );
+    run_day(&mut world, 2);
+    let open = world.open_cells();
+    assert!(
+        open.len() <= 1,
+        "the ring — door included — must be closed again at nightfall: {open:?}"
+    );
+    // Direct evidence for the mechanism: every cell the economy cut open has
+    // been walled again by the end of the day it was cut on.
+    for (cut_round, door) in world.removed_walls.clone() {
+        let sealed = world
+            .wall_builds
+            .iter()
+            .any(|(round, pos)| *round > cut_round && *pos == door);
+        assert!(
+            sealed,
+            "the door at {door:?} cut on R{cut_round} was never re-walled; \
+             wall builds: {:?}",
+            world.wall_builds
+        );
+    }
+}
+
+#[test]
 fn the_workers_build_the_ring_from_their_own_stone() {
     // Hard constraint: at least one worker keeps the loop running, and the ring
     // is built from stone a worker carries itself — a builder can only spend

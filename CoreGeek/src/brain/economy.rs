@@ -51,6 +51,15 @@ const READINESS_URGENT: i64 = 10;
 /// third tower (issue #9: the rocket never arrived on the first night).
 pub const FALLBACK_LEAD: i64 = 20;
 
+/// Rounds before the fallback window opens at which the build reserve starts
+/// guarding the 25 gold the third tower costs (P0-4). The fallback itself
+/// fires at `DUSK_ROUND - FALLBACK_LEAD`; the guard exists so the gold is
+/// still there when it does — consumables and wall vouchers used to be able
+/// to spend the purse below 25 in the very rounds the window was about to
+/// open, which is how the rocket pad never got laid (issues #22/#23:
+/// "第 3 塔从未建造", `tower_plan mayBuild=false` 全天).
+pub const GUARD_LEAD: i64 = 6;
+
 #[derive(Debug, Clone)]
 pub struct Need {
     pub name: String,
@@ -375,7 +384,17 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         if price <= 0 || price == i64::MAX {
             continue;
         }
-        let floor = if is_upgrade(&need.name) || (urgent && is_night_readiness(&need.name)) {
+        // Wall vouchers count as infrastructure only while the tower fund is
+        // not being guarded: a guarded 25 gold is the third tower's, and a
+        // 20-gold wall voucher is exactly the purchase that used to spend it
+        // (P0-4; issues #22/#23 froze at 5–25 with the rocket pad never laid).
+        // Weapon and station vouchers keep the free pass — a purse that
+        // actually reaches 100 gold turns the guard off by itself
+        // (`upgrade_reachable`), so they can never drain the guarded fund.
+        let wall_voucher = need.name.starts_with("WallUpgradeVoucher");
+        let floor = if (is_upgrade(&need.name) && !wall_voucher)
+            || (urgent && is_night_readiness(&need.name))
+        {
             0
         } else {
             reserve
@@ -577,6 +596,24 @@ fn third_tower_fallback(turn: &Turn, state: &BotState) -> bool {
 /// counts; otherwise the liquid wealth already on the board.
 pub fn upgrade_reachable(turn: &Turn, _state: &BotState) -> bool {
     stock_of(turn, "WeaponUpgradeVoucher1") > 0 || liquid_gold(turn) >= WEAPON_VOUCHER1_PRICE
+}
+
+/// Should the 25-gold third-tower fund be guarded from the shopping list?
+/// True once the fallback window is near AND the level-2 upgrade is out of
+/// reach — exactly the condition `third_tower_fallback` re-tests when the
+/// window opens, so the gold the fallback needs is still in the purse by
+/// then. While the upgrade is still reachable the guard stays off and the
+/// "两塔先升级" priority is untouched (the issue #13 lesson); an existing
+/// third tower or an already-upgraded gun leaves nothing to guard.
+pub fn third_tower_guard(turn: &Turn, state: &BotState) -> bool {
+    let towers = turn.towers();
+    if towers.len() != 2 || towers.iter().any(|tower| tower.level >= 2) {
+        return false;
+    }
+    if upgrade_reachable(turn, state) {
+        return false;
+    }
+    turn.in_day_round >= DUSK_ROUND - FALLBACK_LEAD - GUARD_LEAD
 }
 
 /// Find a building the voucher in `role`'s backpack can upgrade.

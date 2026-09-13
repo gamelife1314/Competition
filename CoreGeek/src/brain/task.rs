@@ -175,6 +175,20 @@ pub fn plan_pioneer(
             if state.task.cmd_history.is_empty() {
                 if let Some(script) = state.find_sop(&state.task.task_type, &state.task.description)
                 {
+                    // A later rejection is charged against exactly the entry
+                    // that ran (P1-3), so remember which template produced
+                    // these bytes.
+                    let task_type = state.task.task_type.clone();
+                    let description = state.task.description.clone();
+                    state.task.sop_used_template = state
+                        .sop_cache
+                        .iter()
+                        .rev()
+                        .find(|entry| {
+                            entry.task_type == task_type
+                                && entry.bind(&description).as_deref() == Some(script.as_str())
+                        })
+                        .map(|entry| entry.template.clone());
                     state.task.stage = TaskStage::HavePlan { cmd: script };
                     return plan_pioneer(turn, state, pioneer, plan);
                 }

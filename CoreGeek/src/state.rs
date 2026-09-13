@@ -109,6 +109,10 @@ pub struct TaskSession {
     /// reached the sandbox and ran to completion, whereas an unrun command (a
     /// `[JUDGER_ERROR]`, a timeout) or an answer-less run teaches nothing.
     pub sop_cmd: Option<String>,
+    /// The cached template this session is running, when it started from the
+    /// SOP fast path. A rejection is charged against exactly this entry
+    /// (P1-3) — never against templates that did not run.
+    pub sop_used_template: Option<String>,
 }
 
 /// A cached, parameterised script for one task fingerprint. The body keeps
@@ -120,6 +124,20 @@ pub struct SopEntry {
     pub task_type: String,
     pub keywords: Vec<String>,
     pub template: String,
+    /// Consecutive rejections charged against answers this template produced
+    /// (P1-3). One strike keeps the entry — reuse with feedback, because a
+    /// single rejection can be the task's input differing, not the script's
+    /// logic; the second consecutive strike evicts it. A template whose
+    /// answer was never judged wrong is never touched, and a rejection earned
+    /// by an LLM-written script is never charged to a template that did not
+    /// run — the old behaviour wiped every template of the type on any
+    /// rejection, which is how good SOPs kept dying with bad tasks.
+    pub rejections: i32,
+    /// The bound script the judger last rejected. Reuse is only allowed when
+    /// binding produces DIFFERENT bytes (new parameters, new task input):
+    /// replaying the exact script that already failed is the same wrong
+    /// answer with extra steps, so `find_sop` skips it and the LLM takes over.
+    pub last_rejected: Option<String>,
 }
 
 impl SopEntry {
@@ -517,8 +535,7 @@ impl BotState {
                 self.task.submitted_round = None;
                 self.task.phase_missing_rounds = 0;
                 self.task.point_closed_round = None;
-                let failed_type = self.task.task_type.clone();
-                self.drop_sop_for(&failed_type);
+                self.charge_sop_rejection();
                 // Fast abandon. The opponent's edge in issue #15 was that it
                 // dropped a failing task immediately and "把开拓者投入防御",
                 // while all five of our sessions burned their entire timeout.
@@ -607,6 +624,7 @@ impl BotState {
                 }),
             );
             if confirmed {
+                self.clear_sop_strikes();
                 self.finish_task(true, "confirmed_success");
             }
         }
@@ -690,6 +708,7 @@ impl BotState {
             task_type: self.task.task_type.clone(),
             keywords,
             template: script,
+            ..Default::default()
         })
     }
 
@@ -746,6 +765,18 @@ impl BotState {
             .max_by_key(|(_, overlap)| *overlap)
             .and_then(|(entry, overlap)| {
                 let script = entry.bind(description);
+                // Reuse with feedback, not blind replay (P1-3): a template
+                // carrying a strike may run again only when binding produced
+                // DIFFERENT bytes — new parameters, new task input. Replaying
+                // the exact script the judger already rejected is the same
+                // wrong answer with extra steps, so the LLM takes this one.
+                if entry.rejections > 0 && entry.last_rejected.as_ref() == script.as_ref() {
+                    crate::log::event(
+                        "sop_replay_skipped",
+                        serde_json::json!({"taskType": task_type, "overlap": overlap}),
+                    );
+                    return None;
+                }
                 crate::log::event(
                     "sop_reuse",
                     serde_json::json!({
@@ -756,6 +787,55 @@ impl BotState {
                 );
                 script
             })
+    }
+
+    /// Charge the current session's rejection against the cached template it
+    /// actually ran (P1-3). One strike keeps the entry — reuse with feedback;
+    /// the second consecutive strike evicts it. A session that wrote its own
+    /// script (no SOP fast path) charges nothing: the old behaviour wiped
+    /// every template of the type on any rejection, so a good SOP died with
+    /// every bad LLM attempt.
+    fn charge_sop_rejection(&mut self) {
+        let Some(template) = self.task.sop_used_template.clone() else {
+            return;
+        };
+        let rejected_script = self.task.cmd_history.first().cloned();
+        let mut evicted = false;
+        if let Some(entry) = self
+            .sop_cache
+            .iter_mut()
+            .find(|entry| entry.template == template)
+        {
+            entry.rejections = entry.rejections.saturating_add(1);
+            entry.last_rejected = rejected_script.or_else(|| Some(template.clone()));
+            if entry.rejections >= 2 {
+                let template = entry.template.clone();
+                crate::log::event(
+                    "sop_evicted",
+                    serde_json::json!({"taskType": entry.task_type, "template": crate::log::brief(&template, 80)}),
+                );
+                evicted = true;
+            }
+        }
+        if evicted {
+            self.sop_cache.retain(|entry| entry.template != template);
+        }
+    }
+
+    /// A confirmed success clears the used template's strikes: the script
+    /// demonstrably works when its parameters are right.
+    fn clear_sop_strikes(&mut self) {
+        let Some(template) = self.task.sop_used_template.clone() else {
+            return;
+        };
+        if let Some(entry) = self
+            .sop_cache
+            .iter_mut()
+            .find(|entry| entry.template == template)
+        {
+            entry.rejections = 0;
+            entry.last_rejected = None;
+        }
     }
 
     /// Drop every cached SOP for a task type whose answer was just rejected, so
