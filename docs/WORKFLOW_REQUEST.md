@@ -1,20 +1,20 @@
 # 对战数据交付规范（workflow agent 接口）
 
-> **版本 v11** · 本文档是内网自动对战 workflow 的**交付规范**。
+> **版本 v12** · 本文档是内网自动对战 workflow 的**交付规范**。
 > 读者：拉代码 → 发起对战 → 抓日志 → 分析对局 → 生成改进 issue 的 code agent。
-> **v11 改的是交付通道，而且把活变少了**：没有文件路径可用，我拿不到你机器上的任何东西
-> ——**issue 正文就是交付物**，§8 的 `deliverables` 因此从 `path:` 改成 `paste:`；对手日志
-> 与"原始行 tsv"这两项不再要，理由见 §1。
-> 相应地，**§7.3 的十三条配方收成了一条命令**：仓库里的 `tools/collect_log.sh` 就是那份
-> 规范的机器版，给它一个日志文件，它直接印出六张表那**一页**，整段贴进 issue 即可；每张表
-> 的行数上限写在脚本里（跑一次最多 560 行，典型一场 193 行 / 4.8 KB），所以**不需要判断
-> "贴多少才够"**。§0 是新的：**只做三件事**（每场一行胜负 · 跑那条命令 · 缺口写一句），
-> 做不完就只做这三件——§1 的 P0/P1/P2 优先级的依据在这里。
-> 其余与 v10 相同：v10 把表 5（封门）加厚了——`wall_gate_open` 现在带 `away`/`stuck`，
-> 能直接读出**门卡在谁身上**，并且明确了"这个窗口总共只有 15 回合，15 行 = 整夜没封"。
-> §7 是正面清单（issue 正文要给我哪五部分、怎么取、长什么样，全部给示例），你不需要回答
-> 我任何问题，把六张表填出来交给我是唯一的要求。§6 是你可以自己跑一遍的自检清单；
-> §8 是同一份内容的机器可读版本。
+> **v12 只改一件事：跑得动。** 内网 agent 在 **Windows** 上，jq / awk / grep 不保证有
+> ——jq 恰恰是 Git for Windows 唯一不自带的那个。所以 §7.3 的六张表换成了**一个 Python
+> 脚本**（`tools/collect_log.py`，只用标准库，不需要 pip install），三个平台同一条命令：
+> `python tools/collect_log.py <你的日志文件>`。输入 `.jsonl` / `.jsonl.gz` / `.zip` 都行，
+> BOM / CRLF / UTF-16 / GBK 都能读；跑不了 Python 3 就照 §7.4 写一句"跑不了 + 报错原文"。
+> v11 定的通道没变：没有文件路径可用，我拿不到你机器上的任何东西——**issue 正文就是
+> 交付物**，§8 的 `deliverables` 因此是 `paste:`；对手日志与"原始行 tsv"两项不再要。
+> §0 是新的：**只做三件事**（每场一行胜负 · 跑那条命令 · 缺口写一句），做不完就只做这
+> 三件——§1 的 P0/P1/P2 优先级依据在这里。v10 把表 5（封门）加厚了：`wall_gate_open`
+> 现在带 `away`/`stuck`，能直接读出**门卡在谁身上**，并且明确了"这个窗口总共只有 15
+> 回合，15 行 = 整夜没封"。§7 是正面清单（issue 正文要给我哪五部分、怎么取、长什么样，
+> 全部给示例），你不需要回答我任何问题，把六张表填出来交给我是唯一的要求。§6 是你可以
+> 自己跑一遍的自检清单；§8 是同一份内容的机器可读版本。
 
 ---
 
@@ -23,9 +23,11 @@
 每批就这三件。做不完就只做这三件，其余照 §7.4 写一句"没拿到"。
 
 ```text
+0. 前提只有一个：机器上有 Python 3。`python --version` 印出 3.x 就行。
+   印不出来（或弹出应用商店）就先装一个，然后**重开一个终端**：§7.3 有各平台的安装命令。
 1. 每场一行结果：对局ID + 代码版本 + 胜负 + 比分      ← 从对局详情页抄
-2. 每场跑一条命令，把整段输出贴进来：
-     bash tools/collect_log.sh <你的日志文件>
+2. 每场跑一条命令，把整段输出贴进来（cmd / PowerShell / bash 都一样）：
+     python tools/collect_log.py <你的日志文件>
 3. 拿不到的东西，写一句"拿不到 + 为什么"
 ```
 
@@ -33,7 +35,7 @@
 |---|---|---|
 | 第 1 件：胜负与比分 | **唯一的硬数据**。没有它，"这轮改动是不是真的变好了"只能靠猜——我连输赢都看不见 | 详情页没有就写 `null`，**不要填 0**（§3.4） |
 | 第 2 件：那条命令的输出 | **唯一的现场证据**。棋盘我看得见，过程只有日志记得；而这条命令把日志压成一页 | 命令跑不了就说"跑不了 + 报错原文"，别自己另编一张表 |
-| 第 3 件：缺口 | "配方命中 0 行"和"这件事没发生过"是两件事，分不清就说分不清 | —— |
+| 第 3 件：缺口 | "表印出（0 行）"和"这件事没发生过"是两件事，分不清就说分不清 | —— |
 
 **做得更多当然更好**：§1 是完整清单，§3 是 15 个字段的完整回执，§7 是五部分正文。
 但那些是**加分项，不是及格线**。两件不要做的事：**不要填猜的数**（一个编的 `score` 比
@@ -53,7 +55,7 @@
 
 | 半边 | 谁提供 | 怎么到我手里 |
 |---|---|---|
-| 逐回合过程数据 | 我（stdout JSONL） | 你留着**没加工过的那份**，按 §7.3 的配方跑，把**输出**贴进 issue |
+| 逐回合过程数据 | 我（stdout JSONL） | 你留着**没加工过的那份**，跑 §7.3 那一条命令，把**输出**贴进 issue |
 | 结果、身份、版本 | 你 | 按 §3 的字段填进回执，贴进 issue |
 
 ---
@@ -66,16 +68,17 @@ P1，别把 P1 做成半成品**。
 | 优先级 | 内容 | 从哪来 | 做不成的代价 |
 |---|---|---|---|
 | **P0** | 每场一行结果：`对局ID 代码版本 胜负 比分` | 对局详情页 | 我无法判断任何改动的效果。**这一项缺失，整批数据基本作废** |
-| **P0** | **一条命令的输出**：`bash tools/collect_log.sh <日志>` 整段贴 | 你的日志文件 | 我失去全部现场证据，只能看结果猜过程 |
+| **P0** | **一条命令的输出**：`python tools/collect_log.py <日志>` 整段贴 | 你的日志文件 | 我失去全部现场证据，只能看结果猜过程 |
 | **P0** | §7.4 缺口：拿不到的和原因 | 你自己 | 我会把"没写"读成"没发生" |
 | P1 | §3 的完整回执（15 个字段），一场一份 | 对局详情页 | 分项得分、逐 session 任务分、对手身份拿不到——归因会变粗 |
-| P1 | §4 的 8 个头部字段 | 平台页面 + §5 教练配方 | 看不出跨批次的趋势（排名、胜率） |
+| P1 | §4 的 8 个头部字段 | 平台页面 + §5 的 `--coach` 输出 | 看不出跨批次的趋势（排名、胜率） |
 | P2 | §5 教练汇总一行 | 你的日志 | 看不出内置教练移动过开关没有 |
 | P2 | §7 的第一、二、五部分（批级概况 / 逐场回执正文 / 本轮已改） | 汇总上面几项 | 组织性损失，不是信息损失 |
 
-**`tools/collect_log.sh` 是 §7.3 十三条配方的机器版**——跑哪些命令、怎么聚合、每张表印多少行
-都写死在脚本里，所以你不用判断"贴多少才够"。跑不了（没有 bash / jq）就照 §7.3 的配方手工跑，
-或照 §7.4 说明原因；**不要自己另编一张表**。
+**`tools/collect_log.py` 就是 §7.3 那六张表本身**——筛哪些事件、怎么聚合、每张表印多少行
+都写死在脚本里，所以你不用判断"贴多少才够"。它只要能跑 Python 3（Windows 上直接
+`python tools\collect_log.py <日志>`，不需要 jq / awk / bash）。真跑不了就照 §7.4 写清原因；
+**不要自己另编一张表**。
 
 **原始日志你自己留着。** 存在哪、叫什么、怎么组织都行，也不必在 issue 里报路径——**只要保证
 随时能重跑那条命令**，因为表里每一行都是从它跑出来的。我问"某天黄昏门卡在谁身上"的时候，
@@ -94,9 +97,9 @@ P1，别把 P1 做成半成品**。
 
 ## 2. 我方日志：本地那份要整份留着，别加工
 
-> 这一节讲的是**你本地保存的那份原始 stdout**。它不进 issue（太大），但 §7.3 的每条配方都
-> 跑在它上面——所以它一旦被截断、被合并、被"顺手清理"，表就跟着失真，而我无从察觉。
-> 贴进 issue 的是配方的输出，不是这个文件。
+> 这一节讲的是**你本地保存的那份原始 stdout**。它不进 issue（太大），但 §7.3 那条命令跑在
+> 它上面——所以它一旦被截断、被合并、被"顺手清理"，表就跟着失真，而我无从察觉。
+> 贴进 issue 的是命令的输出，不是这个文件。
 
 **格式**：stdout 是 JSONL，一行一个事件：
 
@@ -110,25 +113,23 @@ P1，别把 P1 做成半成品**。
 - 每回合一条 `round`，另有一批 `task_*` / `coach_*` / `volley_review` / `night_debug` /
   `shopping` / `wall_build` … 事件混在同一流里。**回合数 ≠ 行数**，别按行数截取回合。
 - **行序有意义**（事件按发生顺序落盘）。重排、按事件名分组都会破坏因果链。
-- 本地怎么存都行（gzip、按场分目录、随便命名），**前提是重跑配方时能还原成原始行序**。
+- 本地怎么存都行（gzip、按场分目录、随便命名），**前提是重跑那条命令时能还原成原始行序**。
 
 **三个必须知道的压缩规则**（不知道就会把"没写"读成"没发生"）：
 
 1. **空值不落盘。** `null`、`""`、`[]`、`{}` 一律不写 —— 缺键和空值同义。但
    **`0` 和 `false` 是事实，照写**：`gold:0` 是没钱，`noRobotDamage:false` 是对本回合的
-   断言。所以 `jq 'select(.data.errors)'` 能筛出"有错"的回合，而
-   `jq 'select(.data.gold==0)'` 也照常工作。
+   断言。所以"有错的回合"就是记录里**有 `errors` 键**的那些，而 `gold` 为 0 的回合
+   照样带着 `gold: 0`。
 2. **没变的块不重写。** `round` 里的 `stationHp`/`enemyStationHp`/`wall`/`enemyWall`/
    `towers`/`roles`/`pairs`/`task`/`treasure` **只在变化的那一回合写**，其余回合整个键
    缺席 —— **缺键 = 沿用上一次出现的值，不是"没有"**。那一回合重写了哪些块，由
    `round.data.chg` 列出；**没有 `chg` 就是本回合无变化**。
    **`chg` 是权威，键不是**：块名在 `chg` 里、键却不在记录里，意思是这个块**变成了空的**
    （塔全被拆光、配对清空、任务会话结束）—— 空值本身不落盘（规则 1），所以由 `chg` 宣布。
-   只看键的读者会在这一回合继续沿用旧值，错得无声无息。要取序列必须先"带值前行"：
-   ```sh
-   grep '^{' ours.jsonl | jq -c 'select(.event=="round")
-     | {round:.data.round, towers:(.data.towers // "same"), wall:(.data.wall // "same")}'
-   ```
+   只看键的读者会在这一回合继续沿用旧值，错得无声无息。**要取序列必须先"带值前行"**：
+   某回合没有 `towers` 键，就用上一次出现过的 `towers`，直到它再次出现为止——表 1、表 5a、
+   表 6a 都是这么读的。
    逐回合必写的只有：`round`/`day`/`isDay`/`gold`/`score`/`scoreDelta`/`scoreAttr`/
    `robotCount`/`cmds`/`policy`/`volley`/`ms`，以及非空时的
    `errors`/`errorDescs`/`failures`/`robotEvents`/`phaseTask`/`lastCmdResult`。
@@ -141,8 +142,8 @@ P1，别把 P1 做成半成品**。
    计数行数即可，别去重。`night_recall` 与 `night_withdraw` 已并入 `night_debug`。
 
 **禁止**（对自己本地那份）：截断长字段、合并多行、给每行加队伍前缀或时间戳注解、脱敏
-ID/坐标、只保留 `round` 事件、只保留你分析里引用到的那几行。这些都让配方在你手上和在我
-手上跑出不同的结果，而我看不出来。
+ID/坐标、只保留 `round` 事件、只保留你分析里引用到的那几行。这些都让表在你手上和在我
+手上长得不一样，而我看不出来。
 
 我已经**自己**截断过的字段（不必再想办法还原，但分析时别把它们当全文）：
 
@@ -225,7 +226,7 @@ v8 起全量记录（上限 4000 字符，正常答案几十到几百字符）�
 | `enemy_seen` | object | 对方最后回合的基地等级/塔数/墙数 | `null` |
 | `tasks_ours[]` | array | **我方**每个任务 session 一行，见 §3.5 | 拿不到整块 `null` |
 | `env` | object | 该场进程的 `CG_*` 原值（没有就是 `null`） | 必填（哪怕全 `null`） |
-| `coach` | object | 从我的 JSONL 提取，配方见 §5 | 必填 |
+| `coach` | object | 从我的日志里取，见 §5 | 必填 |
 
 ### 3.4 三条硬规则
 
@@ -270,37 +271,41 @@ v8 起全量记录（上限 4000 字符，正常答案几十到几百字符）�
 | 累计战绩 | `8 胜 5 负 1 平` | 上半场 + 下半场累计 |
 | 胜率 | `57.1%` | 胜场 / 总场次，1 位小数 |
 | 每场一行结果 | `pk577716 胜 139:52 (b03b1c8)` | 不翻 JSON 也能扫一眼 |
-| 教练汇总 | 见 §5 | 格式固定，我会 grep |
+| 教练汇总 | 见 §5 | 格式固定，我按它对齐 |
 
 排名与胜率是判断"改进是否真的有效"的唯一长期指标：单场胜负可能是运气（对手强弱、
 出生点、地图随机），只有趋势能证伪。
 
 ---
 
-## 5. 教练记录：从我的 JSONL 提取（jq 配方）
+## 5. 教练记录：回执里的 `coach` 那一块
 
 教练是决策器内置的在线自适应（`CoreGeek/src/brain/coach.rs`），事件有四种：
 `coach_ready`（启动时的档位）、`coach_night`（每夜结算）、`coach_move`（**移动了一个
 开关**）、`coach_half`（半场结束）。另外逐回合的 `round.data.policy` 记录**当时**档位。
 
+**这一块也由那条命令给你**，加一个 `--coach` 就行——它印出的三行正好是回执里要填的东西：
+
 ```sh
-# 1) 写进 receipt.coach.moves
-grep '^{' ours.jsonl | jq -c 'select(.event=="coach_move")
-  | .data | {round, day, switch, from, to, why}'
-
-# 2) 写进 receipt.coach.halves（没有 coach_half 就用 coach_ready.halvesLearned）
-grep '^{' ours.jsonl | jq -c 'select(.event=="coach_half") | .data.halves' | tail -1
-
-# 3) issue 头部的教练汇总行
-grep '^{' ours.jsonl | jq -r 'select(.event=="coach_move")
-  | "\(.data.switch) \(.data.from)->\(.data.to) @\(.data.day)日 \(.data.why)"'
+python tools/collect_log.py <你的日志文件> --coach
 ```
+
+输出长这样（第二行整段贴进 `receipt.json` 的 `coach.moves`）：
+
+```text
+receipt.coach.moves（整段贴进 receipt.json 的 coach.moves）：
+[{"round":261,"day":3,"switch":"harass","from":"Rhythm","to":"Off","why":"summons_sterile"}]
+receipt.coach.halves：1（最后一个 coach_half）
+本场汇总：移动 2 次（harass 1 / station_pressure 1）
+```
+
+**没动过就是 `[]` 和 `0`，照实写**——「一次没动」是个结论，不能空着（空着我会读成"没记"）。
 
 两个坑：`coach_move.from` / `to` 是**字符串**（布尔档位写作 `"true"` / `"false"`，
 `harass` 是档位名 `Off` / `Rhythm` / `Rich`）；而 `round.data.policy.stationPressure`
 是**布尔**。同名字段两种类型，别用一套解析。
 
-issue 头部请给这一行（我直接 grep）：
+issue 头部请给这一行（每场的「本场汇总」连起来就是这个，N / X / W / L / D 数一下）：
 
 ```
 教练：本批 N 场 | 移动 M 次（station_pressure a / gap_funding b / harass c） | 至少移动过一次的场次 X/N | 结果分布 胜 W / 负 L / 平 D
@@ -312,11 +317,14 @@ issue 头部请给这一行（我直接 grep）：
 
 每一场都跑一遍，任何一条不过就别发：
 
-1. `jq . receipt.json > /dev/null` 通过；`jq -r 'keys[]' receipt.json` 包含 §3.3 的**全部**字段名。
-2. `grep -c '"event":"round"' ours.jsonl` ≥ 该场回合数（行数只会更多，不会更少）。
+1. receipt.json 能解析，且键名覆盖 §3.3 的**全部**字段：
+   `python -c "import json;print(sorted(json.load(open('receipt.json',encoding='utf-8'))))"`
+2. 收集器开头那行 `事件计数：` 里的 `round=` ≥ 该场回合数（只会更多，不会更少）。
 3. `git cat-file -t <base_commit>` 返回 `commit`，且时间与该场吻合。
-4. `receipt.coach.moves` 条数 == `grep -c '"event":"coach_move"' ours.jsonl`。
-5. `receipt.coach.halves` == 最后一个 `coach_half` 的 `halves`（一场都没有则为 `0`）。
+4. `receipt.coach.moves` 条数 == `--coach` 印的 `本场汇总：移动 M 次` 里的 M。
+5. `receipt.coach.halves` == `--coach` 印的 `receipt.coach.halves：` 后面那个数。
+   该行括号里写了这个数是怎么来的（最后一个 `coach_half`，一场都没有就是 `0`）——
+   照抄，别自己另算一个。
 6. 没有把 `null` 写成 `0` / `""` / `"unknown"`；`result` 之外的字段出现 `"unknown"` 一律算错。
 7. 对手那一侧拿不到的东西，在 §7.4 写明原因，而不是静默省略。
 8. §7.3 的六张表**是表，不是结论**。一张命中 0 行的表就让它印「（0 行）」——"表 6a 结论：
@@ -324,7 +332,7 @@ issue 头部请给这一行（我直接 grep）：
 9. issue 正文里**没有**任何"请你回答"式的反向提问——不存在这样的问题。
 10. 表 5 命中 15 行的那天，写的是"**整夜没封**"而不是"开了 15 回"；`away`/`stuck` 里出现的
    角色 id 在表里点名了——门卡在谁身上是这张表存在的理由。
-11. 六张表是**一条命令**跑出来的（`bash tools/collect_log.sh <日志>`），整段贴，没有手工删改；
+11. 六张表是**一条命令**跑出来的（`python tools/collect_log.py <日志>`），整段贴，没有手工删改；
     被截断的节带着「本表共 N 行」的声明。**不用自己数行数——脚本已经封顶了。**
 12. **issue 正文里不出现任何本地路径**。写给自己看就行：路径到我这里是死字，我打不开。
 
@@ -342,7 +350,7 @@ issue 头部请给这一行（我直接 grep）：
 
 ### 7.1 第一部分：批级概况
 
-§4 的 8 个字段。来源：平台页面 + §5 的教练配方。
+§4 的 8 个字段。来源：平台页面 + §5 的 `--coach` 输出。
 
 ```text
 生成时间：2026-09-14 09:12
@@ -374,26 +382,33 @@ issue 头部请给这一行（我直接 grep）：
 **这是整份 issue 里我最需要的部分**，也是唯一能从日志里挖出来的部分——胜负你能看见，过程
 只有我能看见，而这六张表就是过程的切片。
 
-**一条命令，整段贴。** 不用手工跑十三条配方，也不用判断贴多少：
+**一条命令，整段贴。** 不用自己筛事件、自己聚合，也不用判断贴多少：
 
 ```sh
-bash tools/collect_log.sh <你的日志文件>        # .jsonl 或 .jsonl.gz 都行
+python tools/collect_log.py <你的日志文件>        # .jsonl / .jsonl.gz / .zip 都行
 ```
+
+Windows 上就这么写，不用改斜杠（cmd / PowerShell / Git Bash 都认）。
+`python --version` 印不出 3.x 就先装：Windows `winget install Python.Python.3.12`
+（或 python.org 下载安装包），macOS `brew install python3`，
+Debian/Ubuntu `sudo apt-get install -y python3`；装完**重开终端**再跑。
+如果 `python` 一跑就弹出应用商店，那是 Windows 的占位符——换 `py tools\collect_log.py <日志>`。
+脚本只用标准库，**不需要 pip install**。
 
 它的输出就是这一节要的六张表，一节一块，带列名，某张表命中 0 行会明写「（0 行）」而不是
 消失，超长会截断并写明「本表共 N 行」。**把整段输出贴进 issue 即可**，一个字都不用改。
 
-跑不了这条命令（机器没有 bash / jq）就照下面的配方手工跑，再不行照 §7.4 写"跑不了 + 报错
-原文"。**两条底线**：不要自己另编一张表；不要用"结论：正常"代替表。
+跑不了这条命令（没有 Python 3）就照 §7.4 写"跑不了 + 报错原文"——**不要自己另编一张表**，
+也不要用"结论：正常"代替表。**结论由我来下，你给我行。**
 
-下面是**脚本里到底跑了什么**，手工跑或核对输出时看这一节：
+**下面讲的是这六张表各是什么、我怎么读它。这里没有需要你跑的命令。**每张表的实现（筛哪些
+事件、怎么聚合、封顶多少行）都在 `tools/collect_log.py` 的 `build_tables()` 里，按 `表 N`
+分段，要核对某一格是怎么算出来的就看那儿。
 
-- 每条配方都以 `grep '^{' ours.jsonl |` 开头，跳过首行非 JSON 的 `listening on` 行（§2）。
-  `ours.jsonl` 是你本地那份原始 stdout，路径你自己知道就行——**贴的是输出**。
 - **每张表都有行数预算**（脚本按这个封顶）。"实测"是拿一场 10 天 / 3 座塔 / 16 个 session
-  的对局按真实批次的形状跑出来的：**六张表全部跑完 193 行 / 4.8 KB**，平均每张 32 行。
+  的对局按真实批次的形状跑出来的：**整段贴出来 224 行 / 6.3 KB**，其中表格 193 行、表头 13 行。
 
-| 表 | 配方 | 实测 | 脚本封顶 | 增长源 |
+| 表 | 脚本里的节 | 实测 | 脚本封顶 | 增长源 |
 |---|---|---|---|---|
 | 1 造塔计划 | 1 | 3 | 20 | 聚合式，恒定 |
 | 2 经济台账 | 2a / 2b / 2c | 33 / 2 / 50 | 60 / 20 / 60 | 钱动了多少回 |
@@ -402,8 +417,8 @@ bash tools/collect_log.sh <你的日志文件>        # .jsonl 或 .jsonl.gz 都
 | 5 封门 | 5a / 5b / 5c | 52 / 3 / 1 | 160 / 20 / 20 | **每天最多 15 行** |
 | 6 夜间塔况 | 6a / 6b | 3 / 7 | 20 / 40 | 聚合式，恒定 |
 
-**封顶在脚本里，不用你数**：跑一次最多 560 行（那是"每天都出问题"的极端场），典型一场 193 行
-/ 4.8 KB。被截断的节会自己写明「本表共 N 行」——**看到那句就照贴，我会知道哪节被切了**。
+**封顶在脚本里，不用你数**：跑一次最多 560 行表格（那是"每天都出问题"的极端场），典型一场
+224 行 / 6.3 KB。被截断的节会自己写明「本表共 N 行」——**看到那句就照贴，我会知道哪节被切了**。
 
 - 表 5 的 5a 是唯一按回合线性长的：黄昏窗口一天就 15 回合，所以**每天封顶 15 行**，10 天
   150 行加 10 行封门，正好是它 160 的上限。它长不是"贴多了"，是"门开太久了"——正是我要看的。
@@ -419,12 +434,6 @@ bash tools/collect_log.sh <你的日志文件>        # .jsonl 或 .jsonl.gz 都
 `upgradeReachable`（够不够升级基地）是两个不同的门，如果它们轮流为真却谁也没落地，
 卡点就不在钱上，而在"没人走到工地"。
 
-```sh
-grep '^{' ours.jsonl | jq -r 'select(.event=="tower_plan")
-  | "\(.data.towers)\t\(.data.mayBuild)\t\(.data.upgradeReachable)\t\(.data.reserve)\t\(.data.guard)"' \
-  | sort | uniq -c
-```
-
 示例输出（第一列是回合数，后面依次是 塔数 / mayBuild / upgradeReachable / reserve / guard）：
 
 ```text
@@ -433,14 +442,15 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="tower_plan")
       6 2	false	false	25	true
 ```
 
-**逐回合的原始行不要贴进 issue**——它是 700 行，预算是 15。留在本地，或者我点名要哪一天时
-再跑（下面按"第 N 天"筛，`N` 自己换）：
+**逐回合的原始行不要贴进 issue**——它是 700 行，这一节的预算只有 20 行，脚本自己会截。
+留在本地，或者我点名要哪一天时再跑（`--day` 的 `N` 自己换）：
 
 ```sh
-grep '^{' ours.jsonl | jq -r 'select(.event=="tower_plan")
-  | select((((.data.round-1)/130)|floor)+1 == 5)
-  | [.data.round,.data.towers,.data.gaps,.data.reserve,.data.guard,.data.wallGaps,.data.stoneDemand,.data.teamStone,.data.mayBuild,.data.upgradeReachable] | @tsv'
+python tools/collect_log.py <你的日志文件> --day 5      # 把 5 换成我要的那一天/夜
 ```
+
+`--day N` 照样把六张表一起印出来，只是**末尾多几节第 N 天的逐回合明细**（标着 `drill`）。
+**整段贴，别只贴 drill 那几节**——六张表是每批都要的，我这里只是额外要了那一天的原始行。
 
 ---
 
@@ -448,12 +458,6 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="tower_plan")
 
 **我用它判断**：金币冻结是**收入端**没进账，还是**支出端**被守卫金挡住。三个事件要一起看：
 `sell` 是进账，`buy` 是出账，`shopping` 是"想买但买没买到"（`affordable` 为 false 的回合占比）。
-
-```sh
-# 2a 台账：一进一出各一行（事件名说明方向，两个方向字段完全一样）
-grep '^{' ours.jsonl | jq -r 'select(.event=="buy" or .event=="sell")
-  | [.data.round,.event,.data.role,.data.item,.data.num,.data.gold] | @tsv'
-```
 
 示例输出：
 
@@ -464,24 +468,12 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="buy" or .event=="sell")
 31	buy	10002	WallFixer	1	0
 ```
 
-```sh
-# 2b 想买 vs 买得起：affordable=false 的回合数，按 head 需求分组
-grep '^{' ours.jsonl | jq -r 'select(.event=="shopping") | "\(.data.affordable)\t\(.data.need)"' \
-  | sort | uniq -c
-```
-
 示例输出：
 
 ```text
     612 false	WeaponUpgradeVoucher1
     140 true	WallFixer
      44 false	WeaponUpgradeVoucher1
-```
-
-```sh
-# 2c 钱包台阶：只留金币真正变动的那几回合（`round.gold` 是每回合必写的，整场贴太长）
-grep '^{' ours.jsonl | jq -r 'select(.event=="round") | "\(.data.round)\t\(.data.gold)"' \
-  | awk -F'\t' '$2 != prev {print; prev = $2}'
 ```
 
 示例输出（回合 / 金币——一眼看出是不是长期贴死在 25）：
@@ -499,9 +491,7 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="round") | "\(.data.round)\t\(.data
 或者我点名要哪一段时再跑：
 
 ```sh
-grep '^{' ours.jsonl | jq -r 'select(.event=="shopping")
-  | select((((.data.round-1)/130)|floor)+1 == 5)
-  | [.data.round,.data.affordable,.data.need,.data.needNum,.data.price,.data.gold,.data.reserve,.data.buyerShopDist,.data.deadline] | @tsv'
+python tools/collect_log.py <你的日志文件> --day 5      # 把 5 换成我要的那一天/夜
 ```
 
 ---
@@ -512,24 +502,12 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="shopping")
 超时结束时判题器按此前提交过的最好答案结算（任务书 `timeoutRounds` 条），所以
 `reason=timeout` **不等于** 0 分。
 
-```sh
-# 3a 结局直方图
-grep '^{' ours.jsonl | jq -r 'select(.event=="task_ended") | "\(.data.reason)\t\(.data.success)"' \
-  | sort | uniq -c
-```
-
 示例输出：
 
 ```text
       7 timeout	true
       3 timeout	false
       2 wrong_answers	false
-```
-
-```sh
-# 3b 逐 session 一行（和 receipt.tasks_ours[] 对得上）
-grep '^{' ours.jsonl | jq -r 'select(.event=="task_ended")
-  | [.data.session,.data.reason,.data.success,.data.wrongAnswers,.data.cmdRounds] | @tsv'
 ```
 
 示例输出：
@@ -562,24 +540,12 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="task_ended")
 > 说缺 `city`）。所以 4b 的两列要**一起**看：`errors` 是码，`errorDescs` 是原话，两个数组
 > **同序**（第 i 个码对应第 i 句原话）。
 
-```sh
-# 4a 每次提交一行（chars 是提交原文的真实字符数，answer 全文见 task_answer_submit.answer）
-grep '^{' ours.jsonl | jq -r 'select(.event=="task_answer_submit")
-  | [.data.round,.data.session,.data.chars,.data.flipped,.data.rewritten,.data.wrongSoFar] | @tsv'
-```
-
 示例输出（回合 / session / 字符数 / 换过外形 / 被改写 / 当时已错几次）：
 
 ```text
 48	1	212	false	false	0
 61	1	208	true	false	1
 77	2	96	false	false	0
-```
-
-```sh
-# 4b 判题器回过错的回合：第2列是错误码，第3列是判题器原话（同序）
-grep '^{' ours.jsonl | jq -r 'select(.event=="round") | select(.data.errors)
-  | [.data.round, (.data.errors|join(",")), (.data.errorDescs // [] | join(" | "))] | @tsv'
 ```
 
 示例输出：
@@ -607,12 +573,6 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="round") | select(.data.errors)
 `away` 是没归队的角色（`[id, x, y]`）；`stuck` 是其中**根本走不回岗位**的那几个——被墙或机器人
 隔开，永远到不了。"在路上"只是门晚封一两回合，"stuck"是整夜不封。两个字段空了会被裁掉。
 
-```sh
-grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_seal" or .event=="wall_gate_open")
-  | [.data.round, (((.data.round-1)/130)|floor)+1, ((.data.round-1)%130)+1, .event,
-     ((.data.away // []) | tostring), ((.data.stuck // []) | tostring)] | @tsv'
-```
-
 示例输出（回合 / 第几天 / 当天第几回合 / 事件 / 没归队的 / 走不回去的）：
 
 ```text
@@ -622,24 +582,12 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_seal" or .event=="wall_g
 188	2	59	wall_gate_seal	[]	[]
 ```
 
-```sh
-# 每天开了几回合（一行一天，最快看出哪天没封上；15 就是整夜没封）
-grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | (((.data.round-1)/130)|floor)+1' \
-  | sort -n | uniq -c
-```
-
 示例输出：
 
 ```text
       3 1
      15 2
       2 4
-```
-
-```sh
-# 卡在谁身上：哪个角色、在哪、卡了几回合（整场累计）
-grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | .data.away[]? | @tsv' \
-  | awk -F'\t' '{c[$1]++; last[$1]=$2","$3} END {for (id in c) print id, c[id], last[id]}' | sort -k2 -nr
 ```
 
 示例输出（角色 / 没归队的回合数 / 最后一次出现的位置）：
@@ -670,13 +618,8 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | .data.away[]? |
 
 > 两个坑：**(1) `reason` 缺省是 `fired`**，直接对 `reason` 做直方图会把"开火"混进"没开火"
 > 的原因里——要看沉默原因，先 `select(.data.reason != "fired")`。**(2) `pairs` 为空时整个键
-> 不落盘**（§2 规则 1），所以配方用 `[]?` 而不是 `[]`，否则 jq 报
+> 不落盘**（§2 规则 1），所以取 `pairs` 时要容忍它整个缺席。
 > `Cannot iterate over null`。
-
-```sh
-# 6a 按原因计数（每场一行）
-grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]?.reason' | sort | uniq -c
-```
 
 示例输出：
 
@@ -685,12 +628,6 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]?.rea
      35 controller_withdrawn
      12 no_target_in_range
       8 controller_stuck
-```
-
-```sh
-# 6b 按塔 × 原因计数（配对数 > 1 时看是哪座塔哑了）
-grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]? | "\(.tower)\t\(.reason)"' \
-  | sort | uniq -c
 ```
 
 示例输出：
@@ -705,9 +642,7 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]? | "
 它压到个位数。本地备查，或者我点名要哪一夜时再跑：
 
 ```sh
-grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug")
-  | select((((.data.round-1)/130)|floor)+1 == 5)     # 第 N 夜，N 自己换
-  | [.data.round,.data.robots,(.data.pairs // []|tojson)] | @tsv'
+python tools/collect_log.py <你的日志文件> --day 5      # 把 5 换成我要的那一天/夜
 ```
 
 ---
@@ -720,11 +655,11 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug")
 receipt.tasks_ours[].score：拿不到——对局详情页只有总分，没有逐 session 分。
 receipt.enemy_seen：拿不到——对手基地等级/塔数/墙数在详情页上没有，我方 stdout 也看不见。
 表 4b：本场 ours.jsonl 里 errors 全程缺席，不确定是"真没错误"还是"事件没写"。
-collect_log.sh：跑不了——机器上没有 jq，报错原文：jq: command not found；六张表这次没跑。
+collect_log.py：跑不了——机器上没有 Python 3，报错原文：`python` 不是内部或外部命令；六张表这次没跑。
 ```
 
-最后一条尤其重要：**"配方命中 0 行"和"这件事没发生过"是两件事**，分不清就说分不清。
-早于某次日志改动的批次，配方命中 0 行是正常的（见 §7.5）。
+最后一条尤其重要：**"表印出（0 行）"和"这件事没发生过"是两件事**，分不清就说分不清。
+早于某次日志改动的批次，某张表是（0 行）是正常的（见 §7.5）。
 
 ---
 
@@ -752,7 +687,7 @@ collect_log.sh：跑不了——机器上没有 jq，报错原文：jq: command 
   `reason:"controllers_not_retreated"`；老批次里它只有 `reason`，读不出卡在谁身上；
 - `news_legend` **从无到有**（每天一条 `{day, head}`，民间传说的原文）。它一直是宝藏祭坛
   那次 LLM 推断的**唯一输入**，却只存在内存里没落过盘——所以老批次里 `treasure_plan`
-  指错了祭坛/祭品/开启日时，无法与"传说被读错了"区分开。老批次里这条配方命中 0 行。
+  指错了祭坛/祭品/开启日时，无法与"传说被读错了"区分开。老批次里这张表是（0 行）。
 
 ---
 
@@ -763,11 +698,11 @@ agent_request:
   target: workflow-driver
   repo: gamelife1314/Competition
   action: deliver_battle_data
-  version: 11
+  version: 12
   model: >
     We see the board (per-round state, both sides' units, our own score/gold) but never the
     result. Our process data reaches us only through stdout — anything not written there is
-    gone — so the recipes below run over your local capture of it and their OUTPUT is what
+    gone — so the tables below run over your local capture of it and their OUTPUT is what
     travels. Outcome, identity, version and the six evidence tables (issue_body.parts[2]) are
     yours to paste into the issue. Nothing is asked back: there are no questions to answer,
     only rows to deliver.
@@ -777,23 +712,23 @@ agent_request:
       There are no paths. Whatever is not on our stdout is not obtainable, and whatever you
       keep on your own disk stays there — nothing is fetched from your machine. So a
       deliverable is something PASTED INTO THE ISSUE, and the only local artifact that matters
-      is the raw stdout capture you run the recipes against. Keep it, keep it re-runnable;
+      is the raw stdout capture you feed the collector. Keep it, keep it re-runnable;
       where it lives is your business. Do not attach it, and do not attach the opponent log
       either: it cannot reach us, and the opponent facts we need ride on receipt.enemy_seen.
     per_battle:
       - paste: receipt.json (one per match_id, never merged)
         content: outcome receipt (see receipt_fields)
-        rules: [must parse with jq, every field present, unknown => null]
+        rules: [must parse as JSON, every field present, unknown => null]
         budget_lines: 120
     per_batch:
       - issue_header_fields
       - coach summary line
       - the six evidence tables (issue_body.parts[2])
-      - pasted_via: bash tools/collect_log.sh <log>  (one command, output pasted whole)
+      - pasted_via: python tools/collect_log.py <log>  (one command, output pasted whole)
     local_only:
       desc: yours to keep, never to send
       items:
-        - the raw stdout capture (ours.jsonl or whatever you call it) — the recipes' input
+        - the raw stdout capture (ours.jsonl or whatever you call it) — the collector's input
         - per-table raw dumps, for when we ask for a specific day rather than an aggregate
   receipt_fields:
     required: [match_id, base_commit, base_commit_time, opponent, result, result_source, rounds, end_reason, score, score_breakdown, station_hp_last, enemy_seen, tasks_ours, env, coach]
@@ -829,15 +764,15 @@ agent_request:
     - {name: 每场一行结果, example: "pk577716 胜 139:52 (b03b1c8)"}
     - {name: 教练汇总, format: "教练：本批 N 场 | 移动 M 次（station_pressure a / gap_funding b / harass c） | 至少移动过一次的场次 X/N | 结果分布 胜 W / 负 L / 平 D"}
   self_check:
-    - jq . receipt.json succeeds and every field name in receipt_fields is present
-    - grep -c '"event":"round"' ours.jsonl >= rounds in that battle
+    - receipt.json parses and every field name in receipt_fields is present
+    - the collector's own `事件计数：` line reports round= >= rounds in that battle
     - git cat-file -t <base_commit> == commit
-    - receipt.coach.moves count == grep -c '"event":"coach_move"' ours.jsonl
+    - receipt.coach.moves count == the M in the collector's `本场汇总：移动 M 次` line
     - no null replaced by 0 / "" / "unknown" (result is the sole exception)
     - anything unobtainable is named in the gaps part with a reason, never silently omitted
     - all six evidence tables were run, each present even when it matched zero rows
     - no evidence table was replaced by a verdict
-    - the six tables came from `bash tools/collect_log.sh <log>`, pasted whole, nothing hand-edited
+    - the six tables came from `python tools/collect_log.py <log>`, pasted whole, nothing hand-edited
     - no local path appears anywhere in the issue body
     - the issue asks us nothing back
   issue_body:
@@ -854,35 +789,30 @@ agent_request:
       - id: evidence_tables
         title: 六张证据表
         desc: >
-          Run each recipe on the local stdout capture and paste the output. Every recipe below
-          is already an aggregate, so the whole output goes in; the all-match run of a
-          10-day, 3-tower, 16-session battle is 193 lines / 4.8 KB across all six. Never paste
-          only the first few rows, never replace a table with a verdict, and never send a
-          path — a file on your disk is not a deliverable. If one table blows past its budget
-          either paste it anyway and say why (gate table: the gate WAS open that long) or
-          paste the summary recipe instead.
-        produced_by: bash tools/collect_log.sh <log>
-        cap_lines_total: 560   # what the script's per-section caps add up to; a typical battle prints 193
+          One command, over the local stdout capture, pasted whole. The script already
+          aggregates and already caps each section, so the whole output goes in; the all-match
+          run of a 10-day, 3-tower, 16-session battle is 224 lines / 6.3 KB (193 table rows).
+          Never paste only the first few rows, never replace a table with a verdict, never
+          hand-edit the output, and never send a path — a file on your disk is not a
+          deliverable. If one table blows past its budget, paste it anyway and say why (gate
+          table: the gate WAS open that long).
+        produced_by: python tools/collect_log.py <log>
+        cap_lines_total: 560   # the script's per-section caps summed; a typical battle prints 224 lines (193 rows)
         tables:
           - id: tower_plan
+            sections: [表 1 造塔计划: 20 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
             name: 造塔计划
             tells: why the third tower never went up — mayBuild (weapons) and upgradeReachable (base level) are different doors, and if they take turns being true with nothing built, the block is not money but nobody walking to the site
-            recipe: |
-              grep '^{' ours.jsonl | jq -r 'select(.event=="tower_plan")
-                | "\(.data.towers)\t\(.data.mayBuild)\t\(.data.upgradeReachable)\t\(.data.reserve)\t\(.data.guard)"' | sort | uniq -c
           - id: ledger
+            sections: [表 2a 一进一出: 60 行, 表 2b 想买 vs 买得起: 20 行, 表 2c 钱包台阶: 60 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
             name: 经济台账
             tells: whether frozen gold is an income problem (no sell) or a spending problem (guard reserve blocks the buy) — sell is income, buy is outgo, shopping is "wanted to buy, did we manage"
-            recipes:
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="buy" or .event=="sell") | [.data.round,.event,.data.role,.data.item,.data.num,.data.gold] | @tsv'
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="shopping") | "\(.data.affordable)\t\(.data.need)"' | sort | uniq -c
           - id: task_endings
+            sections: [表 3a 结局直方图: 20 行, 表 3b 逐 session: 40 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
             name: 任务结局
             tells: timeout and three-strikes are different diseases; a timed-out task is settled on the best answer ever submitted, so reason=timeout does not mean zero
-            recipes:
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="task_ended") | "\(.data.reason)\t\(.data.success)"' | sort | uniq -c
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="task_ended") | [.data.session,.data.reason,.data.success,.data.wrongAnswers,.data.cmdRounds] | @tsv'
           - id: judge_verdict
+            sections: [表 4a 每次提交: 40 行, 表 4b 判题器回过错的回合: 40 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
             name: 判题器裁定
             tells: the only first-hand evidence for a zero-scored task
             error_codes:
@@ -896,10 +826,8 @@ agent_request:
             gotchas:
               - do NOT read code 2 as "the value was wrong" — the description is the discriminator
               - errors[] and errorDescs[] are parallel and same-order
-            recipes:
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="task_answer_submit") | [.data.round,.data.session,.data.chars,.data.flipped,.data.rewritten,.data.wrongSoFar] | @tsv'
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="round") | select(.data.errors) | [.data.round, (.data.errors|join(",")), (.data.errorDescs // [] | join(" | "))] | @tsv'
           - id: gate
+            sections: [表 5a 封门逐回合: 160 行, 表 5b 每天开了几回合: 20 行, 表 5c 卡在谁身上: 20 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
             name: 封门
             tells: how many rounds the gate stayed open AND who it was waiting on — the dusk check runs every round from dayRound 55 to 69, a window of exactly 15 rounds, so 15 rows in one day means the gate never sealed at all and the ring had a hole all night
             fields:
@@ -907,11 +835,8 @@ agent_request:
               stuck: "the subset of away that cannot walk to its post at all — walled off from its gun, so the gate will never seal; absent when empty"
             gotchas:
               - the window is 15 rounds (dayRound 55..69), so 15 rows is the maximum, not a count of seal attempts
-            recipes:
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_seal" or .event=="wall_gate_open") | [.data.round, (((.data.round-1)/130)|floor)+1, ((.data.round-1)%130)+1, .event, ((.data.away // []) | tostring), ((.data.stuck // []) | tostring)] | @tsv'
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | (((.data.round-1)/130)|floor)+1' | sort -n | uniq -c
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | .data.away[]? | @tsv' | awk -F'\t' '{c[$1]++; last[$1]=$2","$3} END {for (id in c) print id, c[id], last[id]}' | sort -k2 -nr
           - id: night_debug
+            sections: [表 6a 夜间沉默原因计数: 20 行, 表 6b 哪座塔在沉默: 40 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
             name: 夜间塔况
             tells: what each tower spent the night doing; reason carries the whole verdict, and the record is written every round on purpose so that the COUNT of controller_withdrawn is the finding
             vocabulary:
@@ -925,13 +850,10 @@ agent_request:
               no_target_reserved_for_robots: prey exists but our own trigger discipline is holding fire
             gotchas:
               - '"fired" is the default, so a raw reason histogram mixes the good case in with the causes of silence — filter it out to count idle reasons'
-              - 'pairs is pruned away when empty, so iterate with []? or jq fails with "Cannot iterate over null"'
-            recipes:
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]?.reason' | sort | uniq -c
-              - grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]? | "\(.tower)\t\(.reason)"' | sort | uniq -c
+              - 'pairs is pruned away when empty, so the key can be missing entirely — read that as "no rows", not as a broken log'
       - id: gaps
         title: 缺口
-        content: everything unobtainable, with the reason. "The recipe matched zero lines" and "it did not happen" are different claims — say so when you cannot tell them apart.
+        content: everything unobtainable, with the reason. A table that printed （0 行） and a thing that did not happen are different claims — say so when you cannot tell them apart.
       - id: already_fixed
         title: 本轮已改（不必再报）
         content: the already_fixed list below
@@ -944,7 +866,7 @@ agent_request:
       - a session with nothing submitted after 15 rounds ends and frees the pioneer (task_defense_abort.reason=sterile)
       # log-shape changes: a batch captured before this commit will look wrong
       # in exactly these ways, and that is not a finding.
-      - "sell events now exist at all (the ledger recipe used to match zero lines)"
+      - "sell events now exist at all (the ledger table used to print （0 行）)"
       - "the ledger key is `item` in both directions; an older batch spells it `ore` on sell"
       - "buy now carries .data.round, so it can be placed on the timeline"
       - "shopping now carries .data.round, so it joins against round.gold"
@@ -959,8 +881,8 @@ agent_request:
 ## 9. English summary
 
 We see the board, never the result. Everything the per-round request carries is ours to log,
-and we do: `/docs/WORKFLOW_REQUEST.md` v11 asks you to (1) keep a raw capture of our stdout,
-(2) run six recipes over it, and (3) paste the batch header fields, one outcome receipt per
+and we do: `/docs/WORKFLOW_REQUEST.md` v12 asks you to (1) keep a raw capture of our stdout,
+(2) run one command over it, and (3) paste the batch header fields, one outcome receipt per
 battle, and the six tables into the issue.
 
 **The channel is the issue body, and nothing else.** Anything not on our stdout is
@@ -979,12 +901,12 @@ day rather than an aggregate. Do not attach it, and do not send the opponent log
 3. **Issue header** — per-battle commit, batch size (≥5 battles / ≥2 opponents), rank,
    cumulative record, win rate, one line per battle, and the fixed-format coach summary line.
 4. **Six evidence tables** (§7.3) — tower_plan, the buy/sell/shopping ledger, task_ended
-   endings, the judger's verdicts, the wall gate, and night_debug. Every recipe is already an
-   aggregate: all six together come to 193 lines / 4.8 KB on a 10-day, 3-tower, 16-session
-   battle. One command produces all six (`tools/collect_log.sh`), so there is nothing to
-   decide about how much to paste. **This is the part we need most**: you can see the
+   endings, the judger's verdicts, the wall gate, and night_debug. The collector already
+   aggregates: all six together come to 224 lines / 6.3 KB on a 10-day, 3-tower, 16-session
+   battle. One command produces all six (`python tools/collect_log.py <log>`), so there is
+   nothing to decide about how much to paste. **This is the part we need most**: you can see the
    result and we cannot, so these tables are the only process data that reaches us. A table
-   replaced by a verdict is worth nothing, and "the recipe matched zero lines" is not the same
+   replaced by a verdict is worth nothing, and "the table printed （0 行）" is not the same
    claim as "it did not happen".
 5. **Self-check** (§6) — run it before publishing; it catches missing fields, a wrong
    `base_commit`, count mismatches against our own log, a table gone over budget, and a local
@@ -994,7 +916,7 @@ day rather than an aggregate. Do not attach it, and do not send the opponent log
 mechanism questions and §7.2's three open questions): deliver the rows, and the analysis is
 ours to do.
 
-The `coach` block is extracted from our JSONL with the jq recipes in §5; the coach itself
+The `coach` block is the `--coach` output in §5; the coach itself
 needs no environment variables and no control group from you.
 
 ---

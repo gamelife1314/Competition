@@ -1,14 +1,16 @@
-//! `tools/collect_log.sh` is the delivery interface for the six evidence tables.
+//! `tools/collect_log.py` is the delivery interface for the six evidence tables.
 //!
 //! WORKFLOW_REQUEST §7.3 hands the workflow driver ONE command whose output is
 //! pasted into the issue whole. That makes the script an interface in the same
 //! sense `log::ledger_record` is one, and it fails in the same silent way: the
-//! recipes select on event names, and a renamed event does not produce an
-//! error — it produces an empty section, which every reader downstream is
-//! entitled to read as "this did not happen".
+//! tables select on event names, and a renamed event does not produce an error
+//! — it produces an empty section, which every reader downstream is entitled to
+//! read as "this did not happen".
 //!
 //! Nothing in the Rust build sees the script, so nothing else can catch that.
-//! These tests read it and hold it against the emitters in `src/`.
+//! These tests read it and hold it against the emitters in `src/`, against the
+//! row budget the docs promise, and against the command the docs tell the
+//! driver to run.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -20,26 +22,37 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn script() -> String {
-    let path = repo_root().join("tools/collect_log.sh");
+fn read(rel: &str) -> String {
+    let path = repo_root().join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|err| {
-        panic!(
-            "{} is the single command WORKFLOW_REQUEST §7.3 asks the workflow \
-             driver to run, so it has to be there: {err}",
-            path.display()
-        )
+        panic!("{rel} is part of the delivery path, so it has to be there: {err}")
     })
 }
 
-/// Every `select(.event=="x")` in the script, i.e. every event it reads.
+fn collector() -> String {
+    read("tools/collect_log.py")
+}
+
+/// Every event name the collector filters on, i.e. every `pick(records, "x")`.
+///
+/// The script routes *all* event filtering through one helper precisely so this
+/// extraction has a single shape to look for; a table that reached into
+/// `r.get("event")` itself would be invisible here.
 fn selected_events(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let needle = ".event==\"";
     let mut rest = text;
-    while let Some(at) = rest.find(needle) {
-        rest = &rest[at + needle.len()..];
-        let end = rest.find('"').expect("the event name is quoted");
-        out.insert(rest[..end].to_string());
+    while let Some(at) = rest.find("pick(") {
+        rest = &rest[at + "pick(".len()..];
+        let end = rest
+            .find(')')
+            .expect("a pick(...) call is closed on the same line");
+        // `records, "buy", "sell"` — the quoted arguments are the event names.
+        for (i, part) in rest[..end].split('"').enumerate() {
+            if i % 2 == 1 {
+                out.insert(part.to_string());
+            }
+        }
+        rest = &rest[end..];
     }
     out
 }
@@ -83,6 +96,27 @@ fn emitted_events() -> BTreeSet<String> {
     out
 }
 
+/// The `CAPS` table: one row budget per table, the single source of the budget.
+fn caps(text: &str) -> Vec<(String, usize)> {
+    let start = text
+        .find("CAPS = {")
+        .expect("the script declares a CAPS table — it is where the row budget lives");
+    let body = &text[start..];
+    let end = body.find('}').expect("the CAPS table is closed");
+    body[..end]
+        .lines()
+        .filter_map(|line| {
+            let (name, rest) = line.split_once("\":")?;
+            let name = name.rsplit('"').next()?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let value = rest.split('#').next()?.trim().trim_end_matches(',').trim();
+            Some((name, value.parse().ok()?))
+        })
+        .collect()
+}
+
 #[test]
 fn every_event_the_collector_reads_is_an_event_we_actually_emit() {
     // The failure this exists for: rename `wall_gate_open` in day.rs and the
@@ -90,8 +124,8 @@ fn every_event_the_collector_reads_is_an_event_we_actually_emit() {
     // answer was. A dropped `round` field reads as a fact about the match; a
     // dropped event name reads as a fact about the match too, and neither
     // raises anything.
-    let read = selected_events(&script());
-    assert!(!read.is_empty(), "the script selects on no events at all");
+    let read = selected_events(&collector());
+    assert!(!read.is_empty(), "the collector selects on no events at all");
     let emitted = emitted_events();
     assert!(
         !emitted.is_empty(),
@@ -101,18 +135,18 @@ fn every_event_the_collector_reads_is_an_event_we_actually_emit() {
     let missing: Vec<&String> = read.difference(&emitted).collect();
     assert!(
         missing.is_empty(),
-        "these events are selected by tools/collect_log.sh but emitted \
+        "these events are selected by tools/collect_log.py but emitted \
          nowhere in src/ (renamed? typo?): {missing:?}\n\
          emitted: {emitted:?}"
     );
 }
 
 #[test]
-fn the_collector_still_carries_all_six_tables() {
-    // §7.3 names six tables and the issue is read as "six tables or an
-    // explanation". A section quietly dropped from the script is a table
-    // quietly dropped from every future report.
-    let text = script();
+fn the_collector_still_carries_all_thirteen_sections() {
+    // §7.3 names six tables printed as thirteen sections, and the issue is read
+    // as "all of them, or an explanation". A section quietly dropped from the
+    // script is a table quietly dropped from every future report.
+    let text = collector();
     for marker in [
         "表 1 · 造塔计划",
         "表 2a",
@@ -125,38 +159,96 @@ fn the_collector_still_carries_all_six_tables() {
     }
     assert!(
         text.contains("（0 行）"),
-        "an empty table must say so: 'the recipe matched zero rows' and 'it \
+        "an empty table must say so: 'the selector matched zero rows' and 'it \
          did not happen' are different claims, and the script is where the \
          driver learns to tell them apart"
     );
 }
 
 #[test]
-fn the_collector_caps_itself_and_says_when_it_did() {
-    // The budget is enforced here rather than left to the driver's judgement,
-    // because the driver is not the one who pays when the issue body is a file
-    // dump. A cap that truncates silently would be worse than no cap.
-    let text = script();
-    assert!(
-        text.contains("section "),
-        "the tables go out through the capping helper"
-    );
+fn the_row_budget_lives_in_the_script_and_adds_up() {
+    // The budget is enforced in the script rather than left to the driver's
+    // judgement, because the driver is not the one who pays when the issue body
+    // is a file dump. A cap that truncates silently would be worse than no cap,
+    // so the script also has to declare the real length — and the caps have to
+    // stay inside the 560 lines §7.3 and §8 promise.
+    let text = collector();
     assert!(
         text.contains("本表共"),
         "a truncated table has to declare its real length"
     );
-    // `section "<title>" <cap>` — the cap is the last token on the line, and
-    // the title is full of spaces and full-width punctuation, so it is the only
-    // thing that can be read positionally.
-    let caps: Vec<usize> = text
-        .lines()
-        .filter(|line| line.trim_start().starts_with("section \""))
-        .filter_map(|line| line.rsplit('"').next()?.trim().parse::<usize>().ok())
-        .collect();
-    assert!(caps.len() >= 13, "expected thirteen capped sections, got {}", caps.len());
-    let total: usize = caps.iter().sum();
+
+    let table = caps(&text);
+    assert_eq!(
+        table.len(),
+        13,
+        "expected one budget per section, got {table:?}"
+    );
+    assert!(
+        text.contains("CAP_TOTAL = sum(CAPS.values())"),
+        "the total must be summed, not typed out a second time where it can \
+         drift from the table"
+    );
+
+    for (name, _) in &table {
+        assert!(
+            text.contains(&format!("CAPS[\"{name}\"]")),
+            "`{name}` has a budget but no section spends it"
+        );
+    }
+    assert_eq!(
+        text.matches("CAPS[\"").count(),
+        13,
+        "a section is spending a budget that is not in the CAPS table"
+    );
+
+    let total: usize = table.iter().map(|(_, cap)| cap).sum();
     assert!(
         total <= 560,
         "the caps add up to {total} lines, over the 560 the docs promise"
+    );
+}
+
+#[test]
+fn the_documented_command_points_at_files_that_exist() {
+    // The doc is the only thing the driver reads. A command naming a file that
+    // is not in the checkout is worse than no command: the driver reports
+    // "跑不了" and the batch arrives with no evidence at all.
+    let doc = read("docs/WORKFLOW_REQUEST.md");
+    assert!(
+        doc.contains("collect_log.py"),
+        "§7.3 has to name the collector the driver runs"
+    );
+    for token in doc.split(|c: char| !(c.is_alphanumeric() || c == '/' || c == '.' || c == '_')) {
+        if let Some(rel) = token.strip_prefix("tools/") {
+            let rel = format!("tools/{rel}");
+            assert!(
+                repo_root().join(&rel).exists(),
+                "the doc tells the driver to run `{rel}`, which does not exist"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_shell_wrapper_only_finds_an_interpreter() {
+    // The wrapper exists for Git Bash and for the Linux/macOS side of the
+    // project; the Windows path is `python tools\collect_log.py` directly. It
+    // must not grow a second implementation of any table — two implementations
+    // is a choice the driver cannot make and a drift nothing would catch.
+    let wrapper = read("tools/collect_log.sh");
+    assert!(
+        wrapper.contains("collect_log.py"),
+        "the wrapper has to hand off to the collector"
+    );
+    assert!(
+        !wrapper.contains(".event==") && !wrapper.contains("pick("),
+        "the wrapper is a launcher, not a second copy of the tables"
+    );
+    assert!(
+        // `command -v` alone would accept the Windows Store stub, which is
+        // found on PATH and opens a shop window when executed.
+        wrapper.contains("sys.version_info"),
+        "the wrapper has to prove the interpreter actually runs"
     );
 }
