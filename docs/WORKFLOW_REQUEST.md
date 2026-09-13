@@ -1,19 +1,23 @@
 # 对战数据交付规范（workflow agent 接口）
 
-> **版本 v10** · 本文档是内网自动对战 workflow 的**交付规范**。
+> **版本 v11** · 本文档是内网自动对战 workflow 的**交付规范**。
 > 读者：拉代码 → 发起对战 → 抓日志 → 分析对局 → 生成改进 issue 的 code agent。
-> 与上一版的区别：v9 的 §7 只有六张表；v10 把表 5（封门）加厚了——`wall_gate_open` 现在带
-> `away`/`stuck`，能直接读出**门卡在谁身上**，并且明确了"这个窗口总共只有 15 回合，15 行
-> = 整夜没封"。其余部分与 v9 相同：§7 是正面清单（issue 正文要给我哪五部分、怎么取、
-> 长什么样，全部给示例），你不需要回答我任何问题，把六张表填出来交给我是唯一的要求。
-> §6 是你可以自己跑一遍的自检清单；§8 是同一份内容的机器可读版本。
+> **v11 改的是交付通道**：没有文件路径可用，我拿不到你机器上的任何东西——**issue 正文
+> 就是交付物**。§1 已按这条重写，§7.3 因此给每张表加了**行数预算**（按真实批次量过），
+> §8 的 `deliverables` 也从 `path:` 改成 `paste:`。对手日志与"原始行 tsv"这两项不再要，
+> 理由见 §1。
+> 其余与 v10 相同：v10 把表 5（封门）加厚了——`wall_gate_open` 现在带 `away`/`stuck`，
+> 能直接读出**门卡在谁身上**，并且明确了"这个窗口总共只有 15 回合，15 行 = 整夜没封"。
+> §7 是正面清单（issue 正文要给我哪五部分、怎么取、长什么样，全部给示例），你不需要回答
+> 我任何问题，把六张表填出来交给我是唯一的要求。§6 是你可以自己跑一遍的自检清单；
+> §8 是同一份内容的机器可读版本。
 
 ---
 
 ## 0. 一句话
 
-每场交付 3 份文件 + 1 份**结果回执**；每批在 issue 头部给 8 个字段 + **六张证据表**（§7）。
-
+每批在 issue 正文里给：头部 8 个字段 + **每场一份结果回执** + **六张证据表**（§7）。
+**没有文件路径这回事**——stdout 之外的东西我拿不到，贴进 issue 的字就是全部（§1）。
 
 分界线只有一条：**棋盘我看得见，结果我看不见。**
 
@@ -23,33 +27,48 @@
 
 所以这件事分成两半，各归各管：
 
-| 半边 | 谁提供 | 怎么提供 |
+| 半边 | 谁提供 | 怎么到我手里 |
 |---|---|---|
-| 逐回合过程数据 | 我（stdout JSONL） | 你**原样搬运**，一个字节都别加工（§2） |
-| 结果、身份、版本 | 你 | 按 §3 的字段填进回执 |
+| 逐回合过程数据 | 我（stdout JSONL） | 你留着**没加工过的那份**，按 §7.3 的配方跑，把**输出**贴进 issue |
+| 结果、身份、版本 | 你 | 按 §3 的字段填进回执，贴进 issue |
 
 ---
 
 ## 1. 交付物清单
 
-每场（`<match_id>`，例 `pk577716`）：
+**交付通道只有一条：issue 正文。** 你机器上的任何路径我都拿不到——文件下载到本地之后
+就停在本地了，我读到的只有贴进 issue 的字。所以本规范的"交付"= **把下面的东西贴进 issue**，
+不是"把文件放在某个目录里"。
 
-| # | 路径 | 内容 | 硬性要求 |
+| # | 内容 | 从哪来 | 硬性要求 |
 |---|---|---|---|
-| 1 | `workflow/logs/<match_id>/ours.jsonl` | 我方进程的 stdout 逐字 | 不改写、不截断、不合并、不脱敏、**保持行序** |
-| 2 | `workflow/logs/<match_id>/enemy.jsonl` | 对手进程的 stdout（可得时） | 同上；拿不到就放一份 `.missing` 说明原因 |
-| 3 | `workflow/logs/<match_id>/receipt.json` | 结果回执（§3） | `jq .` 能解析；字段一个不少，取不到填 `null` |
-| 4 | `workflow/analysis/<match_id>.md` | 分析报告全文 | 不截断。issue 正文可只摘结论，原文必须落在这条路径 |
+| 1 | §4 的 8 个头部字段 | 平台页面 + §5 教练配方 | 每批一次 |
+| 2 | **每场一份** `receipt.json`（§3），整段贴 | 对局详情页 | 字段一个不少，取不到填 `null`；一个 `match_id` 一份，不合并 |
+| 3 | §5 的教练汇总一行 | 你的 `ours.jsonl` | 格式固定，我会 grep |
+| 4 | **§7.3 的六张表**，每张贴配方的**输出原文** | 你的 `ours.jsonl` | 见 §7.3 的行数预算 |
+| 5 | §7.4 缺口：拿不到的东西和原因 | 你自己 | 不许静默省略 |
 
-> 你现有的目录布局与这里不一致时，**保持你自己的布局**，在 issue 里给出实际路径即可。
-> 不要为了对齐本文档搬动文件——我按 issue 里给的路径找。
+`workflow/` 那套目录（`workflow/logs/<match_id>/…`）**是给你自己用的**：原始 stdout 存在
+哪里、叫什么名字、怎么组织，与本规范无关，也不必在 issue 里报路径。**只要保证随时能重跑
+配方**——表里的每一行都是从原始 stdout 跑出来的，我问"某天黄昏门卡在谁身上"的时候，你要能
+当场再跑一条贴上来。
+
+**不再要的两项**（v10 及更早的清单里有，现在取消）：
+
+- **对手日志 `enemy.jsonl`**。它到不了我手里，而我要的那点对手事实（基地等级 / 塔数 / 墙数）
+  已经在 `receipt.enemy_seen` 里了。拿不到也不必写 `.missing`，§7.4 提一句就够。
+- **"原始行另存 tsv + 给路径"**。路径对我无效。原始行留在本地备查，贴的是**配方的输出**。
 
 每批：issue 头部 8 个字段（§4）+ 每场一份 `receipt.json`（§3）+ 一行教练汇总（§5）+
 **§7.3 的六张证据表**（整个 issue 的正文就是 §7 那五部分）。
 
 ---
 
-## 2. 我方日志：只搬运，不加工
+## 2. 我方日志：本地那份要整份留着，别加工
+
+> 这一节讲的是**你本地保存的那份原始 stdout**。它不进 issue（太大），但 §7.3 的每条配方都
+> 跑在它上面——所以它一旦被截断、被合并、被"顺手清理"，表就跟着失真，而我无从察觉。
+> 贴进 issue 的是配方的输出，不是这个文件。
 
 **格式**：stdout 是 JSONL，一行一个事件：
 
@@ -63,7 +82,7 @@
 - 每回合一条 `round`，另有一批 `task_*` / `coach_*` / `volley_review` / `night_debug` /
   `shopping` / `wall_build` … 事件混在同一流里。**回合数 ≠ 行数**，别按行数截取回合。
 - **行序有意义**（事件按发生顺序落盘）。重排、按事件名分组都会破坏因果链。
-- gzip 可以，但保留 `.jsonl.gz` 后缀与原始行序，并在 issue 里说明。
+- 本地怎么存都行（gzip、按场分目录、随便命名），**前提是重跑配方时能还原成原始行序**。
 
 **三个必须知道的压缩规则**（不知道就会把"没写"读成"没发生"）：
 
@@ -93,8 +112,9 @@
    它**每回合都写**，因为"某塔 `controller_withdrawn` 了多少回合"本身就是结论 ——
    计数行数即可，别去重。`night_recall` 与 `night_withdraw` 已并入 `night_debug`。
 
-**禁止**：截断长字段、合并多行、给每行加队伍前缀或时间戳注解、脱敏 ID/坐标、
-只保留 `round` 事件、只保留你分析里引用到的那几行。
+**禁止**（对自己本地那份）：截断长字段、合并多行、给每行加队伍前缀或时间戳注解、脱敏
+ID/坐标、只保留 `round` 事件、只保留你分析里引用到的那几行。这些都让配方在你手上和在我
+手上跑出不同的结果，而我看不出来。
 
 我已经**自己**截断过的字段（不必再想办法还原，但分析时别把它们当全文）：
 
@@ -105,6 +125,9 @@
 | `task_ended.bestAnswer` | 120 字符 | `task_ended` |
 | `task_answer_found.answer` / `task_answer_sentinel.answer` / `task_answer_blocked.answer` | 120 / 60 / 60 字符 | 各自事件 |
 | `prompt_sent.head`、`cmd_sent.head` | 300 字符 | 各自事件 |
+| `news_official.head`、`news_legend.head` | 200 字符 | 各自事件 |
+
+> 被截断的字符串末尾带 `…`——**看到省略号就是它被裁过**，别把后半段当"原文里没有"。
 
 **不截断的关键字段**：`task_answer_submit.answer` —— 交给判题器的**原始字节**，
 v8 起全量记录（上限 4000 字符，正常答案几十到几百字符），另附 `chars` 记真实字符数。
@@ -267,12 +290,16 @@ issue 头部请给这一行（我直接 grep）：
 4. `receipt.coach.moves` 条数 == `grep -c '"event":"coach_move"' ours.jsonl`。
 5. `receipt.coach.halves` == 最后一个 `coach_half` 的 `halves`（一场都没有则为 `0`）。
 6. 没有把 `null` 写成 `0` / `""` / `"unknown"`；`result` 之外的字段出现 `"unknown"` 一律算错。
-7. 对手日志拿不到时，在 issue 与回执里写明原因，而不是静默省略文件。
+7. 对手那一侧拿不到的东西，在 §7.4 写明原因，而不是静默省略。
 8. §7.3 的六张表**每张都跑过**（哪怕命中 0 行也要有那张表和一个 0），且每张表都不是
-   一句结论；行多的那张，原始 tsv 已落盘且 issue 里给了路径。
+   一句结论。
 9. issue 正文里**没有**任何"请你回答"式的反向提问——不存在这样的问题。
 10. 表 5 命中 15 行的那天，写的是"**整夜没封**"而不是"开了 15 回"；`away`/`stuck` 里出现的
    角色 id 在表里点名了——门卡在谁身上是这张表存在的理由。
+11. 六张表的输出**加起来 ≤ 400 行**（贴之前 `… | wc -l` 加起来看一眼）。超了就是贴了原始行
+   而不是配方输出，回 §7.3 换成那张表的汇总式——**表 5 例外**，它开得久正是要看的东西。
+12. **issue 正文里不出现任何本地路径**。`workflow/logs/…` 这种写给自己看就行：路径到我这里
+   是死字，我打不开。
 
 ---
 
@@ -323,9 +350,27 @@ issue 头部请给这一行（我直接 grep）：
 统一约定：
 
 - 每条配方都以 `grep '^{' ours.jsonl |` 开头，跳过首行非 JSON 的 `listening on` 行（§2）。
-- **行数少的表整张贴进 issue**；**行数多的表**贴配方给出的**汇总/直方图**，原始行另存
-  `workflow/analysis/<match_id>.<表名>.tsv`，在 issue 里给路径。
+  `ours.jsonl` 是你本地那份原始 stdout，路径你自己知道就行——**贴的是配方的输出**。
+- **每张表都有行数预算**。下表的"实测"是拿一场 10 天 / 3 座塔 / 16 个 session 的对局按真实
+  批次的形状跑出来的：**六张表全部跑完 193 行 / 4.8 KB**，平均每张 32 行。某张表远超它那一行，
+  只有两种可能——要么这场真的异常（**那就贴**，并在表下写一句哪里异常），要么你贴的是原始行
+  而不是配方输出（回去换汇总式）。
+
+| 表 | 配方 | 实测行数 | 预算 | 增长源 |
+|---|---|---|---|---|
+| 1 造塔计划 | 1 | 3 | ≤ 15 | 聚合式，恒定 |
+| 2 经济台账 | 2a / 2b / 2c | 33 / 2 / 50 | ≤ 150 | 钱动了多少回 |
+| 3 任务结局 | 3a / 3b | 2 / 15 | ≤ 40 | session 数 |
+| 4 判题器裁定 | 4a / 4b | 14 / 8 | ≤ 80 | 提交次数 / 出错回合数 |
+| 5 封门 | 5a / 5b / 5c | 52 / 3 / 1 | ≤ 80（5a） | **每天最多 15 行** |
+| 6 夜间塔况 | 6a / 6b | 3 / 7 | ≤ 40 | 聚合式，恒定 |
+
+- 表 5 的 5a 是唯一按回合线性长的：黄昏窗口一天就 15 回合，所以**每天封顶 15 行**，10 天最多
+  150 行加 10 行封门。它超预算不是"贴多了"，是"门开太久了"——正是我要看的，**照贴**。
+  真想省地方就先贴 5b（每天几行），我点名要哪天的 5a 再补。
+- 总量目标 **≤ 400 行 / 15 KB**。issue 正文上限 65536 字符，这个预算留了 4 倍余量给回执和正文。
 - 不要只贴头几行，也不要用"结论：正常"代替表格——结论由我来下，你给我行。
+- 表下可以写一两句你怎么读它，但**行必须在**。
 
 ---
 
@@ -349,12 +394,13 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="tower_plan")
       6 2	false	false	25	true
 ```
 
-原始行另存：
+**逐回合的原始行不要贴进 issue**——它是 700 行，预算是 15。留在本地，或者我点名要哪一天时
+再跑（下面按"第 N 天"筛，`N` 自己换）：
 
 ```sh
 grep '^{' ours.jsonl | jq -r 'select(.event=="tower_plan")
-  | [.data.round,.data.towers,.data.gaps,.data.reserve,.data.guard,.data.wallGaps,.data.stoneDemand,.data.teamStone,.data.mayBuild,.data.upgradeReachable] | @tsv' \
-  > workflow/analysis/<match_id>.tower_plan.tsv
+  | select((((.data.round-1)/130)|floor)+1 == 5)
+  | [.data.round,.data.towers,.data.gaps,.data.reserve,.data.guard,.data.wallGaps,.data.stoneDemand,.data.teamStone,.data.mayBuild,.data.upgradeReachable] | @tsv'
 ```
 
 ---
@@ -410,12 +456,13 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="round") | "\(.data.round)\t\(.data
 
 > 2c 是备选：2a/2b 已经说明问题就不必给。
 
-原始行另存：
+**`shopping` 的逐回合原始行不要贴进 issue**（一场几百行，2b 已经把它压成两行）。本地备查，
+或者我点名要哪一段时再跑：
 
 ```sh
 grep '^{' ours.jsonl | jq -r 'select(.event=="shopping")
-  | [.data.round,.data.affordable,.data.need,.data.needNum,.data.price,.data.gold,.data.reserve,.data.buyerShopDist,.data.deadline] | @tsv' \
-  > workflow/analysis/<match_id>.ledger.tsv
+  | select((((.data.round-1)/130)|floor)+1 == 5)
+  | [.data.round,.data.affordable,.data.need,.data.needNum,.data.price,.data.gold,.data.reserve,.data.buyerShopDist,.data.deadline] | @tsv'
 ```
 
 ---
@@ -615,12 +662,13 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]? | "
      12 30000	no_target_in_range
 ```
 
-原始行另存：
+**`night_debug` 的逐回合原始行不要贴进 issue**——它每回合一条，一场 600 行，而 6a/6b 已经把
+它压到个位数。本地备查，或者我点名要哪一夜时再跑：
 
 ```sh
 grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug")
-  | [.data.round,.data.robots,(.data.pairs // []|tojson)] | @tsv' \
-  > workflow/analysis/<match_id>.night_debug.tsv
+  | select((((.data.round-1)/130)|floor)+1 == 5)     # 第 N 夜，N 自己换
+  | [.data.round,.data.robots,(.data.pairs // []|tojson)] | @tsv'
 ```
 
 ---
@@ -630,8 +678,8 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug")
 拿不到的东西**写明原因**，不要静默省略：
 
 ```text
-enemy.jsonl：拿不到——判题器不落对手进程的 stdout。
 receipt.tasks_ours[].score：拿不到——对局详情页只有总分，没有逐 session 分。
+receipt.enemy_seen：拿不到——对手基地等级/塔数/墙数在详情页上没有，我方 stdout 也看不见。
 表 4b：本场 ours.jsonl 里 errors 全程缺席，不确定是"真没错误"还是"事件没写"。
 ```
 
@@ -661,7 +709,10 @@ receipt.tasks_ours[].score：拿不到——对局详情页只有总分，没有
   当回合重写了哪些块由 `round.data.chg` 列出（§2 规则 2）；
 - `round` 记录**不再带 `ts`**（回合号就是时钟）；
 - `wall_gate_open` **开始带 `away`/`stuck`**（谁没归队、谁走不回岗位），并去掉了固定的
-  `reason:"controllers_not_retreated"`；老批次里它只有 `reason`，读不出卡在谁身上。
+  `reason:"controllers_not_retreated"`；老批次里它只有 `reason`，读不出卡在谁身上；
+- `news_legend` **从无到有**（每天一条 `{day, head}`，民间传说的原文）。它一直是宝藏祭坛
+  那次 LLM 推断的**唯一输入**，却只存在内存里没落过盘——所以老批次里 `treasure_plan`
+  指错了祭坛/祭品/开启日时，无法与"传说被读错了"区分开。老批次里这条配方命中 0 行。
 
 ---
 
@@ -672,30 +723,38 @@ agent_request:
   target: workflow-driver
   repo: gamelife1314/Competition
   action: deliver_battle_data
-  version: 10
+  version: 11
   model: >
     We see the board (per-round state, both sides' units, our own score/gold) but never the
-    result. Process data is ours to emit — transport it verbatim. Outcome, identity, version
-    and the six evidence tables (issue_body.parts[2]) are yours to attach. Nothing is asked
-    back: there are no questions to answer, only rows to deliver.
+    result. Our process data reaches us only through stdout — anything not written there is
+    gone — so the recipes below run over your local capture of it and their OUTPUT is what
+    travels. Outcome, identity, version and the six evidence tables (issue_body.parts[2]) are
+    yours to paste into the issue. Nothing is asked back: there are no questions to answer,
+    only rows to deliver.
   deliverables:
+    channel: issue_body
+    note: >
+      There are no paths. Whatever is not on our stdout is not obtainable, and whatever you
+      keep on your own disk stays there — nothing is fetched from your machine. So a
+      deliverable is something PASTED INTO THE ISSUE, and the only local artifact that matters
+      is the raw stdout capture you run the recipes against. Keep it, keep it re-runnable;
+      where it lives is your business. Do not attach it, and do not attach the opponent log
+      either: it cannot reach us, and the opponent facts we need ride on receipt.enemy_seen.
     per_battle:
-      - path: workflow/logs/<match_id>/ours.jsonl
-        content: our process stdout, verbatim JSONL
-        rules: [no truncation, no rewriting, no merging, no redaction, preserve line order]
-        note: first stdout line is not JSON ("listening on 0.0.0.0:<port>") — skip non-{ lines
-      - path: workflow/logs/<match_id>/enemy.jsonl
-        content: opponent stdout when obtainable
-        if_unavailable: write workflow/logs/<match_id>/enemy.jsonl.missing stating why
-      - path: workflow/logs/<match_id>/receipt.json
+      - paste: receipt.json (one per match_id, never merged)
         content: outcome receipt (see receipt_fields)
         rules: [must parse with jq, every field present, unknown => null]
-      - path: workflow/analysis/<match_id>.md
-        content: full analysis report, untruncated
+        budget_lines: 120
     per_batch:
       - issue_header_fields
-      - one receipt.json per battle (never merged)
       - coach summary line
+      - the six evidence tables (issue_body.parts[2])
+      - budget_lines_total: 400
+    local_only:
+      desc: yours to keep, never to send
+      items:
+        - the raw stdout capture (ours.jsonl or whatever you call it) — the recipes' input
+        - per-table raw dumps, for when we ask for a specific day rather than an aggregate
   receipt_fields:
     required: [match_id, base_commit, base_commit_time, opponent, result, result_source, rounds, end_reason, score, score_breakdown, station_hp_last, enemy_seen, tasks_ours, env, coach]
     score: {ours: int, enemy: int}                      # the one hard datum we cannot see
@@ -735,9 +794,11 @@ agent_request:
     - git cat-file -t <base_commit> == commit
     - receipt.coach.moves count == grep -c '"event":"coach_move"' ours.jsonl
     - no null replaced by 0 / "" / "unknown" (result is the sole exception)
-    - a missing enemy log is explained, never silently omitted
+    - anything unobtainable is named in the gaps part with a reason, never silently omitted
     - all six evidence tables were run, each present even when it matched zero rows
     - no evidence table was replaced by a verdict
+    - the six tables together are <= 400 lines (the gate table is the one allowed to run over)
+    - no local path appears anywhere in the issue body
     - the issue asks us nothing back
   issue_body:
     desc: >
@@ -753,10 +814,14 @@ agent_request:
       - id: evidence_tables
         title: 六张证据表
         desc: >
-          Run each recipe on ours.jsonl and paste the output. Low-volume tables go in whole;
-          high-volume ones go in as the summary the recipe produces, with the raw rows saved
-          to workflow/analysis/<match_id>.<table>.tsv and the path given in the issue. Never
-          paste only the first few rows, and never replace a table with a verdict.
+          Run each recipe on the local stdout capture and paste the output. Every recipe below
+          is already an aggregate, so the whole output goes in; the all-match run of a
+          10-day, 3-tower, 16-session battle is 193 lines / 4.8 KB across all six. Never paste
+          only the first few rows, never replace a table with a verdict, and never send a
+          path — a file on your disk is not a deliverable. If one table blows past its budget
+          either paste it anyway and say why (gate table: the gate WAS open that long) or
+          paste the summary recipe instead.
+        budget_lines_total: 400
         tables:
           - id: tower_plan
             name: 造塔计划
@@ -845,6 +910,7 @@ agent_request:
       - "night_recall and night_withdraw are folded into night_debug's pairs[].reason"
       - "round blocks (towers/roles/wall/task/...) are change-gated; absent means unchanged, and round.data.chg names what was re-sent"
       - "round records no longer carry ts (the round number is the clock)"
+      - "news_legend is new: one {day, head} a day with the folk legend's own words, which are the sole input to the altar inference and used to live only in memory — an older batch cannot tell a misread legend from a wrong plan"
 ```
 
 ---
@@ -852,27 +918,35 @@ agent_request:
 ## 9. English summary
 
 We see the board, never the result. Everything the per-round request carries is ours to log,
-and we do: `/docs/WORKFLOW_REQUEST.md` v9 asks you to (1) transport our stdout JSONL
-verbatim, (2) attach a per-battle outcome receipt, (3) attach the batch header fields, and
-(4) run six recipes over our JSONL and put the tables in the issue.
+and we do: `/docs/WORKFLOW_REQUEST.md` v11 asks you to (1) keep a raw capture of our stdout,
+(2) run six recipes over it, and (3) paste the batch header fields, one outcome receipt per
+battle, and the six tables into the issue.
 
-1. **Transport, don't process** — `ours.jsonl` byte-for-byte: no truncation, no merging, no
-   redaction, line order preserved. The first stdout line is not JSON. Rounds ≠ lines.
-2. **Per-battle receipt** (`receipt.json`, one per `match_id`, never merged) — the fields we
-   cannot observe from inside: winner, both totals, the task/kill/survival split, opponent
-   identity, the actual `base_commit`, the per-session task scores, and the `CG_*` values the
-   battle ran with. Unknown values must be `null`, never `0` — a fabricated zero is worse
-   than a missing one, because we will attribute a change to it.
+**The channel is the issue body, and nothing else.** Anything not on our stdout is
+unobtainable, and anything on your disk stays on your disk — so there are no paths to give
+and no files to attach. The one local artifact that matters is the stdout capture itself:
+keep it re-runnable, because the tables are derived from it and we may ask for a specific
+day rather than an aggregate. Do not attach it, and do not send the opponent log either.
+
+1. **Keep the capture whole** — no truncation, no merging, no redaction, line order
+   preserved. The first stdout line is not JSON. Rounds ≠ lines.
+2. **Per-battle receipt** (one per `match_id`, never merged) — the fields we cannot observe
+   from inside: winner, both totals, the task/kill/survival split, opponent identity, the
+   actual `base_commit`, the per-session task scores, and the `CG_*` values the battle ran
+   with. Unknown values must be `null`, never `0` — a fabricated zero is worse than a missing
+   one, because we will attribute a change to it.
 3. **Issue header** — per-battle commit, batch size (≥5 battles / ≥2 opponents), rank,
    cumulative record, win rate, one line per battle, and the fixed-format coach summary line.
 4. **Six evidence tables** (§7.3) — tower_plan, the buy/sell/shopping ledger, task_ended
-   endings, the judger's verdicts, the wall gate, and night_debug. Each recipe is given;
-   paste the output, or the summary plus a path to the raw rows. **This is the part we need
-   most**: you can see the result and we cannot, so these tables are the only process data
-   that reaches us. A table replaced by a verdict is worth nothing, and "the recipe matched
-   zero lines" is not the same claim as "it did not happen".
-5. **Self-check** (§6) — run it before publishing; it catches truncated files, missing
-   fields, a wrong `base_commit`, and count mismatches against our own log.
+   endings, the judger's verdicts, the wall gate, and night_debug. Every recipe is already an
+   aggregate: all six together come to 193 lines / 4.8 KB on a 10-day, 3-tower, 16-session
+   battle, against a 400-line budget. **This is the part we need most**: you can see the
+   result and we cannot, so these tables are the only process data that reaches us. A table
+   replaced by a verdict is worth nothing, and "the recipe matched zero lines" is not the same
+   claim as "it did not happen".
+5. **Self-check** (§6) — run it before publishing; it catches missing fields, a wrong
+   `base_commit`, count mismatches against our own log, a table gone over budget, and a local
+   path left in the body.
 
 **There are no questions to answer.** v9 removed the reverse-questioning of v8 (§7.1's six
 mechanism questions and §7.2's three open questions): deliver the rows, and the analysis is
