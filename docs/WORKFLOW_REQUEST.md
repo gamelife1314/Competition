@@ -1,16 +1,18 @@
 # 对战数据交付规范（workflow agent 接口）
 
-> **版本 v8** · 本文档是内网自动对战 workflow 的**交付规范**。
+> **版本 v9** · 本文档是内网自动对战 workflow 的**交付规范**。
 > 读者：拉代码 → 发起对战 → 抓日志 → 分析对局 → 生成改进 issue 的 code agent。
-> 与上一版的区别：v7 是"请求"体例（请求一～七 + 每条的为什么），v8 按**接口**重写——
-> 逐条写明产物、路径、字段、来源与验收方式，作废的要求直接删掉，不留讨论过程。
-> §6 是你可以自己跑一遍的自检清单；§8 是同一份内容的机器可读版本。
+> 与上一版的区别：v8 的 §7 是**反向提问**（我列六个机制问题，请你跑配方后作答）；v9 把它换成
+> **正面清单**——issue 正文要给我哪五部分、每部分怎么取、长什么样，全部给示例。你不需要回答
+> 我任何问题，把 §7 的六张表填出来交给我是唯一的要求。§6 是你可以自己跑一遍的自检清单；
+> §8 是同一份内容的机器可读版本。
 
 ---
 
 ## 0. 一句话
 
-每场交付 3 份文件 + 1 份**结果回执**；每批在 issue 头部给 8 个字段。
+每场交付 3 份文件 + 1 份**结果回执**；每批在 issue 头部给 8 个字段 + **六张证据表**（§7）。
+
 
 分界线只有一条：**棋盘我看得见，结果我看不见。**
 
@@ -41,7 +43,8 @@
 > 你现有的目录布局与这里不一致时，**保持你自己的布局**，在 issue 里给出实际路径即可。
 > 不要为了对齐本文档搬动文件——我按 issue 里给的路径找。
 
-每批：issue 头部 8 个字段（§4）+ 每场一份 `receipt.json`（§3）+ 一行教练汇总（§5）。
+每批：issue 头部 8 个字段（§4）+ 每场一份 `receipt.json`（§3）+ 一行教练汇总（§5）+
+**§7.3 的六张证据表**（整个 issue 的正文就是 §7 那五部分）。
 
 ---
 
@@ -264,36 +267,376 @@ issue 头部请给这一行（我直接 grep）：
 5. `receipt.coach.halves` == 最后一个 `coach_half` 的 `halves`（一场都没有则为 `0`）。
 6. 没有把 `null` 写成 `0` / `""` / `"unknown"`；`result` 之外的字段出现 `"unknown"` 一律算错。
 7. 对手日志拿不到时，在 issue 与回执里写明原因，而不是静默省略文件。
+8. §7.3 的六张表**每张都跑过**（哪怕命中 0 行也要有那张表和一个 0），且每张表都不是
+   一句结论；行多的那张，原始 tsv 已落盘且 issue 里给了路径。
+9. issue 正文里**没有**任何"请你回答"式的反向提问——不存在这样的问题。
 
 ---
 
-## 7. 反向反馈
+## 7. issue 正文：五部分
 
-### 7.1 六个机制问题（issue #26–#28 的遗留，必须逐条作答）
+放进 issue 的信息就是这五部分。前两部分是你对平台数据的转写，第三部分是从 `ours.jsonl`
+跑出来的**六张表**，第四部分是取不到的东西，第五部分是"别再报这个"。
 
-前三份报告把**现象**讲清楚了（任务 0 分、金币冻结、封门、火力代差），但现象指向的**机制**还开着，
-而机制只有日志能回答。下面每条都给了配方：请直接跑，然后在 issue 里给**结论**——
-「是 / 否 + 数字」，不要复述现象。缺哪个事件、哪条查不出来，也请明说。
+**格式不必和我一样，字段和内容要在。** 每部分都给了取法和一段示例输出。
+示例里的数字是编的，只为说明表的形状——不要把它当成任何一场的实际数据。
 
-| # | 问题 | 为什么要它 | 配方（在 `ours.jsonl` 上跑） |
-|---|------|-----------|------------------------------|
-| 1 | 第三座塔为什么没造出来？整场 `mayBuild==true` 且 `towers<3` 的回合有没有？那时 `guard`/`reserve`/`upgradeReachable` 各是什么？ | #26 全程 2 塔 lv1，而 P0-4 的守护金正好把金币钉在 25。要么是 fallback 从没触发（`upgradeReachable` 被背包里的铁/铜算成"买得起"），要么是触发了但没人走到工地 | `jq -r 'select(.event=="tower_plan") \| [.data.round,.data.towers,.data.gaps,.data.reserve,.data.guard,.data.mayBuild,.data.upgradeReachable] \| @tsv'` |
-| 2 | 金币到底卡在哪？`shopping` 里 `affordable==false` 的回合占比、当时的 head 需求与 `price`、`buy` 次数、`gold` 的分布 | #26 报「reserve=25 导致 affordable 全程 false」。需要分清是"守卫金挡住小额采购"还是"根本没东西可买/买不到" | `jq -r 'select(.event=="shopping") \| [.data.round,.data.affordable,.data.need,.data.price,.data.gold,.data.reserve] \| @tsv'` |
-| 3 | 每个 task session 是怎么结束的？`task_ended.reason` 的直方图；每场提交了几次 `submitAnswer` | 12 个 session 全 0 分，但"超时"和"判错三次"是两种完全不同的病 | `jq -r 'select(.event=="task_ended") \| .data.reason' \| sort \| uniq -c` |
-| 4 | 判题器对每次提交回了什么？`task_answer_submit` 之后那几回合的 `errors` / `errorDescs` | **0 分唯一的现场证据**。`MissingNamedInput` 是字段名错，`code 2` 是值错，两者改法完全相反 | 先 `jq -r 'select(.event=="task_answer_submit") \| [.data.round,.data.session,.data.answer,.data.flipped] \| @tsv'`，再取那些 round 的 `round.errors`/`errorDescs` |
-| 5 | 封门开了几回合？`wall_gate_open` 的次数与 `reason`；那几回合每个 controller（尤其开拓者）在不在环内 | #26 的败因是门开 9 回合→城墙塌→基地亡。要确认是"控制器没归队"还是"归队了但没封上" | `jq -r 'select(.event=="wall_gate_open" or .event=="wall_gate_seal") \| [.data.round,.event,.data.reason] \| @tsv'` |
-| 6 | 卖矿几次、各卖了多少金？`gold` 是否长期贴在同一个常数上 | 判断"经济锁死"是收入问题还是支出问题 | `jq -r 'select(.event=="sell") \| [.data.round,.data.role,.data.ore,.data.num,.data.gold] \| @tsv'`，与 `round.gold` 序列对照（`sell` 事件本回合才有；早于本 commit 的日志这个配方命中 0 行，那不是结论） |
+---
 
-### 7.2 三个开放问题（同上，一直有效）
+### 7.1 第一部分：批级概况
 
-1. 分析时**最缺哪类信息**——哪些结论你只能猜？
-2. 希望我新增哪些事件或字段（附一个你期望的 JSON 示例即可）？
-3. 哪些现有事件是**噪音**，可以砍掉（我可以少写，降低体积与干扰）？
+§4 的 8 个字段。来源：平台页面 + §5 的教练配方。
 
-> 本轮已改、下一份报告不必再报的现象：提交被判错后的重试会**换一种外形**提交（`task_answer_submit.flipped`）；
-> `{"status":"pending"}` 这类**包在 JSON 里的哨兵**不再提交给判题器；开拓者在召回前不足 12 回合时
-> **不再接任务**（`task_accept_deferred`）；session 连续 15 回合一条都没提交就**提前结束**放开拓者回墙线
-> （`task_defense_abort.reason = "sterile"`）。
+```text
+生成时间：2026-09-14 09:12
+对战代码版本：pk580001: 9f3c2a1 (2026-09-14 07:40)
+              pk580002: 9f3c2a1 (2026-09-14 07:40)
+本批次数 / 对手数：6 场 / 3 个对手
+当前排名：9 / 64
+累计战绩：14 胜 9 负 2 平
+胜率：56.0%
+每场一行结果：
+  pk580001 胜 139:52 (9f3c2a1)
+  pk580002 负  41:88 (9f3c2a1)
+  pk580003 平  60:60 (9f3c2a1)
+  ...
+教练：本批 6 场 | 移动 4 次（station_pressure 2 / gap_funding 1 / harass 1） | 至少移动过一次的场次 3/6 | 结果分布 胜 4 / 负 1 / 平 1
+```
+
+---
+
+### 7.2 第二部分：逐场结果回执
+
+一场一份 `receipt.json`，字段表见 §3.3，示例见 §3.2。**取不到就填 `null`，不要用 `0` 冒充**
+（§3.4 规则 1）。这一部分 §3 已经写全，这里不再重复。
+
+---
+
+### 7.3 第三部分：六张证据表
+
+**这是整份 issue 里我最需要的部分**，也是唯一能从日志里挖出来的部分——胜负你能看见，过程
+只有我能看见，而这六张表就是过程的切片。
+
+统一约定：
+
+- 每条配方都以 `grep '^{' ours.jsonl |` 开头，跳过首行非 JSON 的 `listening on` 行（§2）。
+- **行数少的表整张贴进 issue**；**行数多的表**贴配方给出的**汇总/直方图**，原始行另存
+  `workflow/analysis/<match_id>.<表名>.tsv`，在 issue 里给路径。
+- 不要只贴头几行，也不要用"结论：正常"代替表格——结论由我来下，你给我行。
+
+---
+
+#### 表 1 · 造塔计划 `tower_plan`
+
+**我用它判断**：第三座塔为什么没造出来。`mayBuild`（手里的钱够不够买武器）和
+`upgradeReachable`（够不够升级基地）是两个不同的门，如果它们轮流为真却谁也没落地，
+卡点就不在钱上，而在"没人走到工地"。
+
+```sh
+grep '^{' ours.jsonl | jq -r 'select(.event=="tower_plan")
+  | "\(.data.towers)\t\(.data.mayBuild)\t\(.data.upgradeReachable)\t\(.data.reserve)\t\(.data.guard)"' \
+  | sort | uniq -c
+```
+
+示例输出（第一列是回合数，后面依次是 塔数 / mayBuild / upgradeReachable / reserve / guard）：
+
+```text
+     18 2	true	false	25	false
+     34 2	false	true	25	false
+      6 2	false	false	25	true
+```
+
+原始行另存：
+
+```sh
+grep '^{' ours.jsonl | jq -r 'select(.event=="tower_plan")
+  | [.data.round,.data.towers,.data.gaps,.data.reserve,.data.guard,.data.wallGaps,.data.stoneDemand,.data.teamStone,.data.mayBuild,.data.upgradeReachable] | @tsv' \
+  > workflow/analysis/<match_id>.tower_plan.tsv
+```
+
+---
+
+#### 表 2 · 经济台账 `buy` / `sell` / `shopping`
+
+**我用它判断**：金币冻结是**收入端**没进账，还是**支出端**被守卫金挡住。三个事件要一起看：
+`sell` 是进账，`buy` 是出账，`shopping` 是"想买但买没买到"（`affordable` 为 false 的回合占比）。
+
+```sh
+# 2a 台账：一进一出各一行（事件名说明方向，两个方向字段完全一样）
+grep '^{' ours.jsonl | jq -r 'select(.event=="buy" or .event=="sell")
+  | [.data.round,.event,.data.role,.data.item,.data.num,.data.gold] | @tsv'
+```
+
+示例输出：
+
+```text
+5	sell	10002	iron	4	25
+9	buy	10002	WallFixer	1	0
+23	sell	10003	iron	4	25
+31	buy	10002	WallFixer	1	0
+```
+
+```sh
+# 2b 想买 vs 买得起：affordable=false 的回合数，按 head 需求分组
+grep '^{' ours.jsonl | jq -r 'select(.event=="shopping") | "\(.data.affordable)\t\(.data.need)"' \
+  | sort | uniq -c
+```
+
+示例输出：
+
+```text
+    612 false	WeaponUpgradeVoucher1
+    140 true	WallFixer
+     44 false	WeaponUpgradeVoucher1
+```
+
+```sh
+# 2c 钱包台阶：只留金币真正变动的那几回合（`round.gold` 是每回合必写的，整场贴太长）
+grep '^{' ours.jsonl | jq -r 'select(.event=="round") | "\(.data.round)\t\(.data.gold)"' \
+  | awk -F'\t' '$2 != prev {print; prev = $2}'
+```
+
+示例输出（回合 / 金币——一眼看出是不是长期贴死在 25）：
+
+```text
+1	75
+9	0
+23	25
+160	100
+```
+
+> 2c 是备选：2a/2b 已经说明问题就不必给。
+
+原始行另存：
+
+```sh
+grep '^{' ours.jsonl | jq -r 'select(.event=="shopping")
+  | [.data.round,.data.affordable,.data.need,.data.needNum,.data.price,.data.gold,.data.reserve,.data.buyerShopDist,.data.deadline] | @tsv' \
+  > workflow/analysis/<match_id>.ledger.tsv
+```
+
+---
+
+#### 表 3 · 任务结局
+
+**我用它判断**：12 个 session 全 0 分，"超时"和"判错三次"是两种完全不同的病——
+超时结束时判题器按此前提交过的最好答案结算（任务书 `timeoutRounds` 条），所以
+`reason=timeout` **不等于** 0 分。
+
+```sh
+# 3a 结局直方图
+grep '^{' ours.jsonl | jq -r 'select(.event=="task_ended") | "\(.data.reason)\t\(.data.success)"' \
+  | sort | uniq -c
+```
+
+示例输出：
+
+```text
+      7 timeout	true
+      3 timeout	false
+      2 wrong_answers	false
+```
+
+```sh
+# 3b 逐 session 一行（和 receipt.tasks_ours[] 对得上）
+grep '^{' ours.jsonl | jq -r 'select(.event=="task_ended")
+  | [.data.session,.data.reason,.data.success,.data.wrongAnswers,.data.cmdRounds] | @tsv'
+```
+
+示例输出：
+
+```text
+1	timeout	true	1	37
+2	timeout	true	0	22
+3	wrong_answers	false	3	58
+```
+
+---
+
+#### 表 4 · 判题器裁定
+
+**我用它判断**：0 分**唯一的现场证据**。
+
+判题器的 `errorCode` 是**粗分类**，官方就这六个（《接口文档》Response 一节）：
+
+| `errorCode` | 含义 |
+|---|---|
+| 0 | 未知错误 |
+| 1 | 任务超时 |
+| 2 | **答案错误**（提交的答案不正确**或不完全正确**） |
+| 3 | 网络错误 |
+| 4 | 指令错误 |
+| 5 | LLM 额度超限 |
+
+> **别把 `2` 当成"值算错了"**：字段名错、字段缺、值超范围、数值不对，全落在 `2` 里。
+> 真正能区分的是 `description`——判题器的**原话**（如 `MissingNamedInput: city` 指名道姓
+> 说缺 `city`）。所以 4b 的两列要**一起**看：`errors` 是码，`errorDescs` 是原话，两个数组
+> **同序**（第 i 个码对应第 i 句原话）。
+
+```sh
+# 4a 每次提交一行（chars 是提交原文的真实字符数，answer 全文见 task_answer_submit.answer）
+grep '^{' ours.jsonl | jq -r 'select(.event=="task_answer_submit")
+  | [.data.round,.data.session,.data.chars,.data.flipped,.data.rewritten,.data.wrongSoFar] | @tsv'
+```
+
+示例输出（回合 / session / 字符数 / 换过外形 / 被改写 / 当时已错几次）：
+
+```text
+48	1	212	false	false	0
+61	1	208	true	false	1
+77	2	96	false	false	0
+```
+
+```sh
+# 4b 判题器回过错的回合：第2列是错误码，第3列是判题器原话（同序）
+grep '^{' ours.jsonl | jq -r 'select(.event=="round") | select(.data.errors)
+  | [.data.round, (.data.errors|join(",")), (.data.errorDescs // [] | join(" | "))] | @tsv'
+```
+
+示例输出：
+
+```text
+48	2	MissingNamedInput: city
+61	2	MissingNamedInput: city
+77	2	字段 humidity 的值不在合法区间
+```
+
+> 4b 是**全量**的错误回合，不限于任务——`cmds` 被拒、技能坐标非法也在这里，一并给我。
+> 提交的那一回合与它之后几回合**都要**，别只截提交回合本身：判题器的回执常常晚一两回合到。
+
+---
+
+#### 表 5 · 封门
+
+**我用它判断**：城门开了几回合。每天黄昏（`dayRound >= 55`）检查一次"所有人归队了吗"，
+归队就封（`wall_gate_seal`），没归队就开（`wall_gate_open`）并**每回合重报**直到封上——
+所以 `wall_gate_open` 的行数**就是**那天门开着没封上的回合数。这个数直接对应城墙能不能撑住。
+
+```sh
+grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_seal" or .event=="wall_gate_open")
+  | [.data.round, (((.data.round-1)/130)|floor)+1, ((.data.round-1)%130)+1, .event] | @tsv'
+```
+
+示例输出（回合 / 第几天 / 当天第几回合 / 事件）：
+
+```text
+185	2	56	wall_gate_open
+186	2	57	wall_gate_open
+187	2	58	wall_gate_open
+188	2	59	wall_gate_seal
+```
+
+```sh
+# 每天开了几回合（一行一天，最快看出哪天没封上）
+grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | (((.data.round-1)/130)|floor)+1' \
+  | sort -n | uniq -c
+```
+
+示例输出：
+
+```text
+      3 1
+      9 2
+      2 4
+```
+
+---
+
+#### 表 6 · 夜间塔况 `night_debug`
+
+**我用它判断**：塔在夜里到底在干什么。**它每回合都写**，所以"某塔 `controller_withdrawn`
+了多少回合"本身就是结论——**计数，不要去重**。
+
+`reason` 的**全部** 8 个取值，别把第一个当成故障：
+
+| `reason` | 意思 |
+|---|---|
+| `fired` | **默认值 = 塔开火了**，不是"闲置" |
+| `controller_withdrawn` | 操作员带伤脱离，炮位没人（行内另带 `hp`） |
+| `controller_walking` / `controller_stuck` | 夜召回的两种结局：走得回来 / 走不回来 |
+| `controller_healing` | 操作员在吃药 |
+| `cooldown` | 炮在冷却 |
+| `no_target_in_range` | 射程内没有目标 |
+| `no_target_reserved_for_robots` | 有机器人猎物，但被我们的开火纪律留着不打 |
+
+> 两个坑：**(1) `reason` 缺省是 `fired`**，直接对 `reason` 做直方图会把"开火"混进"没开火"
+> 的原因里——要看沉默原因，先 `select(.data.reason != "fired")`。**(2) `pairs` 为空时整个键
+> 不落盘**（§2 规则 1），所以配方用 `[]?` 而不是 `[]`，否则 jq 报
+> `Cannot iterate over null`。
+
+```sh
+# 6a 按原因计数（每场一行）
+grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]?.reason' | sort | uniq -c
+```
+
+示例输出：
+
+```text
+    214 fired
+     35 controller_withdrawn
+     12 no_target_in_range
+      8 controller_stuck
+```
+
+```sh
+# 6b 按塔 × 原因计数（配对数 > 1 时看是哪座塔哑了）
+grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]? | "\(.tower)\t\(.reason)"' \
+  | sort | uniq -c
+```
+
+示例输出：
+
+```text
+     96 30000	fired
+     35 30001	controller_withdrawn
+     12 30000	no_target_in_range
+```
+
+原始行另存：
+
+```sh
+grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug")
+  | [.data.round,.data.robots,(.data.pairs // []|tojson)] | @tsv' \
+  > workflow/analysis/<match_id>.night_debug.tsv
+```
+
+---
+
+### 7.4 第四部分：缺口
+
+拿不到的东西**写明原因**，不要静默省略：
+
+```text
+enemy.jsonl：拿不到——判题器不落对手进程的 stdout。
+receipt.tasks_ours[].score：拿不到——对局详情页只有总分，没有逐 session 分。
+表 4b：本场 ours.jsonl 里 errors 全程缺席，不确定是"真没错误"还是"事件没写"。
+```
+
+最后一条尤其重要：**"配方命中 0 行"和"这件事没发生过"是两件事**，分不清就说分不清。
+早于某次日志改动的批次，配方命中 0 行是正常的（见 §7.5）。
+
+---
+
+### 7.5 第五部分：本轮已改（不必再报）
+
+下面这些**本轮已经改了**，下一份报告不必再把它们当成发现报上来：
+
+- 提交被判错后的重试会**换一种外形**提交（`task_answer_submit.flipped`）；
+- `{"status":"pending"}` 这类**包在 JSON 里的哨兵**不再提交给判题器；
+- 开拓者在召回前不足 12 回合时**不再接任务**（`task_accept_deferred`）；
+- session 连续 15 回合一条都没提交就**提前结束**放开拓者回墙线
+  （`task_defense_abort.reason = "sterile"`）。
+
+日志形状的改动（**改动之前抓的批次会在这几处看起来不对，那不是发现**）：
+
+- `sell` 事件**从无到有**（老批次里表 2a 的 `sell` 行命中 0 行）；
+- 账本字段名是 **`item`**（`buy` 与 `sell` 同名同形），老批次的 `sell` 行里叫 `ore`；
+- `buy` 事件**开始带 `round`**，老批次里它没法对齐到时间线；
+- `shopping` 事件**开始带 `round`**，老批次里它没法与 `round.gold` 对齐；
+- `night_recall` 与 `night_withdraw` **并入** `night_debug` 的 `pairs[].reason`；
+- `round` 里的块（`towers`/`roles`/`wall`/`task`/…）**改为变化才写**，缺键 = 沿用上次的值，
+  当回合重写了哪些块由 `round.data.chg` 列出（§2 规则 2）；
+- `round` 记录**不再带 `ts`**（回合号就是时钟）。
 
 ---
 
@@ -304,11 +647,12 @@ agent_request:
   target: workflow-driver
   repo: gamelife1314/Competition
   action: deliver_battle_data
-  version: 8
+  version: 9
   model: >
     We see the board (per-round state, both sides' units, our own score/gold) but never the
-    result. Process data is ours to emit — transport it verbatim. Outcome, identity and
-    version are yours to attach — fill them per battle.
+    result. Process data is ours to emit — transport it verbatim. Outcome, identity, version
+    and the six evidence tables (issue_body.parts[2]) are yours to attach. Nothing is asked
+    back: there are no questions to answer, only rows to deliver.
   deliverables:
     per_battle:
       - path: workflow/logs/<match_id>/ours.jsonl
@@ -367,33 +711,93 @@ agent_request:
     - receipt.coach.moves count == grep -c '"event":"coach_move"' ours.jsonl
     - no null replaced by 0 / "" / "unknown" (result is the sole exception)
     - a missing enemy log is explained, never silently omitted
-  reverse_feedback:
-    - Which information is the analysis missing (what can you only guess)?
-    - Which new events/fields would you like (attach a JSON example)?
-    - Which existing events are noise and can be dropped?
-  mechanism_questions:
+    - all six evidence tables were run, each present even when it matched zero rows
+    - no evidence table was replaced by a verdict
+    - the issue asks us nothing back
+  issue_body:
     desc: >
-      Residual mechanisms behind issues #26-#28. Answer each with a verdict and numbers, not a
-      restatement of the symptom; say so if the event you need is missing.
-    questions:
-      - id: third_tower
-        ask: Was mayBuild ever true while towers < 3? What were guard/reserve/upgradeReachable then?
-        why: "#26 ran two level-1 towers all match with the P0-4 guard pinning gold at 25."
-      - id: gold_freeze
-        ask: Share of shopping rounds with affordable=false, the head need and its price, buy count, gold distribution.
-        why: separate "the guard blocks small buys" from "there was nothing to buy or no way to buy it".
-      - id: task_endings
-        ask: Histogram of task_ended.reason; submitAnswer count per match.
-        why: a timeout and three-strikes are different diseases with different fixes.
-      - id: judge_verdict
-        ask: errors/errorDescs on the rounds right after each task_answer_submit.
-        why: the only first-hand evidence for a zero-scored task; a wrong field NAME and a wrong VALUE need opposite fixes.
-      - id: gate
-        ask: wall_gate_open count and reason, and where each controller stood during those rounds.
-        why: "#26 lost the base to nine open-gate rounds; confirm whether controllers failed to retreat or failed to seal."
-      - id: sales
-        ask: sell event count and amounts; whether gold sits pinned at one constant.
-        why: tells an income problem from a spending problem.
+      What the issue must carry. Five parts, in this order. Nothing here is a question — no
+      answers are wanted, only these rows. Exact formatting is free; the fields are not.
+    parts:
+      - id: batch_overview
+        title: 批级概况
+        content: the issue_header_fields below
+      - id: receipts
+        title: 逐场结果回执
+        content: one receipt.json per battle (see receipt_fields)
+      - id: evidence_tables
+        title: 六张证据表
+        desc: >
+          Run each recipe on ours.jsonl and paste the output. Low-volume tables go in whole;
+          high-volume ones go in as the summary the recipe produces, with the raw rows saved
+          to workflow/analysis/<match_id>.<table>.tsv and the path given in the issue. Never
+          paste only the first few rows, and never replace a table with a verdict.
+        tables:
+          - id: tower_plan
+            name: 造塔计划
+            tells: why the third tower never went up — mayBuild (weapons) and upgradeReachable (base level) are different doors, and if they take turns being true with nothing built, the block is not money but nobody walking to the site
+            recipe: |
+              grep '^{' ours.jsonl | jq -r 'select(.event=="tower_plan")
+                | "\(.data.towers)\t\(.data.mayBuild)\t\(.data.upgradeReachable)\t\(.data.reserve)\t\(.data.guard)"' | sort | uniq -c
+          - id: ledger
+            name: 经济台账
+            tells: whether frozen gold is an income problem (no sell) or a spending problem (guard reserve blocks the buy) — sell is income, buy is outgo, shopping is "wanted to buy, did we manage"
+            recipes:
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="buy" or .event=="sell") | [.data.round,.event,.data.role,.data.item,.data.num,.data.gold] | @tsv'
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="shopping") | "\(.data.affordable)\t\(.data.need)"' | sort | uniq -c
+          - id: task_endings
+            name: 任务结局
+            tells: timeout and three-strikes are different diseases; a timed-out task is settled on the best answer ever submitted, so reason=timeout does not mean zero
+            recipes:
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="task_ended") | "\(.data.reason)\t\(.data.success)"' | sort | uniq -c
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="task_ended") | [.data.session,.data.reason,.data.success,.data.wrongAnswers,.data.cmdRounds] | @tsv'
+          - id: judge_verdict
+            name: 判题器裁定
+            tells: the only first-hand evidence for a zero-scored task
+            error_codes:
+              desc: the judger's own coarse buckets (接口文档, Response section)
+              0: unknown
+              1: task timeout
+              2: answer wrong — "incorrect OR incomplete"; a wrong field NAME, a missing field, an out-of-range value and a wrong number all land here
+              3: network
+              4: command
+              5: LLM quota exceeded
+            gotchas:
+              - do NOT read code 2 as "the value was wrong" — the description is the discriminator
+              - errors[] and errorDescs[] are parallel and same-order
+            recipes:
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="task_answer_submit") | [.data.round,.data.session,.data.chars,.data.flipped,.data.rewritten,.data.wrongSoFar] | @tsv'
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="round") | select(.data.errors) | [.data.round, (.data.errors|join(",")), (.data.errorDescs // [] | join(" | "))] | @tsv'
+          - id: gate
+            name: 封门
+            tells: how many rounds the gate stayed open — the dusk check runs every round from dayRound 55 until it seals, so the wall_gate_open row count IS the number of rounds that day the ring had a hole
+            recipes:
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_seal" or .event=="wall_gate_open") | [.data.round, (((.data.round-1)/130)|floor)+1, ((.data.round-1)%130)+1, .event] | @tsv'
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="wall_gate_open") | (((.data.round-1)/130)|floor)+1' | sort -n | uniq -c
+          - id: night_debug
+            name: 夜间塔况
+            tells: what each tower spent the night doing; reason carries the whole verdict, and the record is written every round on purpose so that the COUNT of controller_withdrawn is the finding
+            vocabulary:
+              fired: THE DEFAULT — the tower fired; not an idleness reason
+              controller_withdrawn: operator broke contact wounded (row also carries hp)
+              controller_walking: recalled and moving back
+              controller_stuck: recalled and cannot get back
+              controller_healing: operator is taking medicine
+              cooldown: the gun is recharging
+              no_target_in_range: nothing in reach
+              no_target_reserved_for_robots: prey exists but our own trigger discipline is holding fire
+            gotchas:
+              - '"fired" is the default, so a raw reason histogram mixes the good case in with the causes of silence — filter it out to count idle reasons'
+              - 'pairs is pruned away when empty, so iterate with []? or jq fails with "Cannot iterate over null"'
+            recipes:
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]?.reason' | sort | uniq -c
+              - grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug") | .data.pairs[]? | "\(.tower)\t\(.reason)"' | sort | uniq -c
+      - id: gaps
+        title: 缺口
+        content: everything unobtainable, with the reason. "The recipe matched zero lines" and "it did not happen" are different claims — say so when you cannot tell them apart.
+      - id: already_fixed
+        title: 本轮已改（不必再报）
+        content: the already_fixed list below
   already_fixed:
     desc: do not re-report these; they changed this round
     items:
@@ -403,7 +807,9 @@ agent_request:
       - a session with nothing submitted after 15 rounds ends and frees the pioneer (task_defense_abort.reason=sterile)
       # log-shape changes: a batch captured before this commit will look wrong
       # in exactly these ways, and that is not a finding.
-      - "sell events now exist at all (recipe 6 used to match zero lines)"
+      - "sell events now exist at all (the ledger recipe used to match zero lines)"
+      - "the ledger key is `item` in both directions; an older batch spells it `ore` on sell"
+      - "buy now carries .data.round, so it can be placed on the timeline"
       - "shopping now carries .data.round, so it joins against round.gold"
       - "night_recall and night_withdraw are folded into night_debug's pairs[].reason"
       - "round blocks (towers/roles/wall/task/...) are change-gated; absent means unchanged, and round.data.chg names what was re-sent"
@@ -415,8 +821,9 @@ agent_request:
 ## 9. English summary
 
 We see the board, never the result. Everything the per-round request carries is ours to log,
-and we do: `/docs/WORKFLOW_REQUEST.md` v8 asks you to (1) transport our stdout JSONL
-verbatim, (2) attach a per-battle outcome receipt, (3) attach the batch header fields.
+and we do: `/docs/WORKFLOW_REQUEST.md` v9 asks you to (1) transport our stdout JSONL
+verbatim, (2) attach a per-battle outcome receipt, (3) attach the batch header fields, and
+(4) run six recipes over our JSONL and put the tables in the issue.
 
 1. **Transport, don't process** — `ours.jsonl` byte-for-byte: no truncation, no merging, no
    redaction, line order preserved. The first stdout line is not JSON. Rounds ≠ lines.
@@ -427,8 +834,18 @@ verbatim, (2) attach a per-battle outcome receipt, (3) attach the batch header f
    than a missing one, because we will attribute a change to it.
 3. **Issue header** — per-battle commit, batch size (≥5 battles / ≥2 opponents), rank,
    cumulative record, win rate, one line per battle, and the fixed-format coach summary line.
-4. **Self-check** (§6) — run it before publishing; it catches truncated files, missing
+4. **Six evidence tables** (§7.3) — tower_plan, the buy/sell/shopping ledger, task_ended
+   endings, the judger's verdicts, the wall gate, and night_debug. Each recipe is given;
+   paste the output, or the summary plus a path to the raw rows. **This is the part we need
+   most**: you can see the result and we cannot, so these tables are the only process data
+   that reaches us. A table replaced by a verdict is worth nothing, and "the recipe matched
+   zero lines" is not the same claim as "it did not happen".
+5. **Self-check** (§6) — run it before publishing; it catches truncated files, missing
    fields, a wrong `base_commit`, and count mismatches against our own log.
+
+**There are no questions to answer.** v9 removed the reverse-questioning of v8 (§7.1's six
+mechanism questions and §7.2's three open questions): deliver the rows, and the analysis is
+ours to do.
 
 The `coach` block is extracted from our JSONL with the jq recipes in §5; the coach itself
 needs no environment variables and no control group from you.

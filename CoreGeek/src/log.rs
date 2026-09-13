@@ -142,15 +142,22 @@ pub fn xy(pos: crate::protocol::Pos) -> serde_json::Value {
     serde_json::json!([pos.x, pos.y])
 }
 
-/// The record for one ore stack actually converted to gold.
+/// The record for one thing bought or sold — `buy` and `sell` share it.
 ///
-/// It exists as a named function because it is an interface, not a debug
-/// print: WORKFLOW_REQUEST §7.1 reads it against the `round.gold` series to
-/// tell an income-starved economy — long runs of rounds with no `sell` in them
-/// — from a spend-blocked one, where sells land and the purse stays pinned
-/// anyway. Those four questions are the field list. `gold` is the purse at the
-/// moment the order went out, which is the same frame `round.gold` uses.
-pub fn sell_record(
+/// They are the two directions of one ledger, and the question they exist to
+/// answer is asked of the ledger, not of either entry: is the purse pinned
+/// because nothing is coming in, or because everything that comes in goes
+/// straight back out? That is read by joining both directions against the
+/// `round.gold` series, so a row with no `round` cannot be placed on the
+/// timeline and a row keyed differently from its opposite cannot be joined to
+/// it. `item` is the ore, weapon or voucher the money moved for, and `gold` is
+/// the purse at the moment the order went out — the same frame `round.gold`
+/// uses. The event name carries the direction; the record does not repeat it.
+///
+/// A named function rather than inline JSON at two call sites because the
+/// field list is an interface WORKFLOW_REQUEST §7.3 reads, and an interface is
+/// worth a test.
+pub fn ledger_record(
     turn: &crate::model::Turn,
     role: &crate::model::Unit,
     cmd: &crate::protocol::RoleCommand,
@@ -158,7 +165,7 @@ pub fn sell_record(
     serde_json::json!({
         "round": turn.round_no,
         "role": role.id,
-        "ore": cmd.name,
+        "item": cmd.name,
         "num": cmd.num,
         "gold": turn.gold,
     })

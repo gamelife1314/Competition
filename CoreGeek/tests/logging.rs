@@ -137,12 +137,13 @@ fn a_position_costs_two_numbers_not_two_key_names() {
 }
 
 #[test]
-fn a_sale_records_the_purse_it_was_made_from() {
-    // WORKFLOW_REQUEST §7.1 question 6 reads this event against the
-    // `round.gold` series, so the field names are an interface: drop `round`
-    // and the two streams stop joining, drop `gold` and "the purse is pinned
-    // at 25" stops being answerable. Until this round the event did not exist
-    // at all and the recipe matched zero lines.
+fn a_ledger_row_can_be_placed_on_the_timeline_and_joined_to_its_opposite() {
+    // WORKFLOW_REQUEST §7.3 reads these two events against the `round.gold`
+    // series, so the field names are an interface: drop `round` and a row stops
+    // being placeable on the timeline, and key the two directions differently
+    // and they stop being joinable. Until this round `sell` did not exist at
+    // all (the recipe matched zero lines) and `buy` had no `round` — which is
+    // why both now come out of one function.
     let turn = turn_from(json!({
         "roundNo": 42,
         "mapInfo": {"width": 41, "height": 32, "zones": []},
@@ -161,10 +162,23 @@ fn a_sale_records_the_purse_it_was_made_from() {
     }));
     let role = turn.role_by_id(10002).expect("the worker exists");
 
-    let record = coregeek::log::sell_record(&turn, role, &RoleCommand::sell("iron", 2));
+    let sold = coregeek::log::ledger_record(&turn, role, &RoleCommand::sell("iron", 2));
     assert_eq!(
-        record,
-        json!({"round": 42, "role": 10002, "ore": "iron", "num": 2, "gold": 25})
+        sold,
+        json!({"round": 42, "role": 10002, "item": "iron", "num": 2, "gold": 25})
+    );
+
+    // The other direction, same shape: the event name is what says which way
+    // the money went, so the two records must differ in nothing else.
+    let bought = coregeek::log::ledger_record(&turn, role, &RoleCommand::buy("medicine", 1));
+    assert_eq!(
+        bought,
+        json!({"round": 42, "role": 10002, "item": "medicine", "num": 1, "gold": 25})
+    );
+    assert_eq!(
+        bought.as_object().expect("a record is an object").keys().collect::<Vec<_>>(),
+        sold.as_object().expect("a record is an object").keys().collect::<Vec<_>>(),
+        "the two directions of the ledger are read by one recipe"
     );
 }
 

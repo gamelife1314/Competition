@@ -290,8 +290,8 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         crate::log::event(
             "shopping",
             serde_json::json!({
-                // The round is the join key: WORKFLOW_REQUEST §7.1's second
-                // question is about the *ratio* of unaffordable rounds and what
+                // The round is the join key: WORKFLOW_REQUEST §7.3's ledger
+                // table is about the *ratio* of unaffordable rounds and what
                 // gold was doing in them, and without this the event could only
                 // be counted, never aligned with `round.gold`.
                 "round": turn.round_no,
@@ -1254,7 +1254,7 @@ fn buyer_flow(
         if num > 0 {
             crate::log::event(
                 "buy",
-                serde_json::json!({"role": role.id, "name": need.name, "num": num, "gold": turn.gold}),
+                crate::log::ledger_record(turn, role, &RoleCommand::buy(&need.name, num)),
             );
             return Some(RoleCommand::buy(&need.name, num));
         }
@@ -1677,7 +1677,7 @@ fn sell_flow(
         // them is a mining problem, while sells that land with the gold pinned
         // afterwards is a spending one. Until now nothing was logged here at
         // all, so the recipe matched zero lines.
-        crate::log::event("sell", crate::log::sell_record(turn, role, &cmd));
+        crate::log::event("sell", crate::log::ledger_record(turn, role, &cmd));
         return Some(cmd);
     }
     walk_toward(turn, role, &stands, claimed)
