@@ -385,6 +385,22 @@ impl Turn {
             .filter(|unit| unit.kind == UnitKind::Wall && unit.alive())
             .collect()
     }
+    /// The opponent's station. The request carries their whole roster
+    /// (`teamEnemy.roles`) but nothing about how they are doing — their score,
+    /// gold and task submissions are invisible to us; their base's HP is not,
+    /// and logging it per round is what lets a captured match say which day a
+    /// base fell without needing the judger's own match record.
+    pub fn enemy_station(&self) -> Option<&Unit> {
+        self.enemy
+            .iter()
+            .find(|unit| unit.kind == UnitKind::Station)
+    }
+    pub fn enemy_walls(&self) -> Vec<&Unit> {
+        self.enemy
+            .iter()
+            .filter(|unit| unit.kind == UnitKind::Wall && unit.alive())
+            .collect()
+    }
     pub fn role_by_id(&self, id: i64) -> Option<&Unit> {
         self.ours.iter().find(|unit| unit.id == id)
     }

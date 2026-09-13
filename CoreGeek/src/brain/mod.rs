@@ -205,6 +205,12 @@ fn log_round(
         .collect();
     let wall_hp: i64 = turn.walls().iter().map(|wall| wall.health).sum();
     let wall_hp_delta = state.prev_wall_hp.map(|previous| wall_hp - previous);
+    // The opponent's side of the same two numbers. Their score, gold and task
+    // submissions are invisible to us (see `Turn::enemy_station`), but their
+    // base HP is in every request — logging it makes "our base fell on day 2,
+    // theirs on day 5" answerable from OUR log alone, so the analysis workflow
+    // is not the only source of that fact.
+    let enemy_wall_hp: i64 = turn.enemy_walls().iter().map(|wall| wall.health).sum();
     // Score attribution. Robots that leave the board score `score2`
     // (small/middle/large/BOSS = 1/2/4/10); the survival rule of chapter 6 is
     // `10 x day` while the station stands. Both are accumulated here so the
@@ -245,9 +251,12 @@ fn log_round(
             },
             "stationHp": turn.station().map(|station| station.health),
             "stationLvl": turn.station().map(|station| station.level),
+            "enemyStationHp": turn.enemy_station().map(|station| station.health),
+            "enemyStationLvl": turn.enemy_station().map(|station| station.level),
             "robotCount": robot_hp.len(),
             "robotEvents": robot_events,
             "wall": {"count": turn.walls().len(), "hp": wall_hp, "hpDelta": wall_hp_delta},
+            "enemyWall": {"count": turn.enemy_walls().len(), "hp": enemy_wall_hp},
             "pairs": pairs,
             "towers": towers,
             "roles": roles,

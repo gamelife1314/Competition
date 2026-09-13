@@ -297,12 +297,14 @@ pub fn plan_pioneer(
             // the log. One event per submission, carrying what was actually
             // sent, closes that gap for good.
             let payload = submittable_answer_for(&fields, &state.task.description, &answer);
+            let (logged, chars) = answer_for_log(&payload);
             crate::log::event(
                 "task_answer_submit",
                 serde_json::json!({
                     "session": state.task.session_id,
                     "round": turn.round_no,
-                    "answer": truncate(&payload, 160),
+                    "answer": logged,
+                    "chars": chars,
                     "rewritten": payload != answer,
                 }),
             );
@@ -951,4 +953,20 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
         return text.to_string();
     }
     text.chars().take(max_chars).collect()
+}
+
+/// `task_answer_submit.answer` 的字符上限。
+///
+/// 这个字段是交给判题器的**原始字节**，也是任务 0 分唯一的现场证据——判题器回
+/// `MissingNamedInput` 时，缺的是哪个字段只能从这段原文里看出来。上一版把它截到
+/// 160 字符，等于把最有用的证据自己扔了。上限只用于挡住异常巨大的 LLM 回包
+/// （一场所提交的次数是个位数，正常答案几十到几百字符）。
+pub const ANSWER_LOG_CAP: usize = 4000;
+
+/// 打进日志的答案：全文（上限 [`ANSWER_LOG_CAP`] 字符）+ **真实**字符数。
+///
+/// 长度单独给出，所以任何被上限截断的答案都能被认出来
+/// （`answer.chars().count() < chars` 即截断），不会被误当成判题器收到的原文。
+pub fn answer_for_log(payload: &str) -> (String, usize) {
+    (truncate(payload, ANSWER_LOG_CAP), payload.chars().count())
 }

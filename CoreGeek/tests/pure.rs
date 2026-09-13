@@ -2,7 +2,9 @@
 //! parsing and the day/night calendar.
 
 use coregeek::brain::combat::{line_cells, within_cone};
-use coregeek::brain::task::{exit_code, extract_answer, extract_command, strip_status_line};
+use coregeek::brain::task::{
+    answer_for_log, exit_code, extract_answer, extract_command, strip_status_line, ANSWER_LOG_CAP,
+};
 use coregeek::brain::treasure::parse_plan;
 use coregeek::model::Turn;
 use coregeek::protocol::{Pos, Request};
@@ -169,5 +171,29 @@ fn error_descriptions_are_kept_not_dropped() {
     assert_eq!(
         turn.error_descriptions,
         vec!["MissingNamedInput: city".to_string(), "任务超时".to_string()]
+    );
+}
+
+#[test]
+fn the_submitted_answer_is_logged_in_full() {
+    // 判题器说 MissingNamedInput 时，缺的是哪个字段只能从提交原文里看出来——
+    // 那不是可以截到 160 字符的东西。
+    let answer = format!(
+        "{{\"city\": \"北京\", \"reason\": \"{}\"}}",
+        "因为该地全年降水集中于夏季且地形抬升显著".repeat(8)
+    );
+    assert!(answer.chars().count() > 160, "构造的答案必须超过旧上限");
+    let (logged, chars) = answer_for_log(&answer);
+    assert_eq!(logged, answer, "正常长度的答案逐字进日志");
+    assert_eq!(chars, answer.chars().count());
+
+    // 异常巨大的回包才截断，且真实长度必须留下，让截断可被认出来。
+    let huge = "x".repeat(ANSWER_LOG_CAP + 500);
+    let (logged, chars) = answer_for_log(&huge);
+    assert_eq!(logged.chars().count(), ANSWER_LOG_CAP);
+    assert_eq!(chars, ANSWER_LOG_CAP + 500);
+    assert!(
+        logged.chars().count() < chars,
+        "截断必须可以被识别：实际字符数 < 真实字符数"
     );
 }

@@ -1,370 +1,349 @@
-# 对自动对战 Workflow 的全部要求
+# 对战数据交付规范（workflow agent 接口）
 
-> 载体：本文档 + git commit message（`git log` 可见完整请求）。
-> 目标读者：驱动自动对战、下载日志、分析对局、生成「改进任务」issue 的内部 code agent / workflow。
-> 版本：v7（本文档为唯一入口，取代原 `AGENT_REQUEST.md`）。
-> v7 增量：**请求七改为「对战结果回执」**——原 A/B 拨盘实验（要求 workflow 设置
-> `CG_TUNE_*` 环境变量）作废，因为内网 workflow 无法设置环境变量；策略自适应已改为
-> **决策器内置的在线教练**，不依赖任何外部对照组。请求五事件表补充教练事件与
-> `round.policy` 字段。
+> **版本 v8** · 本文档是内网自动对战 workflow 的**交付规范**。
+> 读者：拉代码 → 发起对战 → 抓日志 → 分析对局 → 生成改进 issue 的 code agent。
+> 与上一版的区别：v7 是"请求"体例（请求一～七 + 每条的为什么），v8 按**接口**重写——
+> 逐条写明产物、路径、字段、来源与验收方式，作废的要求直接删掉，不留讨论过程。
+> §6 是你可以自己跑一遍的自检清单；§8 是同一份内容的机器可读版本。
 
 ---
 
-## 请求一：issue 头部补充累计战绩字段
+## 0. 一句话
 
-当前 issue 只含**单场**结果 + 本批次数（`分析场次: 1 (胜 0 / 负 1 / 平或未知 0)`），
-缺少全局视角，无法判断改进是否让整体成绩上升。
+每场交付 3 份文件 + 1 份**结果回执**；每批在 issue 头部给 8 个字段。
 
-请在「生成时间」下方增加：
+分界线只有一条：**棋盘我看得见，结果我看不见。**
 
-| 字段 | 含义 | 示例 |
+每个回合的请求里带着：回合号、地图、我方队名/ID/金币/总分、我方任务板、**双方所有
+单位的血量与等级**、机器人、两家商店、判题器的错误码与原文。但 `teamEnemy` 里**只有
+`roles`**——对方的总分、金币、任务提交，以及**这一场谁赢了**，我一律看不到。
+
+所以这件事分成两半，各归各管：
+
+| 半边 | 谁提供 | 怎么提供 |
 |---|---|---|
-| 当前排名 | 全部参赛队中的名次 | `12 / 64` |
-| 累计胜场 | 上半场+下半场累计获胜 | `8` |
-| 累计负场 | 累计落败 | `5` |
-| 累计平局 | 累计平局 | `1` |
-| 胜率 | 胜场 / 总场次，保留 1 位小数 | `57.1%` |
-
-**为什么**：单场失利可能是运气（对手强弱、出生点、地图随机）。只有排名与胜率的
-长期趋势能说明改进是否有效，否则会出现"修了半天反而更差"却看不出来。
+| 逐回合过程数据 | 我（stdout JSONL） | 你**原样搬运**，一个字节都别加工（§2） |
+| 结果、身份、版本 | 你 | 按 §3 的字段填进回执 |
 
 ---
 
-## 请求二：每轮发起的对战场数 3 → 5
+## 1. 交付物清单
 
-**为什么**：3 场样本太小，无法区分信号与噪声（1 胜 2 负 vs 0 胜 3 负 统计上无意义），
-3 场胜率在 33%/67% 间剧烈摆动，无法用于决策。5 场以上胜率才具参考价值，同时加快迭代循环。
+每场（`<match_id>`，例 `pk577716`）：
 
----
-
-## 请求三：记录每场对战所基于的代码 commit
-
-请在「生成时间」下方增加：
-
-| 字段 | 含义 | 示例 |
-|---|---|---|
-| 对战代码版本 | 发起该场对战时使用的 git commit（短 hash + 时间） | `b03b1c8 (2026-09-13 08:30)` |
-
-一批对战跨越多个 commit 时，请逐场标记，或在批次头部列出：
-```
-历史对局代码版本（如涉及多个）：
-  pk575557: 8de90f3 (2026-09-13 08:26)
-  pk575412: b03b1c8 (2026-09-13 08:30)
-```
-
-**为什么**：workflow 拉代码 → 发起对战 → 下载日志 → 分析 → 生成 issue 存在**时间差**，
-而我们本地持续在提交。读 issue 时我们的 HEAD 通常已经变了：
-
-1. 分析里引用的**行号/函数名可能已不存在**（"照 issue 去改却找不到代码"）
-2. 报告的问题**可能已被后续 commit 修掉**，白白浪费一轮改进
-3. 没有 base commit **无法复现日志**（不能 checkout 到那个版本）
-4. 无法把 commit 与胜率趋势关联（配合请求一）
-
-**实例**：issue #23 的分析生成于 08:53，而 `561640b`（issue #22 修复）提交于 08:47——
-6 分钟不可能跑完一场比赛，所以 #23 描述的是**修复前**的代码。若有 base commit 字段，
-我们就能立刻判断"这条改进项是否已被修复"。
-
----
-
-## 请求四：提供完整详细的日志（最重要）
-
-### 现状问题
-
-1. **issue 正文被截断**：每条改进项被截到 ~200 字符。例如 issue #23 里出现
-   `北京任务答案 {"city"` 后**直接断掉**，看不到实际提交的完整答案，无法定位格式错误。
-2. **原始日志不在仓库**：issue 引用的 `workflow/logs/pk577716/teamB_4388_道化黄泉路.log`
-   和 `workflow/analysis/*.md` 在本仓库中**不存在**，我们拿不到逐回合原始数据。
-3. **缺少对手视角**：只有我方日志时，无法理解对手为何能完成任务/守住基地
-   （例如 issue #10 提到"对手靠 `MissingNamedInput` 拒绝描述重试 4 次成功"，
-   但我们看不到对手的 LLM 交互细节）。
-
-### 请提供（按重要性排序）
-
-| # | 内容 | 形式 | 用途 |
+| # | 路径 | 内容 | 硬性要求 |
 |---|---|---|---|
-| 1 | **我方完整原始 JSONL 日志** | 逐回合全量，不截断 | 复现决策链、定位代码位置 |
-| 2 | **对手日志**（若可得） | 同上 | 学习对手成功的任务/防御策略 |
-| 3 | **完整分析报告** | `workflow/analysis/*.md` 全文 | 我们的分析已被截断到无法使用 |
-| 4 | **issue 正文不截断**（或阈值提到 ≥2000 字符） | — | 现在 200 字符切断关键信息 |
-| 5 | **结构化关键事件摘要** | JSON，见下 | 便于自动比对与量化 |
+| 1 | `workflow/logs/<match_id>/ours.jsonl` | 我方进程的 stdout 逐字 | 不改写、不截断、不合并、不脱敏、**保持行序** |
+| 2 | `workflow/logs/<match_id>/enemy.jsonl` | 对手进程的 stdout（可得时） | 同上；拿不到就放一份 `.missing` 说明原因 |
+| 3 | `workflow/logs/<match_id>/receipt.json` | 结果回执（§3） | `jq .` 能解析；字段一个不少，取不到填 `null` |
+| 4 | `workflow/analysis/<match_id>.md` | 分析报告全文 | 不截断。issue 正文可只摘结论，原文必须落在这条路径 |
 
-### 建议的结构化事件摘要（每场）
+> 你现有的目录布局与这里不一致时，**保持你自己的布局**，在 issue 里给出实际路径即可。
+> 不要为了对齐本文档搬动文件——我按 issue 里给的路径找。
+
+每批：issue 头部 8 个字段（§4）+ 每场一份 `receipt.json`（§3）+ 一行教练汇总（§5）。
+
+---
+
+## 2. 我方日志：只搬运，不加工
+
+**格式**：stdout 是 JSONL，一行一个事件：
 
 ```json
-{
-  "match_id": "pk577716",
-  "base_commit": "561640b",
-  "duration_rounds": 256,
-  "result": {"series": "3:0", "single": "loss", "score": [52, 139]},
-  "score_breakdown": {
-    "ours":   {"task": 0, "kill": 5, "survival": 20},
-    "enemy":  {"task": 139, "kill": 0, "survival": 0}
-  },
-  "tasks": {
-    "ours":  [{"id": 1, "status": "failed", "reason": "schema_reject",
-               "submitted": "<完整答案原文>", "error": "<errors[].description 全文>"}],
-    "enemy": [{"id": 1, "status": "completed", "rounds": 16, "score": 91}]
-  },
-  "base_hp_timeline": [{"round": 1, "ours": 1500, "enemy": 1500}],
-  "wall_hp_timeline":  [{"round": 60, "count": 20, "hp": 20000}],
-  "robot_waves":       [{"night": 1, "spawned": 70, "killed": 45}],
-  "towers":            [{"id": 20020, "level": 1, "fired_rounds": 12, "idle_rounds": 24}],
-  "gold_curve":        [{"round": 1, "gold": 75}],
-  "anomalies":         [{"round": 130, "event": "controller_withdrawn", "role": 20010}]
-}
+{"ts":1789281855133,"event":"round","data":{"round":1,"day":1,…}}
 ```
 
-**为什么最关键**：`errors[].description` 是判题器返回的**唯一 schema 提示来源**
-（我们的 `model.rs` 此前把它解析后丢弃了）。完整日志能让我们看到
-"提交了什么 → 判题器说了什么 → 对手怎么改对的"这个完整闭环，
-这是修复任务系统 0 分问题的核心证据。
+- **首行不是 JSON**（`listening on 0.0.0.0:<port>`）。解析前跳过不以 `{` 开头的行。
+- 每回合一条 `round`，另有一批 `task_*` / `coach_*` / `volley_review` / `night_debug` /
+  `shopping` / `wall_build` … 事件混在同一流里。**回合数 ≠ 行数**，别按行数截取回合。
+- **行序有意义**（事件按发生顺序落盘）。重排、按事件名分组都会破坏因果链。
+- gzip 可以，但保留 `.jsonl.gz` 后缀与原始行序，并在 issue 里说明。
 
-> **v6 备注（我方侧已完成）**：自本版本对应 commit 起，我方 `round` 事件自带
-> `errorDescs` 字段（每条判题器错误描述，截 120 字符）——你们可以直接从 JSONL 提取，
-> 不必再从协议层另抓。若 120 字符不够，请告诉我们需要的截断长度。
+**禁止**：截断长字段、合并多行、给每行加队伍前缀或时间戳注解、脱敏 ID/坐标、
+只保留 `round` 事件、只保留你分析里引用到的那几行。
 
----
+我已经**自己**截断过的字段（不必再想办法还原，但分析时别把它们当全文）：
 
-## 请求五：明确告诉我们当前分析却什么信息
-
-我们承诺持续优化自己的日志输出（stdout JSONL），但需要你们反馈：
-
-1. **当前分析时最缺哪类信息**（哪些字段拿不到，只能猜）
-2. **希望我们新增的事件名称与字段**（建议附 JSON 示例）
-3. **哪些现有日志是噪音**（可以砍掉，降低体积与干扰）
-
-我们当前已输出的事件：
-
-| 事件 | 用途 |
-|---|---|
-| `round` | 每回合完整状态（cmds / failures / score / scoreAttr / scoreDelta / **errorDescs**） |
-| `night_debug` | 夜间控制器–炮塔配对、距离、冷却、是否开火、静默原因 |
-| `volley` | 齐射结果核对（fired/executed/damaged/kills/rejected） |
-| `task_*` | 任务接取/开始/提交/结束、session、阶段；`task_answer_submit` 含**实际提交原文**；`task_answer_schema` 含缺/多字段；`task_fields` 含 FIELDS 侦察回显 |
-| `sop_reuse` / `sop_evicted` / `sop_replay_skipped` | SOP 缓存复用、二次判错淘汰、拒重放同字节脚本 |
-| `shopping` / `buy` | 采购意图、价格、可负担性、买家距离 |
-| `tower_plan` / `build_blacklisted` | 建造计划与失败黑名单；`tower_plan.guard` 为第三塔资金守护 |
-| `pair_recomputed` / `night_withdraw` | 夜间配对重算原因、控制器撤退；撤退滞回状态 |
-| `door_reseal` / `wall_gate_*` | 门切开/黄昏重封/墙门封合 |
-| `robotEvents` | 机器人出生（id + spawnHp） |
-| `wall` | 墙数量与总血量变化 |
-| `coach_ready` | 进程启动时教练的初始档位与已学半场数（`policy` / `halvesLearned`） |
-| `coach_night` | 每夜结算：双方基地/围墙损失、我方火力是否污染归因、火力缺口估计、档位、证据计数 |
-| `coach_move` | **教练移动了一个开关**：`switch` / `from` / `to` / `why` / `night` / `evidence`（分析的重点事件） |
-| `coach_half` | 半场结束：强制结算最后一夜、证据衰减一半、写盘 |
-
-此外 `round` 事件自带 `policy` 字段（`stationPressure` / `gapFunding` / `harass`），
-逐回合记录**当时是哪一档**，分析时不必去猜档位切换的时刻。
-
----
-
-## 请求六：任务健康度的统计口径修正（重要）
-
-**现状问题**：当前分析把 `task_ended reason=timeout` 直接记为「任务失败 / 0 分」。
-但接口文档 `PlayerTask.timeoutRounds` 写明：**任务超时强制结束时，按「此前提交过的
-通过率最高的答案」结算积分与金币**——提交是累加制。一个 `timeout` session 只要提交过
-答案就有分（可能是几十分），把它记为 0 会误诊根因（v1 路线图 P1-5）。
-
-**请把任务健康度改为**：
-
-| 指标 | 定义 | 数据源（我方 JSONL） |
+| 字段 | 上限 | 出现在 |
 |---|---|---|
-| 提交率 | `submittedRound` 非空的 session 比例 | `round.task.submittedRound` / `task_answer_submit` 事件 |
-| 平均通过率 | 各 session 最高通过率均值（判分侧的近似） | `totalScore` 增量归因 `scoreAttr.residual` |
-| 真零分 session | **从未提交**（cmdRounds=0 或 无 `task_answer_submit`） | 同上 |
+| `errorDescs[]` | 120 字符 | `round` |
+| `phaseTask`、`lastCmdResult` | 160 字符 | `round` |
+| `task_ended.bestAnswer` | 120 字符 | `task_ended` |
+| `task_answer_found.answer` / `task_answer_sentinel.answer` / `task_answer_blocked.answer` | 120 / 60 / 60 字符 | 各自事件 |
+| `prompt_sent.head`、`cmd_sent.head` | 300 字符 | 各自事件 |
 
-「提交率」应作为任务系统改进的第一验收指标（v1 目标 ≥ 80%），而不是「timeout 次数」。
+**不截断的关键字段**：`task_answer_submit.answer` —— 交给判题器的**原始字节**，
+v8 起全量记录（上限 4000 字符，正常答案几十到几百字符），另附 `chars` 记真实字符数。
+判题器回 `MissingNamedInput` 时，缺的是哪个字段只能从这段原文里看出来，
+所以这是任务 0 分唯一的一手证据。分析时若 `answer` 的实际字符数 < `chars`，
+说明它被 4000 上限截断过（正常场次不会发生）。
 
 ---
 
-## 请求七：对战结果回执（**取代**原 A/B 拨盘实验）
+## 3. 结果回执 `receipt.json`（本次交付的核心）
 
-> **原请求七作废。** 上一版请你们用 `CG_TUNE_*` 环境变量发起 A/B 对战——**内网
-> workflow 无法设置环境变量**，这个请求从一开始就跑不起来。策略选择不该外包给一个
-> 跑不起来的实验，所以自本版本对应 commit 起，**决策器内置在线教练**
-> （`CoreGeek/src/brain/coach.rs`）：它在进程内部自己读局势、自己移动开关、自己
-> 记住跨场结论，**不需要任何环境变量、不需要对照组、不需要你们做任何额外操作**。
+### 3.1 为什么必须是回执
 
-教练能看见的只有**场内量**：双方基地与围墙血量、我方当日召唤令计数、黄昏时的火力
-缺口估计、我方炮塔是否朝对方建筑开过火。它按"证据 → 移动一个开关 → 反证据 → 移回来"
-闭环工作，每夜结算一次，每次移动都打一条 `coach_move` 日志（含 `switch`/`from`/`to`/
-`why`/`evidence`）。
+决策器的输入全是**场内量**：双方基地与围墙血量、我方金币、当日召唤令计数、黄昏的
+火力缺口估计。它能判断"该不该收火""该不该继续买令"，但**判断不了**这些调整换来了
+什么。胜负、双方总分、分项得分、对手身份、base commit 这五样都在你的视野里，
+不在我的视野里。没有回执，"这轮改动是不是变好了"只能靠猜。
 
-它看不见的是**结果**：这局谁赢了、总分多少、分项得分如何。请把这块补上。
-
-### 请在每场对战后提供一条结果回执（JSON，一行）
+### 3.2 示例
 
 ```json
 {
   "match_id": "pk577716",
   "base_commit": "b03b1c8",
-  "opponent": "teamB_4388_道化黄泉路",
+  "base_commit_time": "2026-09-13T08:30:00+08:00",
+  "opponent": {"team_id": "4388", "team_name": "teamB_4388_道化黄泉路"},
   "result": "win",
+  "result_source": "judger",
   "rounds": 256,
+  "end_reason": "enemy_station_destroyed",
   "score": {"ours": 139, "enemy": 52},
   "score_breakdown": {
-    "ours":  {"task": 91, "kill": 8, "survival": 40},
+    "ours":  {"task": 91, "kill": 8,  "survival": 40},
     "enemy": {"task": 0,  "kill": 52, "survival": 0}
   },
-  "station_down_day": {"ours": null, "enemy": 2},
+  "station_hp_last": {"ours": 1500, "enemy": 0},
+  "enemy_seen": {"station_level": 2, "towers": 3, "walls": 12},
+  "tasks_ours": [
+    {"session": 1, "task_type": "城市气候", "accepted_round": 12, "ended_round": 96,
+     "reason": "completed", "submitted": true, "submissions": 2, "score": 47}
+  ],
+  "env": {"CG_LEARN": null, "CG_TUNE_CLEAR_GAP": null, "CG_TUNE_STATION_FOCUS": null},
   "coach": {
     "halves": 2,
     "moves": [
-      {"round": 262, "day": 3, "switch": "harass", "from": "Rhythm", "to": "Off", "why": "summons_sterile"},
-      {"round": 391, "day": 4, "switch": "station_pressure", "from": "false", "to": "true", "why": "two_quiet_nights"}
+      {"round": 262, "day": 3, "switch": "harass", "from": "Rhythm", "to": "Off", "why": "summons_sterile"}
     ]
   }
 }
 ```
 
-字段说明：
+### 3.3 字段表
 
-| 字段 | 含义 | 数据源 |
-|---|---|---|
-| `result` | `win` / `loss` / `draw` / `unknown` | 判题器结果（**我们看不到**） |
-| `score` / `score_breakdown` | 双方总分与 task/kill/survival 分项 | 同上（**我们看不到**） |
-| `station_down_day` | 基地被打掉的第几天，没掉填 `null` | 同上（**我们看不到**） |
-| `coach` | `coach_half` 的 `halves` + 全部 `coach_move` 事件（`round`/`day`/`switch`/`from`/`to`/`why`） | 我方 JSONL 直接提取（请求四） |
+| 字段 | 类型 | 来源 | 取不到时 |
+|---|---|---|---|
+| `match_id` | string | 你的对局 ID | 必填 |
+| `base_commit` | string | 发起该场时仓库 HEAD 的短 hash | 必填（没有就不发这场） |
+| `base_commit_time` | string | 该 commit 的提交时间，ISO8601 带时区 | `null` |
+| `opponent.team_id` / `team_name` | string | 判题器对局详情 | `null` |
+| `result` | `win`/`loss`/`draw`/`unknown` | 判题器判定 | 只此一处允许 `unknown` |
+| `result_source` | string | `judger` / `series` / `inferred`，说明胜负从哪来 | 必填 |
+| `rounds` | int | 该场最后一回合号 | `null` |
+| `end_reason` | string | 判题器的结束原因原文 | `null` |
+| `score.ours` / `score.enemy` | int | 双方总分 | **必填**（我唯一要不到的硬数据） |
+| `score_breakdown` | object | 双方 task/kill/survival 分项 | 整块 `null`，别只填一半 |
+| `station_hp_last` | object | 双方基地最后血量 | `null`（我也能从 `round.enemyStationHp` 自推） |
+| `enemy_seen` | object | 对方最后回合的基地等级/塔数/墙数 | `null` |
+| `tasks_ours[]` | array | **我方**每个任务 session 一行，见 §3.5 | 拿不到整块 `null` |
+| `env` | object | 该场进程的 `CG_*` 原值（没有就是 `null`） | 必填（哪怕全 `null`） |
+| `coach` | object | 从我的 JSONL 提取，配方见 §5 | 必填 |
 
-### 请在 issue 头部给一行汇总
+### 3.4 三条硬规则
 
-```
-教练：本批次 N 场 | 移动 M 次（station_pressure a / gap_funding b / harass c）
-      | 至少移动过一次的场次 X / N | 结果分布（胜/负/平）
-```
+1. **取不到就填 `null`**：不要省略字段、不要猜、不要填 `0` / `""` / `"unknown"`。
+   `0` 和 `null` 对我是两件相反的事——前者是"对方真的一分没得"，后者是"不知道"。
+   用 `0` 冒充不知道，我会把它当成事实去归因。
+2. **一个 match_id 一份回执**，不要合并多场；同一 commit 的多场也各写各的。
+3. `base_commit` 必须是**实际跑这场时**的 HEAD。你的流程有拉代码 → 对战 → 抓日志 →
+   分析的时延，我读到 issue 时 HEAD 通常已经变了：没有这个字段，分析里引用的行号与
+   函数名可能已经不存在，我也无法 checkout 回去复现日志。
+   （实例：issue #23 的分析生成于 08:53，而它描述的修复 `561640b` 提交于 08:47——
+   6 分钟跑不完一场比赛，所以那份分析讲的是修复前的代码。）
 
-### 为什么这是现在最值钱的信息
+### 3.5 `tasks_ours[]` 里每个 session 要有
 
-教练的证据全是**相对量**（我方掉了多少血、对方掉了多少血、令花出去对方有没有掉血）。
-它能判断"该不该收火"、"该不该继续买令"，但**无法判断**这些调整最终换来了什么。
-把胜负与分项得分按 `base_commit` + `match_id` 回执回来，才能回答：
+| 字段 | 说明 |
+|---|---|
+| `session` | 我日志里的 `task.session`（`task_started` / `task_answer_submit` / `task_ended` 都带） |
+| `task_type` | 任务类型（`task_started.head` 里有） |
+| `accepted_round` / `ended_round` | 接取与结束回合；用于和我的日志对齐 |
+| `reason` | `task_ended.reason`（`completed` / `timeout` / `wrong_answers` / …） |
+| `submitted` | 是否提交过答案（`task_answer_submit` 是否出现过） |
+| `submissions` | 提交次数 |
+| `score` | **判题器给这个 session 的最终得分**——我这边看不到，只能靠 `totalScore` 反推 |
 
-1. 收火档（`stationPressure=false`）赢的那些场，是不是靠少挨打、活到最后的
-   `survival` 分赢的？
-2. 加码档（`harass=Rich`）在哪些对手身上有效（令确实啃动了对方），在哪些对手身上
-   是白花钱？
-3. 教练每次移动**之后**的胜率是升是降——这是唯一能证伪"教练越学越好"这个假设的证据。
-4. 哪些 `why` 出现得最频繁（`our_station_bleeding` / `summons_sterile` / …），
-   说明当前承诺档在哪一类局面上系统性地不合适。
-
-**要求**：回执与请求三的 `base_commit` 对齐（同一 commit 的回执才可横向比较）；
-每场一条，不要只给汇总。
+**为什么单列这张表**：任务超时结束时，判题器按"此前提交过的通过率最高的答案"结算
+（任务书 `timeoutRounds` 条）。所以 `reason=timeout` **不等于 0 分**，把 timeout 一律
+记成失败会误诊根因。我目前只能用 `totalScore - kill - survival` 反推出一个残差，
+它把任务得分和估算误差混在一起，分不清"某个 session 真的 0 分"和"我算错了"。
+逐 session 的 `score` 是唯一能把这两件事分开的数据。
 
 ---
 
-## 机器可读请求块
+## 4. issue 头部字段
+
+| 字段 | 示例 | 说明 |
+|---|---|---|
+| 生成时间 | — | 保留 |
+| 对战代码版本 | `pk575557: 8de90f3 (2026-09-13 08:26)` | 逐场列出；跨多个 commit 时逐行 |
+| 本批次数 / 对手数 | `5 场 / 3 个对手` | 批规模 **≥5 场、≥2 对手**：3 场分不清信号与噪声 |
+| 当前排名 | `12 / 64` | 全部参赛队中的名次 |
+| 累计战绩 | `8 胜 5 负 1 平` | 上半场 + 下半场累计 |
+| 胜率 | `57.1%` | 胜场 / 总场次，1 位小数 |
+| 每场一行结果 | `pk577716 胜 139:52 (b03b1c8)` | 不翻 JSON 也能扫一眼 |
+| 教练汇总 | 见 §5 | 格式固定，我会 grep |
+
+排名与胜率是判断"改进是否真的有效"的唯一长期指标：单场胜负可能是运气（对手强弱、
+出生点、地图随机），只有趋势能证伪。
+
+---
+
+## 5. 教练记录：从我的 JSONL 提取（jq 配方）
+
+教练是决策器内置的在线自适应（`CoreGeek/src/brain/coach.rs`），事件有四种：
+`coach_ready`（启动时的档位）、`coach_night`（每夜结算）、`coach_move`（**移动了一个
+开关**）、`coach_half`（半场结束）。另外逐回合的 `round.data.policy` 记录**当时**档位。
+
+```sh
+# 1) 写进 receipt.coach.moves
+grep '^{' ours.jsonl | jq -c 'select(.event=="coach_move")
+  | .data | {round, day, switch, from, to, why}'
+
+# 2) 写进 receipt.coach.halves（没有 coach_half 就用 coach_ready.halvesLearned）
+grep '^{' ours.jsonl | jq -c 'select(.event=="coach_half") | .data.halves' | tail -1
+
+# 3) issue 头部的教练汇总行
+grep '^{' ours.jsonl | jq -r 'select(.event=="coach_move")
+  | "\(.data.switch) \(.data.from)->\(.data.to) @\(.data.day)日 \(.data.why)"'
+```
+
+两个坑：`coach_move.from` / `to` 是**字符串**（布尔档位写作 `"true"` / `"false"`，
+`harass` 是档位名 `Off` / `Rhythm` / `Rich`）；而 `round.data.policy.stationPressure`
+是**布尔**。同名字段两种类型，别用一套解析。
+
+issue 头部请给这一行（我直接 grep）：
+
+```
+教练：本批 N 场 | 移动 M 次（station_pressure a / gap_funding b / harass c） | 至少移动过一次的场次 X/N | 结果分布 胜 W / 负 L / 平 D
+```
+
+---
+
+## 6. 交付前自检
+
+每一场都跑一遍，任何一条不过就别发：
+
+1. `jq . receipt.json > /dev/null` 通过；`jq -r 'keys[]' receipt.json` 包含 §3.3 的**全部**字段名。
+2. `grep -c '"event":"round"' ours.jsonl` ≥ 该场回合数（行数只会更多，不会更少）。
+3. `git cat-file -t <base_commit>` 返回 `commit`，且时间与该场吻合。
+4. `receipt.coach.moves` 条数 == `grep -c '"event":"coach_move"' ours.jsonl`。
+5. `receipt.coach.halves` == 最后一个 `coach_half` 的 `halves`（一场都没有则为 `0`）。
+6. 没有把 `null` 写成 `0` / `""` / `"unknown"`；`result` 之外的字段出现 `"unknown"` 一律算错。
+7. 对手日志拿不到时，在 issue 与回执里写明原因，而不是静默省略文件。
+
+---
+
+## 7. 反向反馈（三个问题，请在同一份 issue 里回答）
+
+1. 分析时**最缺哪类信息**——哪些结论你只能猜？
+2. 希望我新增哪些事件或字段（附一个你期望的 JSON 示例即可）？
+3. 哪些现有事件是**噪音**，可以砍掉（我可以少写，降低体积与干扰）？
+
+---
+
+## 8. 机器可读指令块
 
 ```yaml
 agent_request:
   target: workflow-driver
   repo: gamelife1314/Competition
-  action: improve_workflow
-  version: 7
-  changes:
-    - id: issue_header_stats
-      desc: extend improvement-issue header with cumulative stats
-      placement: after "生成时间" line
-      add_fields:
-        - {name: current_rank, desc: rank among all teams,     example: "12 / 64"}
-        - {name: total_wins,   desc: cumulative match wins,    example: 8}
-        - {name: total_losses, desc: cumulative match losses,  example: 5}
-        - {name: total_draws,  desc: cumulative match draws,   example: 1}
-        - {name: win_rate,     desc: wins / total, 1 decimal,  example: "57.1%"}
-    - id: battles_per_round
-      desc: raise the number of battles initiated per round
-      from: 3
-      to: 5
-    - id: battle_base_commit
-      desc: record the code commit each battle was fought on
-      per_battle: true
-      add_fields:
-        - {name: battle_base_commit, desc: "git commit hash + time", example: "b03b1c8 (2026-09-13 08:30)"}
-    - id: full_logs
-      desc: provide complete, untruncated battle data
-      priority: highest
-      provide:
-        - ours_raw_jsonl          # our full per-round log, untruncated
-        - enemy_raw_jsonl         # opponent log when obtainable
-        - analysis_report_md      # workflow/analysis/*.md in full
-        - issue_body_untruncated  # raise the ~200-char cut to >=2000
-        - structured_summary_json # see schema in the document above
-      note: our round event now carries errorDescs (judger error text) — extract directly
-    - id: log_requirements_feedback
-      desc: tell us which log fields/events the analysis needs
-      request: >
-        List (a) which information is currently missing and forces guesswork,
-        (b) desired new event names and fields (with a JSON example),
-        (c) which existing events are noise and can be dropped.
-    - id: task_health_metric
-      desc: score task health by submission rate + average pass rate, not "timeout = failure"
-      metrics:
-        - {name: submission_rate, source: "task_answer_submit events / task.submittedRound", target: ">= 80% of sessions"}
-        - {name: avg_pass_rate,   source: "scoreAttr.residual attribution"}
-        - {name: true_zero_sessions, definition: "sessions with NO submission (cmdRounds=0 or no task_answer_submit)"}
-    - id: battle_outcome_receipt
-      desc: per-battle machine-readable outcome receipt (REPLACES ab_dial_experiments)
-      supersedes: ab_dial_experiments
+  action: deliver_battle_data
+  version: 8
+  model: >
+    We see the board (per-round state, both sides' units, our own score/gold) but never the
+    result. Process data is ours to emit — transport it verbatim. Outcome, identity and
+    version are yours to attach — fill them per battle.
+  deliverables:
+    per_battle:
+      - path: workflow/logs/<match_id>/ours.jsonl
+        content: our process stdout, verbatim JSONL
+        rules: [no truncation, no rewriting, no merging, no redaction, preserve line order]
+        note: first stdout line is not JSON ("listening on 0.0.0.0:<port>") — skip non-{ lines
+      - path: workflow/logs/<match_id>/enemy.jsonl
+        content: opponent stdout when obtainable
+        if_unavailable: write workflow/logs/<match_id>/enemy.jsonl.missing stating why
+      - path: workflow/logs/<match_id>/receipt.json
+        content: outcome receipt (see receipt_fields)
+        rules: [must parse with jq, every field present, unknown => null]
+      - path: workflow/analysis/<match_id>.md
+        content: full analysis report, untruncated
+    per_batch:
+      - issue_header_fields
+      - one receipt.json per battle (never merged)
+      - coach summary line
+  receipt_fields:
+    required: [match_id, base_commit, base_commit_time, opponent, result, result_source, rounds, end_reason, score, score_breakdown, station_hp_last, enemy_seen, tasks_ours, env, coach]
+    score: {ours: int, enemy: int}                      # the one hard datum we cannot see
+    score_breakdown: {ours: {task, kill, survival}, enemy: {task, kill, survival}}
+    station_hp_last: {ours: int, enemy: int}
+    enemy_seen: {station_level: int, towers: int, walls: int}
+    tasks_ours:
+      desc: one row per our task session; the judger's own per-session score
+      fields: [session, task_type, accepted_round, ended_round, reason, submitted, submissions, score]
       why: >
-        The intranet workflow cannot set environment variables, so the CG_TUNE_* A/B
-        request was unactionable. The bot now self-tunes in-process (brain::coach) and
-        needs no external control group. What it cannot observe from inside is the
-        OUTCOME: the winner, both totals, and the per-objective split.
-      include_coach:
-        source: our JSONL
-        fields: [coach_half.halves, "every coach_move: round/day/switch/from/to/why"]
-      per_battle:
-        - {name: match_id,         example: "pk577716"}
-        - {name: base_commit,      example: "b03b1c8"}
-        - {name: opponent,         example: "teamB_4388_道化黄泉路"}
-        - {name: result,           values: [win, loss, draw, unknown]}
-        - {name: score,            example: {"ours": 139, "enemy": 52}}
-        - {name: score_breakdown,  example: {"ours": {"task": 91, "kill": 8, "survival": 40}}}
-        - {name: station_down_day, example: {"ours": null, "enemy": 2}}
-      issue_header_line: >
-        coach: N battles | M moves (station_pressure a / gap_funding b / harass c) |
-        battles with >=1 move X / N | result distribution
-      requirements: "one receipt per battle (not just an aggregate), aligned with battle_base_commit, per-objective breakdown"
-    - id: coach_event_table
-      desc: our new coach_* log events + round.policy (see the event table in 请求五)
-      events: [coach_ready, coach_night, coach_move, coach_half]
-      note: round.* now carries a `policy` object each round, so the active dial is known per round
+        A timed-out task is settled on the best submission ever made, so reason=timeout does
+        not mean zero. Our only proxy is totalScore - kill - survival, which mixes the task
+        score with our estimation error and cannot separate a genuine zero from a misestimate.
+    env:
+      desc: the CG_* environment values the battle actually ran with (null when unset)
+      keys: [CG_LEARN, CG_TUNE_CLEAR_GAP, CG_TUNE_STATION_FOCUS]
+      why: an empty result here is itself the answer — it tells us no dial was forced.
+    coach:
+      source: our JSONL
+      halves: last coach_half.halves (fallback coach_ready.halvesLearned, else 0)
+      moves: every coach_move -> {round, day, switch, from, to, why}
+  value_rules:
+    null_not_zero: "0 and null mean opposite things (0 = really scored nothing, null = unknown)"
+    one_receipt_per_match_id: true
+    base_commit_per_battle: true
+  issue_header_fields:
+    - {name: 对战代码版本, per_battle: true, example: "pk575557: 8de90f3 (2026-09-13 08:26)"}
+    - {name: 本批次数/对手数, requirement: ">= 5 battles, >= 2 opponents", example: "5 场 / 3 个对手"}
+    - {name: 当前排名, example: "12 / 64"}
+    - {name: 累计战绩, example: "8 胜 5 负 1 平"}
+    - {name: 胜率, example: "57.1%"}
+    - {name: 每场一行结果, example: "pk577716 胜 139:52 (b03b1c8)"}
+    - {name: 教练汇总, format: "教练：本批 N 场 | 移动 M 次（station_pressure a / gap_funding b / harass c） | 至少移动过一次的场次 X/N | 结果分布 胜 W / 负 L / 平 D"}
+  self_check:
+    - jq . receipt.json succeeds and every field name in receipt_fields is present
+    - grep -c '"event":"round"' ours.jsonl >= rounds in that battle
+    - git cat-file -t <base_commit> == commit
+    - receipt.coach.moves count == grep -c '"event":"coach_move"' ours.jsonl
+    - no null replaced by 0 / "" / "unknown" (result is the sole exception)
+    - a missing enemy log is explained, never silently omitted
+  reverse_feedback:
+    - Which information is the analysis missing (what can you only guess)?
+    - Which new events/fields would you like (attach a JSON example)?
+    - Which existing events are noise and can be dropped?
 ```
 
 ---
 
-## English summary
+## 9. English summary
 
-Please improve the battle workflow in five ways:
+We see the board, never the result. Everything the per-round request carries is ours to log,
+and we do: `/docs/WORKFLOW_REQUEST.md` v8 asks you to (1) transport our stdout JSONL
+verbatim, (2) attach a per-battle outcome receipt, (3) attach the batch header fields.
 
-1. **Issue header stats** — cumulative rank, wins, losses, draws, win rate.
-2. **Battles per round 3 → 5** — three samples cannot separate signal from noise.
-3. **Battle base commit** — record the commit each battle ran on; the workflow's
-   multi-stage delay means our HEAD has usually moved on by the time we read the
-   issue.
-4. **Full logs (highest priority)** — stop truncating the issue body at ~200
-   chars; provide our complete raw JSONL, the opponent's log when obtainable,
-   the full analysis report, and a structured per-match summary. The judge's
-   `errors[].description` is the only schema signal we get, and our parser
-   currently discards it.
-5. **Log requirements feedback** — tell us what your analysis is missing, what
-   new events/fields you want, and which existing events are noise.
+1. **Transport, don't process** — `ours.jsonl` byte-for-byte: no truncation, no merging, no
+   redaction, line order preserved. The first stdout line is not JSON. Rounds ≠ lines.
+2. **Per-battle receipt** (`receipt.json`, one per `match_id`, never merged) — the fields we
+   cannot observe from inside: winner, both totals, the task/kill/survival split, opponent
+   identity, the actual `base_commit`, the per-session task scores, and the `CG_*` values the
+   battle ran with. Unknown values must be `null`, never `0` — a fabricated zero is worse
+   than a missing one, because we will attribute a change to it.
+3. **Issue header** — per-battle commit, batch size (≥5 battles / ≥2 opponents), rank,
+   cumulative record, win rate, one line per battle, and the fixed-format coach summary line.
+4. **Self-check** (§6) — run it before publishing; it catches truncated files, missing
+   fields, a wrong `base_commit`, and count mismatches against our own log.
 
-Change in v7 (please read request 七):
-
-* The old **A/B dial experiment is withdrawn** — the intranet workflow cannot set
-  environment variables, so `CG_TUNE_*` could never be exercised. The bot now
-  carries an **in-process adaptive coach** (`brain::coach`) that reads the board,
-  moves one of three existing switches on causal evidence, and logs every move as
-  a `coach_move` event. It needs nothing from you.
-* What it *cannot* see from inside is the **outcome**. So instead of an A/B, we ask
-  for a **per-battle outcome receipt**: match_id, base_commit, opponent, result,
-  both totals, the task/kill/survival split, which day each base fell, plus the
-  `coach_move` events extracted from our JSONL. One JSON object per battle.
-* Please also add a one-line coach summary to the issue header (battles, moves by
-  switch, share of battles that moved a dial, result distribution) and pick up the
-  new `coach_ready` / `coach_night` / `coach_move` / `coach_half` events and the
-  per-round `round.policy` field.
+The `coach` block is extracted from our JSONL with the jq recipes in §5; the coach itself
+needs no environment variables and no control group from you.
 
 ---
 
-*本文件由本地 agent 维护，用于向内部 code agent / workflow 传递改进需求。*
+*本文件由本地 agent 维护，作为向内部 workflow 下发数据交付指令的接口。*
