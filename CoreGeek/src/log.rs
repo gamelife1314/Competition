@@ -142,6 +142,19 @@ pub fn xy(pos: crate::protocol::Pos) -> serde_json::Value {
     serde_json::json!([pos.x, pos.y])
 }
 
+/// The record for one day's folk legend — the text the altar is inferred from.
+///
+/// The legend is judger-authored prose, and it is the only input to the single
+/// LLM call that infers the treasure altar (`treasure.rs` sends
+/// `state.treasure.legends` wholesale). Nothing else in the log carries what it
+/// said, so a `treasure_plan` that comes back with the wrong sacrifice items or
+/// the wrong opening day is unreadable: there is no way to tell a misread
+/// legend from a wrong inference. `day` is the join key that places the text
+/// beside the plan it produced.
+pub fn legend_record(day: i64, text: &str) -> serde_json::Value {
+    serde_json::json!({"day": day, "head": brief(text, 200)})
+}
+
 /// The record for one thing bought or sold — `buy` and `sell` share it.
 ///
 /// They are the two directions of one ledger, and the question they exist to

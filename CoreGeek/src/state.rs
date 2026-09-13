@@ -491,6 +491,13 @@ impl BotState {
             self.treasure
                 .legends
                 .push((turn.day, turn.folk_legends.clone()));
+            // The legend's own words, once a day. They were stored here and
+            // never written, which made the one input the altar is inferred
+            // from the one input the log did not carry — see `legend_record`.
+            crate::log::event(
+                "news_legend",
+                crate::log::legend_record(turn.day, &turn.folk_legends),
+            );
         }
     }
 

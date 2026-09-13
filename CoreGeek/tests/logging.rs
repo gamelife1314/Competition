@@ -182,6 +182,26 @@ fn a_ledger_row_can_be_placed_on_the_timeline_and_joined_to_its_opposite() {
     );
 }
 
+#[test]
+fn a_folk_legend_reaches_the_log_with_the_day_that_produced_it() {
+    // The legend is judger prose and the sole input to the one LLM call that
+    // infers the treasure altar. It was stored in `state.treasure.legends` and
+    // never written, so a `treasure_plan` naming the wrong sacrifice items had
+    // nothing to be checked against: the log carried the inference and not the
+    // evidence. `news_official` has been written since it was added; this is
+    // its other half.
+    let record = coregeek::log::legend_record(3, "石碑之上刻着三颗星砂，秋分之夜方开");
+    assert_eq!(record["day"], json!(3), "the day places the text beside the plan");
+    assert_eq!(record["head"], json!("石碑之上刻着三颗星砂，秋分之夜方开"));
+
+    // Past the cap the head is kept and the cut is marked, so a reader can tell
+    // a short legend from one we only kept the front of.
+    let head = coregeek::log::legend_record(4, &"字".repeat(500))["head"].clone();
+    let text = head.as_str().expect("the head is a string");
+    assert_eq!(text.chars().count(), 201, "200 characters and the ellipsis");
+    assert!(text.ends_with('…'), "and the ellipsis is the mark that it was cut");
+}
+
 /// A board with one wall whose health the caller controls, so the same payload
 /// can be replayed twice and then perturbed in exactly one field.
 fn board(round_no: i64, wall_hp: i64) -> Vec<u8> {
