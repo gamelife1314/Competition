@@ -296,7 +296,15 @@ pub fn plan_pioneer(
             // two), which made a scored-zero task impossible to diagnose from
             // the log. One event per submission, carrying what was actually
             // sent, closes that gap for good.
-            let payload = submittable_answer_for(&fields, &state.task.description, &answer);
+            // 任务书 ch.6 scores `回答正确字段个数 / 全量字段个数`: a shape the
+            // judger did not expect scores zero however right the value is, and
+            // an errorCode 2 does not say which of the two shapes was wrong. So
+            // a retry after any rejection submits the OTHER one — same value,
+            // other wrapper — instead of the identical bytes with a new number
+            // in them, which is what the three-strike abandon used to be.
+            let flip = state.task.wrong_answers > 0;
+            let payload =
+                submittable_answer_shaped(&fields, &state.task.description, &answer, flip);
             let (logged, chars) = answer_for_log(&payload);
             crate::log::event(
                 "task_answer_submit",
@@ -306,6 +314,8 @@ pub fn plan_pioneer(
                     "answer": logged,
                     "chars": chars,
                     "rewritten": payload != answer,
+                    "flipped": flip,
+                    "wrongSoFar": state.task.wrong_answers,
                 }),
             );
             state.task.submitted_round = Some(turn.round_no);
@@ -331,9 +341,10 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
     let mut prompt = String::new();
     prompt.push_str("你在一个隔离沙盒中执行任务，沙盒可运行基础 shell 与 python3（无外网）。\n");
     prompt.push_str(
-        "环境说明：任务相关文件（如 task_X.md、输入数据）都放在 /tmp/selfEvolutionTask/ 目录下。\n",
+        "环境说明：任务相关文件（如 task_X.md、输入数据）通常放在 /tmp/selfEvolutionTask/ 目录下。\n",
     );
     prompt.push_str("请先用 `find /tmp/selfEvolutionTask/ -maxdepth 4` 或 `ls -R /tmp/selfEvolutionTask/` 查看有哪些文件；任务文件可能在多层子目录里（如 1-fixed-step/2-engineering-fix/task_X.md）。必须用 `find`/`ls` 输出的【真实完整路径】去 `cat`，不要假设文件在根目录、不要直接 `cat task_X.md`。\n");
+    prompt.push_str("如果 /tmp/selfEvolutionTask/ 不存在或为空，说明目录在别处：用 `ls -la /` 和 `find / -maxdepth 4 -name 'task*' 2>/dev/null | head -50` 定位真实目录，并把找到的路径打印出来（下一轮会带着它继续）。不要因为一个路径不存在就放弃。\n");
     prompt.push_str("任务描述：\n");
     prompt.push_str(&state.task.description);
     prompt.push_str("\n\n要求：\n");
@@ -347,6 +358,11 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
     prompt.push_str("6. `ANSWER:` 后面必须是真实结果（数字/字符串/JSON）。找不到文件或算不出来时，**不要**打印 ANSWER 行，也不要用 `xxx`、`failed_to_extract`、`TODO`、`unknown`、`N/A` 之类的占位符占位——那会被判错并浪费一整轮；直接把报错信息打印到 stderr 即可，脚本会带着错误重试。\n");
     prompt.push_str("7. `ANSWER:` 后面**只放任务要的那个值**：是数字就只放数字（不要带单位、不要加解释），是 Markdown 标题、表格或说明文字都不算答案。多字段答案只写任务文件里点名的字段，不要自行增加 `status`、`note`、`task_id` 这类字段——判分按要求的字段逐个比对，多写一个字段会被判错。\n");
     prompt.push_str("8. 打印 ANSWER 前先自检一次：确认这个值确实由脚本从任务数据里算出来（而不是照着题面猜的或照抄示例），位数/单位/大小写与任务要求一致。\n");
+    // 接口文档 §executeCmd: "判题器会在本回合执行，执行时长不得超过15秒，否则
+    // 视为执行指令超时". A timed-out command returns `[TIMEOUT]` with no answer,
+    // so the round is spent twice — once on the script that never finished and
+    // once on the replan. Nothing in the old prompt mentioned the ceiling.
+    prompt.push_str("9. 判题器对每条命令有 **15 秒硬超时**，超时整条命令作废（拿不到任何输出）：脚本必须在 15 秒内跑完并打印结果。因此不要 `sleep`、不要写重试/轮询循环、不要不带 `-maxdepth` 去 `find /`（扫全盘很慢）、不要访问外网地址（沙盒无外网，连接会挂到超时）。\n");
     if !state.task.discovered_fields.is_empty() {
         prompt.push_str(&format!(
             "\n已从任务文件确认的输出字段：{}。ANSWER 的 JSON 必须恰好包含这些字段，不多不少。\n",
@@ -540,25 +556,49 @@ fn schema_fields(state: &BotState) -> Vec<String> {
 /// value was compared), so it is unwrapped. With no echo at all the legacy
 /// description heuristic decides.
 pub fn submittable_answer_for(fields: &[String], description: &str, answer: &str) -> String {
+    submittable_answer_shaped(fields, description, answer, false)
+}
+
+/// [`submittable_answer_for`] with the single-key-object decision inverted.
+///
+/// The judger scores 任务书 ch.6 as `回答正确字段个数 / 全量字段个数`, so a wrapper
+/// it did not expect zeroes the answer however right the value is — and the
+/// value is the LLM's job, not ours. Shape is the one thing we still control:
+/// once a submission has come back errorCode 2, the retry submits the OTHER
+/// shape rather than the identical bytes with a new number in them. Two shapes
+/// are all there is (bare scalar, one-key object), so one flip exhausts the
+/// space; `wrong_answers` counts the rejections and `plan_pioneer` flips on any.
+pub fn submittable_answer_shaped(
+    fields: &[String],
+    description: &str,
+    answer: &str,
+    flip: bool,
+) -> String {
     if fields.len() >= 2 {
         return answer.to_string();
     }
-    if fields.len() == 1 {
-        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(answer)
-        {
-            if map.len() == 1 {
-                let bare = map
-                    .values()
-                    .next()
-                    .and_then(bare_scalar);
-                if let Some(bare) = bare {
-                    return bare;
-                }
-            }
-        }
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(answer)
+    else {
+        return answer.to_string();
+    };
+    if map.len() != 1 {
         return answer.to_string();
     }
-    submittable_answer(description, answer)
+    let Some((key, value)) = map.iter().next() else {
+        return answer.to_string();
+    };
+    // An echoed single field means the answer IS that value, so the wrapper is
+    // ours to drop. With no echo at all the legacy description heuristic
+    // decides: a wrapper around a field the task never named is ours too.
+    let unwrap = if fields.len() == 1 {
+        true
+    } else {
+        !description.to_lowercase().contains(&key.to_lowercase())
+    };
+    if unwrap == flip {
+        return answer.to_string(); // `flip` reached the other shape: keep this one
+    }
+    bare_scalar(value).unwrap_or_else(|| answer.to_string())
 }
 
 /// A scalar rendered bare, or None when the value is structured/empty.
@@ -666,10 +706,48 @@ pub fn is_markdown_heading(answer: &str) -> bool {
 /// that produced an answer is now cached (`sop_cmd`), it teaches the SOP cache
 /// a script whose entire purpose is to fail.
 ///
-/// Only a whole-answer match counts. A real result that merely contains one of
-/// these words — a path, a JSON field, a line of prose — is left alone.
+/// A real result that merely CONTAINS one of these words — a path, a JSON
+/// field, a line of prose — is left alone; the match is on a whole value, and
+/// for a JSON answer it is on every leaf of the object (issue #28's
+/// `{"result":"unknown"}` / `{"status":"pending"}` are sentinels too, they just
+/// arrived wrapped).
 pub fn is_failure_answer(answer: &str) -> bool {
-    const SENTINELS: [&str; 34] = [
+    let trimmed = answer
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '。' || c == '.')
+        .trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if is_sentinel(trimmed) {
+        return true;
+    }
+    // A sentinel WRAPPED IN JSON is still a sentinel. Issue #28's sessions
+    // submitted `{"result": "unknown"}` and `{"status": "pending"}` — the
+    // model's error path dressed as an answer — and both reached the judger,
+    // because the whole-answer test above only ever matched a bare token. The
+    // shape is the model's own formatting, so the values are what carry the
+    // meaning: an object whose every leaf is a sentinel answers nothing, and
+    // submitting it can only score zero while burning the round a real attempt
+    // needed. An object with no leaves at all (`{}`) is the same nothing.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let leaves = scalar_leaves(&value);
+        if leaves.is_empty() && value.is_object() {
+            return true;
+        }
+        if !leaves.is_empty() && leaves.iter().all(|leaf| is_sentinel(leaf)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is this whole string one of the not-an-answer tokens? Compared case
+/// insensitively and only as a whole value: a real result that merely contains
+/// one of these words — a path, a JSON field, a line of prose — is not a
+/// sentinel.
+fn is_sentinel(text: &str) -> bool {
+    const SENTINELS: [&str; 48] = [
         "xxx",
         "xx",
         "x",
@@ -681,6 +759,9 @@ pub fn is_failure_answer(answer: &str) -> bool {
         "n/a",
         "na",
         "nil",
+        "null",
+        "none",
+        "nan",
         "unknown",
         "undefined",
         "placeholder",
@@ -696,24 +777,45 @@ pub fn is_failure_answer(answer: &str) -> bool {
         "parse_failed",
         "no_answer",
         "noanswer",
+        "no_data",
+        "nodata",
         "not_found",
         "notfound",
+        "unavailable",
+        // A run that has not finished is not a result. `{"status":"pending"}`
+        // (issue #28) is the model saying "ask me again", and the judger scores
+        // it exactly like the empty answer it is.
+        "pending",
+        "processing",
+        "running",
+        "in_progress",
+        "inprogress",
+        "not_ready",
         "无",
         "空",
         "未知",
         "暂无",
         "待补充",
+        "未完成",
+        "待定",
         "提取失败",
     ];
-    let trimmed = answer
-        .trim()
-        .trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == '。' || c == '.')
-        .trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-    let lower = trimmed.to_lowercase();
+    let lower = text.trim().to_lowercase();
     SENTINELS.iter().any(|sentinel| lower == *sentinel)
+}
+
+/// Every scalar leaf of a JSON value, rendered as the text a sentinel test can
+/// read. Objects and arrays are descended into; an empty container contributes
+/// nothing.
+fn scalar_leaves(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(text) => vec![text.clone()],
+        serde_json::Value::Number(number) => vec![number.to_string()],
+        serde_json::Value::Bool(flag) => vec![flag.to_string()],
+        serde_json::Value::Array(items) => items.iter().flat_map(scalar_leaves).collect(),
+        serde_json::Value::Object(map) => map.values().flat_map(scalar_leaves).collect(),
+        serde_json::Value::Null => vec!["null".to_string()],
+    }
 }
 
 /// Return the strongest structured result seen so far. Only explicit answer

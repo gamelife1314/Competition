@@ -237,11 +237,33 @@ issue 头部请给这一行（我直接 grep）：
 
 ---
 
-## 7. 反向反馈（三个问题，请在同一份 issue 里回答）
+## 7. 反向反馈
+
+### 7.1 六个机制问题（issue #26–#28 的遗留，必须逐条作答）
+
+前三份报告把**现象**讲清楚了（任务 0 分、金币冻结、封门、火力代差），但现象指向的**机制**还开着，
+而机制只有日志能回答。下面每条都给了配方：请直接跑，然后在 issue 里给**结论**——
+「是 / 否 + 数字」，不要复述现象。缺哪个事件、哪条查不出来，也请明说。
+
+| # | 问题 | 为什么要它 | 配方（在 `ours.jsonl` 上跑） |
+|---|------|-----------|------------------------------|
+| 1 | 第三座塔为什么没造出来？整场 `mayBuild==true` 且 `towers<3` 的回合有没有？那时 `guard`/`reserve`/`upgradeReachable` 各是什么？ | #26 全程 2 塔 lv1，而 P0-4 的守护金正好把金币钉在 25。要么是 fallback 从没触发（`upgradeReachable` 被背包里的铁/铜算成"买得起"），要么是触发了但没人走到工地 | `jq -r 'select(.event=="tower_plan") \| [.data.round,.data.towers,.data.gaps,.data.reserve,.data.guard,.data.mayBuild,.data.upgradeReachable] \| @tsv'` |
+| 2 | 金币到底卡在哪？`shopping` 里 `affordable==false` 的回合占比、当时的 head 需求与 `price`、`buy` 次数、`gold` 的分布 | #26 报「reserve=25 导致 affordable 全程 false」。需要分清是"守卫金挡住小额采购"还是"根本没东西可买/买不到" | `jq -r 'select(.event=="shopping") \| [.data.round,.data.affordable,.data.need,.data.price,.data.gold,.data.reserve] \| @tsv'` |
+| 3 | 每个 task session 是怎么结束的？`task_ended.reason` 的直方图；每场提交了几次 `submitAnswer` | 12 个 session 全 0 分，但"超时"和"判错三次"是两种完全不同的病 | `jq -r 'select(.event=="task_ended") \| .data.reason' \| sort \| uniq -c` |
+| 4 | 判题器对每次提交回了什么？`task_answer_submit` 之后那几回合的 `errors` / `errorDescs` | **0 分唯一的现场证据**。`MissingNamedInput` 是字段名错，`code 2` 是值错，两者改法完全相反 | 先 `jq -r 'select(.event=="task_answer_submit") \| [.data.round,.data.session,.data.answer,.data.flipped] \| @tsv'`，再取那些 round 的 `round.errors`/`errorDescs` |
+| 5 | 封门开了几回合？`wall_gate_open` 的次数与 `reason`；那几回合每个 controller（尤其开拓者）在不在环内 | #26 的败因是门开 9 回合→城墙塌→基地亡。要确认是"控制器没归队"还是"归队了但没封上" | `jq -r 'select(.event=="wall_gate_open" or .event=="wall_gate_seal") \| [.data.round,.event,.data.reason] \| @tsv'` |
+| 6 | 卖矿几次、各卖了多少金？`gold` 是否长期贴在同一个常数上 | 判断"经济锁死"是收入问题还是支出问题 | `jq -r 'select(.event=="sell") \| .data' \| head -50`，与 `round.gold` 序列对照 |
+
+### 7.2 三个开放问题（同上，一直有效）
 
 1. 分析时**最缺哪类信息**——哪些结论你只能猜？
 2. 希望我新增哪些事件或字段（附一个你期望的 JSON 示例即可）？
 3. 哪些现有事件是**噪音**，可以砍掉（我可以少写，降低体积与干扰）？
+
+> 本轮已改、下一份报告不必再报的现象：提交被判错后的重试会**换一种外形**提交（`task_answer_submit.flipped`）；
+> `{"status":"pending"}` 这类**包在 JSON 里的哨兵**不再提交给判题器；开拓者在召回前不足 12 回合时
+> **不再接任务**（`task_accept_deferred`）；session 连续 15 回合一条都没提交就**提前结束**放开拓者回墙线
+> （`task_defense_abort.reason = "sterile"`）。
 
 ---
 
@@ -319,6 +341,36 @@ agent_request:
     - Which information is the analysis missing (what can you only guess)?
     - Which new events/fields would you like (attach a JSON example)?
     - Which existing events are noise and can be dropped?
+  mechanism_questions:
+    desc: >
+      Residual mechanisms behind issues #26-#28. Answer each with a verdict and numbers, not a
+      restatement of the symptom; say so if the event you need is missing.
+    questions:
+      - id: third_tower
+        ask: Was mayBuild ever true while towers < 3? What were guard/reserve/upgradeReachable then?
+        why: "#26 ran two level-1 towers all match with the P0-4 guard pinning gold at 25."
+      - id: gold_freeze
+        ask: Share of shopping rounds with affordable=false, the head need and its price, buy count, gold distribution.
+        why: separate "the guard blocks small buys" from "there was nothing to buy or no way to buy it".
+      - id: task_endings
+        ask: Histogram of task_ended.reason; submitAnswer count per match.
+        why: a timeout and three-strikes are different diseases with different fixes.
+      - id: judge_verdict
+        ask: errors/errorDescs on the rounds right after each task_answer_submit.
+        why: the only first-hand evidence for a zero-scored task; a wrong field NAME and a wrong VALUE need opposite fixes.
+      - id: gate
+        ask: wall_gate_open count and reason, and where each controller stood during those rounds.
+        why: "#26 lost the base to nine open-gate rounds; confirm whether controllers failed to retreat or failed to seal."
+      - id: sales
+        ask: sell event count and amounts; whether gold sits pinned at one constant.
+        why: tells an income problem from a spending problem.
+  already_fixed:
+    desc: do not re-report these; they changed this round
+    items:
+      - a rejected answer is retried in the other shape (task_answer_submit.flipped)
+      - sentinels wrapped in JSON ({"status":"pending"}) are never submitted
+      - no task is accepted with fewer than 12 day-rounds before the dusk recall (task_accept_deferred)
+      - a session with nothing submitted after 15 rounds ends and frees the pioneer (task_defense_abort.reason=sterile)
 ```
 
 ---

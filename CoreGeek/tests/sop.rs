@@ -995,3 +995,75 @@ fn a_verdict_that_is_not_about_the_window_clears_the_streak() {
         "one refusal after a working window is not enough to abandon"
     );
 }
+
+#[test]
+fn a_sentinel_wrapped_in_json_is_still_a_sentinel() {
+    // Issue #28: the model's error path dresses its give-up in the answer's
+    // JSON shape — `{"result": "unknown"}`, `{"status": "pending"}` — and the
+    // whole-answer test let both through to the judger. 任务书 ch.6 scores
+    // `回答正确字段个数 / 全量字段个数`, so a wrapper full of nothing is a
+    // guaranteed zero, and it costs the round a real attempt needed.
+    use coregeek::brain::task::is_failure_answer;
+    for sentinel in [
+        r#"{"result": "unknown"}"#,
+        r#"{"status": "pending"}"#,
+        r#"{"status":"processing"}"#,
+        r#"{"answer": "N/A"}"#,
+        r#"{"value": null}"#,
+        r#"["unknown", "none"]"#,
+        "{}",
+    ] {
+        assert!(
+            is_failure_answer(sentinel),
+            "`{sentinel}` answers nothing and must never be submitted"
+        );
+    }
+    // The rule is "every leaf is a sentinel", never "contains a sentinel word":
+    // a real object that happens to carry one sentinel-valued field still has
+    // fields 任务书 ch.6 will score.
+    for real in [
+        r#"{"unknown": 42}"#,
+        r#"{"status": "completed", "count": 7}"#,
+        r#"{"total_count": 0}"#,
+        r#"{"city": "南京", "count": 5}"#,
+        r#"{"note": "unknown", "answer": 12}"#,
+    ] {
+        assert!(
+            !is_failure_answer(real),
+            "`{real}` carries real fields and must survive the filter"
+        );
+    }
+}
+
+#[test]
+fn a_rejected_answer_is_retried_in_the_other_shape() {
+    // 任务书 ch.6 scores the answer field by field, so the wrapper the judger
+    // expects is worth as much as the value inside it — and errorCode 2 does
+    // not say which of the two was wrong. The retry therefore flips the shape
+    // instead of resubmitting the identical bytes.
+    use coregeek::brain::task::submittable_answer_shaped;
+    let fields = ["token".to_string()];
+    let answer = r#"{"token":"fc1e78eb2a5a"}"#;
+
+    // Normal: a single echoed field means the answer IS that value (issue #15).
+    assert_eq!(submittable_answer_shaped(&fields, "取 token", answer, false), "fc1e78eb2a5a");
+    // Rejected once: submit the shape we did not try — the keyed object.
+    assert_eq!(submittable_answer_shaped(&fields, "取 token", answer, true), answer);
+
+    // With no echoed schema the legacy description rule applies, and it flips
+    // the same way: the description never names the key, so the wrapper goes —
+    // unless the previous attempt already went bare.
+    assert_eq!(submittable_answer_shaped(&[], "统计文件数量", answer, false), "fc1e78eb2a5a");
+    assert_eq!(submittable_answer_shaped(&[], "统计文件数量", answer, true), answer);
+
+    // Two or more fields mean the object is the answer's real shape; there is
+    // nothing to flip and the flip must not invent one.
+    let two = ["city".to_string(), "count".to_string()];
+    let object = r#"{"city":"南京","count":5}"#;
+    assert_eq!(submittable_answer_shaped(&two, "城市与数量", object, false), object);
+    assert_eq!(submittable_answer_shaped(&two, "城市与数量", object, true), object);
+
+    // A bare scalar has no wrapper to flip either — the retry changes nothing,
+    // which is correct: only the value can be wrong there.
+    assert_eq!(submittable_answer_shaped(&fields, "取 token", "fc1e78eb2a5a", true), "fc1e78eb2a5a");
+}

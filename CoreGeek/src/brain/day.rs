@@ -109,6 +109,31 @@ const SEAL_GRACE: i64 = 8;
 /// Slack on top of the walk home before the pioneer's dusk recall fires, for a
 /// blocked cell or a detour. Mirrors the three rounds `preposition_round` keeps.
 const PIONEER_RETREAT_SLACK: i64 = 2;
+/// Day-rounds that must still be available before a task point is worth
+/// accepting.
+///
+/// 任务书 5.3: "在任务执行结束后，再次接取任务需等待 30 个回合刷新时间" — and the
+/// dusk recall ends every session the pioneer is still holding when it fires.
+/// So a session accepted with fewer rounds left than a session needs is not a
+/// cheap attempt, it is that task point sold for 30 rounds: the recall walks
+/// the pioneer off the point, the judger ends the task, and the point is gone
+/// through the whole of the next morning. A working session costs four to six
+/// rounds (prompt → `llmResp` → the held-back command → verdict → submit), so
+/// twelve leaves room for one failed cycle and a second try.
+const TASK_MIN_ATTEMPT_ROUNDS: i64 = 12;
+/// Rounds a session may spend without producing a single submission before the
+/// pioneer goes back to the wall line.
+///
+/// Issue #15's lesson was that the opponent dropped failing tasks immediately
+/// and "把开拓者投入防御"; a session that has run three full LLM cycles (each
+/// costs prompt → answer → command → verdict, so five rounds apiece) with
+/// nothing submitted has produced no evidence that the fourth is the one. The
+/// pioneer is one of the three controllers the wall gate seal waits for, and
+/// issue #26 lost its base to nine rounds of `wall_gate_open`
+/// (`controllers_not_retreated`). Only a session with NOTHING submitted
+/// qualifies: one wrong answer is evidence the loop is working, and
+/// `MAX_WRONG_ANSWERS` already governs that case.
+const MAX_STERILE_ROUNDS: i64 = 15;
 
 /// How many ring cells this day's fortification budget covers.
 ///
@@ -795,6 +820,27 @@ fn pioneer_day(
     //    checkpoint: it fires strictly earlier (the walk home is already
     //    subtracted) and for every pioneer, paired or not.
     let recalled = turn.in_day_round >= pioneer_recall_round(turn, pioneer);
+    // A session that has produced nothing at all after `MAX_STERILE_ROUNDS` is
+    // not converging, and the pioneer is worth more on the wall line than on a
+    // point nothing is coming out of (issue #15's lesson; issue #26 lost the
+    // base to a gate no controller had retreated through). Checked before the
+    // recall so the log names the real reason a session ended.
+    if state.task.active
+        && state.task.best_answer.is_empty()
+        && state.task.submitted_round.is_none()
+        && turn.round_no - state.task.accepted_round >= MAX_STERILE_ROUNDS
+    {
+        crate::log::event(
+            "task_defense_abort",
+            serde_json::json!({
+                "round": turn.round_no,
+                "session": state.task.session_id,
+                "dayRound": turn.in_day_round,
+                "reason": "sterile",
+            }),
+        );
+        state.finish_task(false, "sterile");
+    }
     if state.task.active && recalled {
         crate::log::event(
             "task_defense_abort",
@@ -978,6 +1024,25 @@ impl BotState {
             })
             .min_by_key(|task| chebyshev(pioneer.pos, task.pos))?;
         if chebyshev(pioneer.pos, candidate.pos) <= 1 {
+            // The clock gates the ACCEPT, never the approach: a point accepted
+            // with fewer rounds left than a session needs is a point sold for
+            // its 30-round cooldown (see `TASK_MIN_ATTEMPT_ROUNDS`), but
+            // walking toward a point is free and the morning is the only time
+            // the pioneer has. Measured from where the pioneer IS, so standing
+            // out at the point already costs the walk home — which is the same
+            // deadline the recall will enforce.
+            if turn.in_day_round + TASK_MIN_ATTEMPT_ROUNDS > pioneer_recall_round(turn, pioneer) {
+                crate::log::event(
+                    "task_accept_deferred",
+                    serde_json::json!({
+                        "round": turn.round_no,
+                        "dayRound": turn.in_day_round,
+                        "point": candidate.pos,
+                        "recall": pioneer_recall_round(turn, pioneer),
+                    }),
+                );
+                return None;
+            }
             let timeout = if candidate.timeout_rounds > 0 {
                 candidate.timeout_rounds
             } else {

@@ -1687,6 +1687,33 @@ fn build_prompt_includes_task_environment_path() {
     );
 }
 
+#[test]
+fn build_prompt_budgets_the_sandbox_clock() {
+    // 接口文档 §executeCmd: "执行时长不得超过15秒，否则视为执行指令超时" — a
+    // timed-out command comes back `[TIMEOUT]` with no output, so the round is
+    // spent twice. The prompt asked for a lot and never mentioned the ceiling;
+    // a script with a `sleep`, a retry loop or an unqualified `find /` is a
+    // guaranteed way to hit it.
+    let mut state = BotState::default();
+    state.task.description = "请统计 /tmp 下的文件数量".into();
+    let turn = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
+    let prompt = coregeek::brain::task::build_prompt(&state, &turn);
+    assert!(
+        prompt.contains("15 秒"),
+        "prompt states the judger's hard timeout"
+    );
+    for banned in ["sleep", "重试"] {
+        assert!(
+            prompt.contains(banned),
+            "prompt warns against `{banned}` in the script"
+        );
+    }
+    assert!(
+        prompt.contains("find / -maxdepth 4"),
+        "an absent task directory has a documented fallback search"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Issue #9: pre-positioning before dusk, rocket second, strict answer parsing
 // ---------------------------------------------------------------------------

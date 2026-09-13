@@ -208,3 +208,85 @@ fn the_dusk_recall_may_still_take_the_pioneer_home() {
         "the step {step:?} does not close on the base (was {before} cells out)"
     );
 }
+
+#[test]
+fn a_task_point_is_not_accepted_without_the_rounds_to_use_it() {
+    // 任务书 5.3: "在任务执行结束后，再次接取任务需等待 30 个回合刷新时间", and the
+    // dusk recall ends any session still open when it fires. So a late accept
+    // is not a cheap attempt — it is that point sold for 30 rounds, because
+    // the recall ends the task and the judger starts the cooldown. Issue #26
+    // lost its base to the nine `wall_gate_open` rounds a pioneer standing on
+    // a point it could not finish had spent outside the ring.
+    let accept_of = |plan: &coregeek::brain::Plan| {
+        plan.commands
+            .get(&10004)
+            .map(|cmd| cmd.action.clone())
+            .unwrap_or_default()
+    };
+
+    // Early day, twelve-plus rounds before the recall: accept.
+    let turn = turn_from(board(5, (35, 4)));
+    let mut state = BotState::default();
+    let plan = day_plan(&turn, &mut state);
+    assert_eq!(
+        accept_of(&plan),
+        "acceptTask",
+        "an early accept has the whole day to work with"
+    );
+
+    // Late day at the same point, same pioneer: no accept. The recall is seven
+    // rounds away, which is not one full cycle of prompt → llmResp → command →
+    // verdict → submit.
+    let turn = turn_from(board(20, (35, 4)));
+    let mut state = BotState::default();
+    let plan = day_plan(&turn, &mut state);
+    assert_ne!(
+        accept_of(&plan),
+        "acceptTask",
+        "accepting now burns the point's 30-round cooldown for an attempt that \
+         cannot even complete one cycle"
+    );
+    assert!(
+        !state.task.active,
+        "a deferred accept opens no session"
+    );
+}
+
+#[test]
+fn a_sterile_session_hands_the_pioneer_back_to_the_wall_line() {
+    // Issue #15: the opponent dropped failing tasks and "把开拓者投入防御"; a
+    // session that has spent three full LLM cycles (prompt → answer → command
+    // → verdict) and submitted nothing has produced no reason to believe the
+    // fourth is the one. Issue #26 lost the base while its controllers — the
+    // pioneer among them — were still outside the ring.
+    let mut state = session_at(TaskStage::Planning);
+    state.task.accepted_round = 5;
+    let turn = turn_from(board(18, (35, 4))); // round 19: 14 rounds in
+    day_plan(&turn, &mut state);
+    assert!(state.task.active, "fourteen rounds is not yet sterile");
+
+    let turn = turn_from(board(20, (35, 4))); // round 21: 16 rounds in
+    day_plan(&turn, &mut state);
+    assert!(
+        !state.task.active,
+        "a session with nothing submitted after 15 rounds gives the pioneer back"
+    );
+}
+
+#[test]
+fn a_session_with_a_submission_is_never_sterile() {
+    // The other half: one answer in hand is evidence the loop is working, and
+    // `MAX_WRONG_ANSWERS` already governs how many rejections it survives.
+    // Cutting here would throw away a banked answer 任务书 ch.6 still scores by
+    // 通过率.
+    let mut state = session_at(TaskStage::WaitingSubmit { attempts: 3 });
+    state.task.accepted_round = 5;
+    state.task.best_answer = r#"{"count": 41}"#.into();
+    state.task.submitted_round = Some(9);
+    let turn = turn_from(board(20, (35, 4)));
+    day_plan(&turn, &mut state);
+    assert!(
+        state.task.active,
+        "a session that has submitted keeps its point"
+    );
+}
