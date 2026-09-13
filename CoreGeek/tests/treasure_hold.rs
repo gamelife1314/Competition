@@ -136,3 +136,38 @@ fn the_sacrifice_shopping_leaves_the_medicine_money_intact() {
     assert_eq!(cmd.action, "buy");
     assert_eq!(cmd.name.as_deref(), Some("StarSand"));
 }
+
+#[test]
+fn day_plan_never_drags_the_waiting_pioneer_off_the_altar() {
+    // The wiring behind holds_altar: with the sacrifice already in the pack
+    // and opening day tomorrow, the treasure step has nothing to emit — and
+    // the loiter/retreat fall-throughs in pioneer_day must NOT take over.
+    let mut state = waiting_state(3);
+    let mut payload = world(140, (29, 6));
+    payload["teamOur"]["roles"][1]["backpack"] = json!(["StarSand"]);
+    let turn = turn_from(payload);
+    let mut day_state = BotState::default();
+    day_state.current_day = 2;
+    day_state.treasure = state.treasure.clone();
+    let plan = coregeek::brain::day::plan(&turn, &mut day_state);
+    assert!(
+        plan.commands.get(&10004).is_none(),
+        "a pioneer waiting out the altar's last day holds its cell: {:?}",
+        plan.commands.get(&10004)
+    );
+
+    // Opening day: the same board summons immediately.
+    let mut day_state = BotState::default();
+    day_state.current_day = 3;
+    day_state.treasure = state.treasure.clone();
+    let mut payload = world(270, (29, 6));
+    payload["teamOur"]["roles"][1]["backpack"] = json!(["StarSand"]);
+    let turn = turn_from(payload);
+    let plan = coregeek::brain::day::plan(&turn, &mut day_state);
+    let cmd = plan
+        .commands
+        .get(&10004)
+        .expect("opening day summons, it does not hold");
+    assert_eq!(cmd.action, "summonTreasure");
+    let _ = &mut state;
+}

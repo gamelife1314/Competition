@@ -2088,6 +2088,11 @@ fn planner_buys_consumables_in_a_batch() {
             railgun(10030, 10, 21, 2),
             rocket(10040, 9, 21, 2),
             json!({
+                "id": 10002, "pos": {"x": 5, "y": 5}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100, "backpack": []
+            }),
+            json!({
                 "id": 10010, "pos": {"x": 1, "y": 0}, "roleType": "worker",
                 "health": 100, "attackPower": 0, "attackRange": 0,
                 "backPackCapability": 100, "backpack": []
@@ -2102,6 +2107,8 @@ fn planner_buys_consumables_in_a_batch() {
     let cmd = plan.commands.get(&10010).expect("worker buys");
     assert_eq!(cmd.action, "buy");
     assert_eq!(cmd.name.as_deref(), Some("Medicine"));
+    // P1-4 续航包: one bottle per controller — two controllers, both bottles
+    // in one command.
     assert_eq!(cmd.num, Some(2), "both medicines are bought in one command");
 }
 

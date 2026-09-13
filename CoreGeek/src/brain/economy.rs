@@ -255,6 +255,9 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     // 4. Night consumables: pre-stocked before the first night instead of only
     //    reacting to an injury. A controller that drops below 30% at night with
     //    no Medicine simply dies, and a dead controller mans no weapon.
+    //    P1-4 续航包：one bottle PER CONTROLLER — the night withdrawal rule
+    //    almost never fires when every controller carries a potion, and the
+    //    potion is also what clears the hysteresis holdout (night.rs).
     let injured = turn.controllable().iter().any(|role| {
         let max_hp = if role.kind == UnitKind::Worker {
             220
@@ -263,11 +266,10 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         };
         role.health * 10 < max_hp * 8
     });
+    let controllers = turn.controllable().len() as i64;
     let medicine = stock_of(turn, "Medicine");
-    let want_medicine = if injured {
-        2
-    } else if readiness {
-        1
+    let want_medicine = if injured || readiness {
+        controllers.max(1)
     } else {
         0
     };
@@ -292,7 +294,14 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     let want_fixers = if damaged_walls > 0 {
         damaged_walls.min(6)
     } else if readiness && walls.len() >= RING_WALLS_FOR_UPGRADE {
-        2
+        // P1-4 续航包：2–4 kits a day. A ring that has been closed before is
+        // the ring the night tears open (issue #21: 17→7) — and the kits are
+        // the only wall HP available during the night itself.
+        if state.ring_ever_complete {
+            4
+        } else {
+            2
+        }
     } else {
         0
     };
@@ -356,7 +365,44 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         });
     }
 
+    // P1-1: tonight's clear gap may reorder this list (dial-gated).
+    clear_gap_order(turn, &mut needs);
     needs
+}
+
+/// P1-1: when tonight's estimated wave out-HPs our guns (`firepower_gap` >
+/// 0), firepower funding outranks everything long-term: the station upgrade
+/// drops below the consumables and harassment is suppressed outright — a
+/// bigger base behind too few guns is how the D2–D3 nights were lost
+/// (issues #8/#18/#19/#20). Weapon/wall vouchers and the night sustain pack
+/// keep their priorities; the P0-4 third-tower guard already owns the build
+/// side of the same gap.
+///
+/// Dial-gated (`CG_TUNE_CLEAR_GAP`, default OFF): the committed fixed order
+/// stands until the multi-opponent A/B report shows the reorder winning
+/// (Improve.kimi.md §7, P1-1 row). `drive` is taken explicitly so tests can
+/// exercise both branches without touching the process-wide dial.
+pub fn clear_gap_order_with(drive: bool, turn: &Turn, needs: &mut Vec<Need>) {
+    if !drive || crate::brain::combat::firepower_gap(turn) <= 0 {
+        return;
+    }
+    for need in needs.iter_mut() {
+        if matches!(
+            need.name.as_str(),
+            "StationUpgradeVoucher1" | "StationUpgradeVoucher2"
+        ) {
+            need.priority = 5;
+        }
+    }
+    needs.retain(|need| need.name != "BossRobotSummonOrder");
+}
+
+fn clear_gap_order(turn: &Turn, needs: &mut Vec<Need>) {
+    clear_gap_order_with(
+        crate::brain::combat::weights().clear_gap_drive != 0,
+        turn,
+        needs,
+    );
 }
 
 /// The affordable subset of `intent_list`, in purchase order.

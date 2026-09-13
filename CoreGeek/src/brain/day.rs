@@ -191,9 +191,22 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // for tasks/treasure. An unaffordable intent still nominates a buyer: the
     // deadline budgeter needs someone walking toward the shop before the gold
     // arrives.
+    //
+    // P1-2 买家与经济工拆分: once the wall work is done the FIRST worker takes
+    // the shop trips and the dedicated economy worker (the last one) stays on
+    // the collect→sell loop. With one role doing both, every purchase cost the
+    // mine→vendor→shop triangle — 30-40 rounds per buy, one or two buys a day,
+    // and the purse idled at the counter while ore waited in the backpack
+    // (issues #20/#22). While the ring is still being built the wall worker has
+    // no time for errands, so the old same-role fallback holds; with one worker
+    // alive it holds too.
     let workers = turn.workers();
+    let shared_wall_duty = turn.day == 1 && !wall_gaps.is_empty();
+    let wall_work_done = wall_gaps.is_empty() && !shared_wall_duty;
     let buyer_id: Option<i64> = if budget.intent.is_empty() {
         None
+    } else if wall_work_done && workers.len() >= 2 {
+        workers.first().map(|unit| unit.id)
     } else {
         workers.last().map(|unit| unit.id)
     };
@@ -233,7 +246,6 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     } else {
         None
     };
-    let shared_wall_duty = turn.day == 1 && !wall_gaps.is_empty();
     if !budget.intent.is_empty() {
         // Economy intent vs outcome: the head of the list is what we WANT, the
         // gold check and the buyer's distance say whether it is reachable this
@@ -313,6 +325,15 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         // 仅在自进化任务执行期间可用" — issue #17's two sessions, both burned
         // to zero while the opponent took 345 from four completed tasks.
         if holds_task_point(state, role) {
+            continue;
+        }
+        // …or a pioneer holding the altar for the treasure's opening day
+        // (P2-1). `holds_altar`'s deliberate no-command wait is not idleness
+        // either; walking it home here would restart the two-step oscillation
+        // the predicate exists to end.
+        if role.kind == crate::model::UnitKind::Pioneer
+            && treasure::holds_altar(turn, state, role)
+        {
             continue;
         }
         if let Some(cmd) = fallback_toward_station(turn, role) {
@@ -876,6 +897,16 @@ fn pioneer_day(
     if !recalled {
         if let Some(cmd) = treasure::plan_pioneer(turn, state, pioneer, claimed, plan) {
             plan.push(pioneer.id, cmd);
+            return;
+        }
+        // P2-1: waiting beside the altar for the opening day is a deliberate
+        // HOLD, not idleness. The treasure planner returns no command for that
+        // wait, and the loiter/retreat steps below would each drag the pioneer
+        // a cell away so the treasure step has to drag it back the next — a
+        // two-step oscillation that can spend the whole opening window
+        // commuting (and that keeps the gate seal waiting on a role that is
+        // never home).
+        if treasure::holds_altar(turn, state, pioneer) {
             return;
         }
     }
