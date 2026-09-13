@@ -50,14 +50,44 @@
 **格式**：stdout 是 JSONL，一行一个事件：
 
 ```json
-{"ts":1789281855133,"event":"round","data":{"round":1,"day":1,…}}
+{"event":"round","data":{"round":1,"day":1,…}}
 ```
 
 - **首行不是 JSON**（`listening on 0.0.0.0:<port>`）。解析前跳过不以 `{` 开头的行。
+- 带 `round` 字段的记录**没有 `ts`**：行序就是时间线，`round` 自身就是时钟。只有
+  `startup` / `build_info` / `coach_*` 这些没有回合可锚的记录才带 `ts`。
 - 每回合一条 `round`，另有一批 `task_*` / `coach_*` / `volley_review` / `night_debug` /
   `shopping` / `wall_build` … 事件混在同一流里。**回合数 ≠ 行数**，别按行数截取回合。
 - **行序有意义**（事件按发生顺序落盘）。重排、按事件名分组都会破坏因果链。
 - gzip 可以，但保留 `.jsonl.gz` 后缀与原始行序，并在 issue 里说明。
+
+**三个必须知道的压缩规则**（不知道就会把"没写"读成"没发生"）：
+
+1. **空值不落盘。** `null`、`""`、`[]`、`{}` 一律不写 —— 缺键和空值同义。但
+   **`0` 和 `false` 是事实，照写**：`gold:0` 是没钱，`noRobotDamage:false` 是对本回合的
+   断言。所以 `jq 'select(.data.errors)'` 能筛出"有错"的回合，而
+   `jq 'select(.data.gold==0)'` 也照常工作。
+2. **没变的块不重写。** `round` 里的 `stationHp`/`enemyStationHp`/`wall`/`enemyWall`/
+   `towers`/`roles`/`pairs`/`task`/`treasure` **只在变化的那一回合写**，其余回合整个键
+   缺席 —— **缺键 = 沿用上一次出现的值，不是"没有"**。那一回合重写了哪些块，由
+   `round.data.chg` 列出；**没有 `chg` 就是本回合无变化**。
+   **`chg` 是权威，键不是**：块名在 `chg` 里、键却不在记录里，意思是这个块**变成了空的**
+   （塔全被拆光、配对清空、任务会话结束）—— 空值本身不落盘（规则 1），所以由 `chg` 宣布。
+   只看键的读者会在这一回合继续沿用旧值，错得无声无息。要取序列必须先"带值前行"：
+   ```sh
+   grep '^{' ours.jsonl | jq -c 'select(.event=="round")
+     | {round:.data.round, towers:(.data.towers // "same"), wall:(.data.wall // "same")}'
+   ```
+   逐回合必写的只有：`round`/`day`/`isDay`/`gold`/`score`/`scoreDelta`/`scoreAttr`/
+   `robotCount`/`cmds`/`policy`/`volley`/`ms`，以及非空时的
+   `errors`/`errorDescs`/`failures`/`robotEvents`/`phaseTask`/`lastCmdResult`。
+   基地陷落写 `stationHp: 0`（不是缺键）；对手基地写 `null` 表示**看不见**，不等于被拆。
+3. **按对/按塔的流已合并。** `night_debug` 现在是**每回合一条**，内含 `pairs[]`，每项
+   `{tower, controller, reason, fired?, hp?}`；`reason` 就是全部结论
+   （`controller_walking`/`controller_stuck` 是夜召回的两种结局，`cooldown` 是炮在冷却，
+   `no_target_in_range` 与 `no_target_reserved_for_robots` 区分"没目标"和"我们自己留着不打"）。
+   它**每回合都写**，因为"某塔 `controller_withdrawn` 了多少回合"本身就是结论 ——
+   计数行数即可，别去重。`night_recall` 与 `night_withdraw` 已并入 `night_debug`。
 
 **禁止**：截断长字段、合并多行、给每行加队伍前缀或时间戳注解、脱敏 ID/坐标、
 只保留 `round` 事件、只保留你分析里引用到的那几行。
@@ -252,7 +282,7 @@ issue 头部请给这一行（我直接 grep）：
 | 3 | 每个 task session 是怎么结束的？`task_ended.reason` 的直方图；每场提交了几次 `submitAnswer` | 12 个 session 全 0 分，但"超时"和"判错三次"是两种完全不同的病 | `jq -r 'select(.event=="task_ended") \| .data.reason' \| sort \| uniq -c` |
 | 4 | 判题器对每次提交回了什么？`task_answer_submit` 之后那几回合的 `errors` / `errorDescs` | **0 分唯一的现场证据**。`MissingNamedInput` 是字段名错，`code 2` 是值错，两者改法完全相反 | 先 `jq -r 'select(.event=="task_answer_submit") \| [.data.round,.data.session,.data.answer,.data.flipped] \| @tsv'`，再取那些 round 的 `round.errors`/`errorDescs` |
 | 5 | 封门开了几回合？`wall_gate_open` 的次数与 `reason`；那几回合每个 controller（尤其开拓者）在不在环内 | #26 的败因是门开 9 回合→城墙塌→基地亡。要确认是"控制器没归队"还是"归队了但没封上" | `jq -r 'select(.event=="wall_gate_open" or .event=="wall_gate_seal") \| [.data.round,.event,.data.reason] \| @tsv'` |
-| 6 | 卖矿几次、各卖了多少金？`gold` 是否长期贴在同一个常数上 | 判断"经济锁死"是收入问题还是支出问题 | `jq -r 'select(.event=="sell") \| .data' \| head -50`，与 `round.gold` 序列对照 |
+| 6 | 卖矿几次、各卖了多少金？`gold` 是否长期贴在同一个常数上 | 判断"经济锁死"是收入问题还是支出问题 | `jq -r 'select(.event=="sell") \| [.data.round,.data.role,.data.ore,.data.num,.data.gold] \| @tsv'`，与 `round.gold` 序列对照（`sell` 事件本回合才有；早于本 commit 的日志这个配方命中 0 行，那不是结论） |
 
 ### 7.2 三个开放问题（同上，一直有效）
 
@@ -371,6 +401,13 @@ agent_request:
       - sentinels wrapped in JSON ({"status":"pending"}) are never submitted
       - no task is accepted with fewer than 12 day-rounds before the dusk recall (task_accept_deferred)
       - a session with nothing submitted after 15 rounds ends and frees the pioneer (task_defense_abort.reason=sterile)
+      # log-shape changes: a batch captured before this commit will look wrong
+      # in exactly these ways, and that is not a finding.
+      - "sell events now exist at all (recipe 6 used to match zero lines)"
+      - "shopping now carries .data.round, so it joins against round.gold"
+      - "night_recall and night_withdraw are folded into night_debug's pairs[].reason"
+      - "round blocks (towers/roles/wall/task/...) are change-gated; absent means unchanged, and round.data.chg names what was re-sent"
+      - "round records no longer carry ts (the round number is the clock)"
 ```
 
 ---

@@ -362,6 +362,10 @@ pub struct BotState {
     /// Running estimate of earned kill score, used to split the total into
     /// kill / survival / residual (task) components.
     pub cum_kill_score: i64,
+    /// Last-written signatures of the change-gated blocks in the `round`
+    /// record (`log::changed`). Purely a logging concern, but it has to survive
+    /// from one round to the next, which makes this the only place it can live.
+    pub log_sigs: crate::log::LogSigs,
 
     /// 内置教练（`brain::coach`）：不靠环境变量、不靠外部 workflow，从局势里读出
     /// 证据自己移动三个策略开关。它随半场一起活着（见 `observe` 的重置分支）。

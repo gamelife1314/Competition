@@ -239,10 +239,16 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // 100-gold upgrade, and whether that upgrade is still reachable, is the
     // decision the deadline budgeter exists to make explainable.
     crate::log::event(
+        // Written every day round, deliberately: this is the evidence for
+        // WORKFLOW_REQUEST §7.1's first question — whether `mayBuild` was ever
+        // true while `towers < 3` — and that question is a *ratio* over rounds,
+        // which a record emitted only on change could not answer. What it no
+        // longer carries is `dayRound` (derivable from `round`) and
+        // `fallbackRound` (`DUSK_ROUND - FALLBACK_LEAD`, the same constant on
+        // all 1400 of them).
         "tower_plan",
         serde_json::json!({
             "round": turn.round_no,
-            "dayRound": turn.in_day_round,
             "towers": turn.towers().len(),
             "gaps": tower_gaps.len(),
             "reserve": build_reserve,
@@ -252,7 +258,6 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             "teamStone": economy::team_ores(turn, STONE),
             "mayBuild": economy::may_build_weapon(turn, state),
             "upgradeReachable": economy::upgrade_reachable(turn, state),
-            "fallbackRound": economy::DUSK_ROUND - economy::FALLBACK_LEAD,
         }),
     );
     // With two workers, the LAST one is the dedicated economy worker: it skips
@@ -285,6 +290,11 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         crate::log::event(
             "shopping",
             serde_json::json!({
+                // The round is the join key: WORKFLOW_REQUEST §7.1's second
+                // question is about the *ratio* of unaffordable rounds and what
+                // gold was doing in them, and without this the event could only
+                // be counted, never aligned with `round.gold`.
+                "round": turn.round_no,
                 "buyer": buyer_id,
                 "gold": turn.gold,
                 "reserve": build_reserve,
@@ -1660,7 +1670,15 @@ fn sell_flow(
         return None;
     }
     if stands.iter().any(|pos| *pos == role.pos) {
-        return economy::sell_command(turn, state, role, stone_demand);
+        let cmd = economy::sell_command(turn, state, role, stone_demand)?;
+        // WORKFLOW_REQUEST §7.1 asks whether the economy is income-starved or
+        // spend-blocked, and the only way to tell is the sell side against
+        // `round.gold`: a run of rounds at a constant gold with no `sell` in
+        // them is a mining problem, while sells that land with the gold pinned
+        // afterwards is a spending one. Until now nothing was logged here at
+        // all, so the recipe matched zero lines.
+        crate::log::event("sell", crate::log::sell_record(turn, role, &cmd));
+        return Some(cmd);
     }
     walk_toward(turn, role, &stands, claimed)
 }

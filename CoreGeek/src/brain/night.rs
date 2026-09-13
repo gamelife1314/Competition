@@ -297,6 +297,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // change halfway through one round's firing sequence.
     let coach_policy = state.coach.policy();
 
+    // Per-pair diagnostics, folded into one record after the loop — see the
+    // note at the push site.
+    let mut night_rows: Vec<serde_json::Value> = Vec::new();
+
     for (controller_id, tower_id) in &pairs {
         let (Some(tower), Some(controller)) =
             (turn.role_by_id(*tower_id), turn.role_by_id(*controller_id))
@@ -335,18 +339,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         // back out and a controller whose wound has stopped being an emergency
         // is recalled again the same round it becomes one.
         if night_withdraw(turn, controller, &mut claimed, &mut plan) {
+            // The wound that triggered it rides on the pair's row below, so the
+            // `controller_withdrawn` rounds a gun spent silent and the HP it
+            // was frozen at stay in one record instead of two.
             idle_reason = "controller_withdrawn";
-            crate::log::event(
-                "night_withdraw",
-                serde_json::json!({
-                    "round": turn.round_no,
-                    "controller": controller.id,
-                    "tower": tower.id,
-                    "health": controller.health,
-                    "pos": controller.pos,
-                    "dist": dist,
-                }),
-            );
         } else if !adjacent {
             // NIGHT RECALL (recurring defect): a controller not adjacent to its
             // tower MUST move there, outranking every other night duty (heal,
@@ -381,16 +377,6 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             } else {
                 "controller_stuck"
             };
-            crate::log::event(
-                "night_recall",
-                serde_json::json!({
-                    "round": turn.round_no,
-                    "controller": controller.id,
-                    "tower": tower.id,
-                    "dist": dist,
-                    "moved": moved,
-                }),
-            );
         } else {
             // Adjacent: a badly hurt operator heals first (a dead one mans
             // nothing), otherwise man the tower.
@@ -422,27 +408,44 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             }
             // The controller holds position (no command) to stay adjacent.
         }
-        // One diagnostic line per pair per round: makes "weapon unoperated"
-        // failures visible in the stdout JSONL log without a debugger.
-        crate::log::event(
-            "night_debug",
-            serde_json::json!({
-                "round": turn.round_no,
-                "pairs_count": pairs.len(),
-                "controller_adjacent": adjacent,
-                "dist": dist,
-                "cooldown": tower.cooldown,
-                "attack_targets": targets_count,
-                "tower_id": *tower_id,
-                "controller_id": *controller_id,
-                "controller_pos": controller.pos,
-                "tower_pos": tower.pos,
-                "fired": fired,
-                "enemyFire": enemy_fire,
-                "reason": idle_reason,
-            }),
-        );
+        // One row per pair, folded into a single record after the loop. This
+        // used to be a `night_debug` line AND a `night_recall` line per pair
+        // per round — 3 pairs x 2 records x 60 night rounds x 10 days, about
+        // 250 KB a match at ~400 bytes each, most of it the same
+        // `controller_pos`/`tower_pos`/`pairs_count` restated every round.
+        //
+        // `reason` is the whole diagnosis: `controller_walking` and
+        // `controller_stuck` are the recall's two outcomes, `cooldown` is the
+        // gun recharging, and `no_target_in_range` against
+        // `no_target_reserved_for_robots` says whether the silence was the map
+        // or our own trigger discipline. That is why `dist`, `cooldown` and
+        // the two positions do not need their own keys.
+        let mut row = serde_json::json!({
+            "tower": *tower_id,
+            "controller": *controller_id,
+            "reason": idle_reason,
+        });
+        if fired {
+            row["fired"] = serde_json::json!(targets_count);
+            if enemy_fire {
+                row["enemyAssets"] = serde_json::json!(true);
+            }
+        }
+        if idle_reason == "controller_withdrawn" {
+            row["hp"] = serde_json::json!(controller.health);
+        }
+        night_rows.push(row);
     }
+    // Still one record every night round, deliberately: the count of rounds a
+    // tower spent `controller_withdrawn` IS the finding (Improve.kimi.md reads
+    // "35 次 controller_withdrawn, 塔全程沉默"), so a record that only appeared
+    // when the reason changed would delete the duration. What it no longer does
+    // is repeat the positions and the pair count, which were the same every
+    // round and were two thirds of the bytes.
+    crate::log::event(
+        "night_debug",
+        serde_json::json!({"round": turn.round_no, "robots": turn.robots.len(), "pairs": night_rows}),
+    );
 
     // Spare controllers.
     let controllers: Vec<&Unit> = turn.controllable();

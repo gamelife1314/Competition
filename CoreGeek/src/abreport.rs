@@ -68,6 +68,8 @@ pub fn parse_battle<I: IntoIterator<Item = String>>(label: &str, lines: I) -> Ba
     };
     let mut station_seen = false;
     let mut enemy_station_seen = false;
+    // Last `stationHp` the record carried; see the carry-forward note below.
+    let mut last_station_hp: Option<i64> = None;
 
     for line in lines {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
@@ -97,7 +99,17 @@ pub fn parse_battle<I: IntoIterator<Item = String>>(label: &str, lines: I) -> Ba
                 report.residual = row.residual;
                 report.final_total = row.total;
 
-                match data.get("stationHp").and_then(Value::as_i64) {
+                // `stationHp` is change-gated in the `round` record: it is
+                // written on the round it first appears, whenever the number
+                // moves, and on the round the base falls (as an explicit `0`).
+                // On the rounds in between it is absent, which means "unchanged"
+                // and NOT "gone" — so the last value seen carries forward. Read
+                // as a bare `data.get` this would call every quiet round the day
+                // the base was lost.
+                if let Some(hp) = data.get("stationHp").and_then(Value::as_i64) {
+                    last_station_hp = Some(hp);
+                }
+                match last_station_hp {
                     Some(hp) if hp > 0 => station_seen = true,
                     _ if station_seen && report.station_lost_day.is_none() => {
                         report.station_lost_day = Some(day);

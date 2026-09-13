@@ -72,23 +72,42 @@ fn enemy_station_falling_is_the_win_condition_and_is_dated() {
 
 #[test]
 fn losing_our_station_is_dated_too() {
+    // A fallen base is written as an explicit `0` by `log_round` (`turn.station()`
+    // returning `None` is what 0 means there), so that is what the capture says.
     let capture = vec![
         round_line(1, 1, 10, 0, 10, 0, json!(1500), json!(1500), vec![], false),
-        round_line(
-            2,
-            131,
-            10,
-            0,
-            0,
-            10,
-            Value::Null,
-            json!(1500),
-            vec![],
-            false,
-        ),
+        round_line(2, 131, 10, 0, 0, 10, json!(0), json!(1500), vec![], false),
     ];
     let report = parse_battle("alpha", capture);
     assert_eq!(report.station_lost_day, Some(2));
+}
+
+#[test]
+fn a_round_that_does_not_mention_the_base_is_not_a_loss() {
+    // `stationHp` is change-gated: it is written when it first appears, when it
+    // moves, and when the base falls — and omitted on every round in between,
+    // which is most of them. Read as a bare `data.get` those absences look
+    // exactly like a station that disappeared, and every battle would be dated
+    // a day-1 loss on its second quiet round.
+    let capture = vec![
+        round_line(1, 1, 10, 0, 10, 0, json!(1500), json!(1500), vec![], false),
+        // Four quiet rounds: the record says nothing about the base at all.
+        line("round", json!({"round": 2, "day": 1, "score": 12,
+            "scoreAttr": {"kill": 0, "killThisRound": 0, "survival": 10, "residual": 2}})),
+        line("round", json!({"round": 3, "day": 1, "score": 14,
+            "scoreAttr": {"kill": 0, "killThisRound": 0, "survival": 10, "residual": 4}})),
+        // Then it comes back damaged, and finally falls.
+        round_line(1, 4, 16, 0, 10, 6, json!(900), json!(1500), vec![], false),
+        line("round", json!({"round": 5, "day": 1, "score": 18,
+            "scoreAttr": {"kill": 0, "killThisRound": 0, "survival": 10, "residual": 8}})),
+        round_line(2, 131, 18, 0, 0, 8, json!(0), json!(1500), vec![], false),
+    ];
+    let report = parse_battle("alpha", capture);
+    assert_eq!(
+        report.station_lost_day,
+        Some(2),
+        "the base fell on day 2; day 1 ended with it merely damaged"
+    );
 }
 
 #[test]

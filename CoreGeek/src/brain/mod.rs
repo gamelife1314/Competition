@@ -162,19 +162,19 @@ fn log_round(
                 "id": id,
                 "action": cmd.action,
                 "name": cmd.name,
-                "target": cmd.targetPos.as_ref().map(|list| list.first()),
+                "target": cmd.targetPos.as_ref().and_then(|list| list.first()).map(|pos| crate::log::xy(*pos)),
                 "controller": cmd.controllerId,
             })
         })
         .collect();
-    let towers: Vec<serde_json::Value> = turn
+    let towers: serde_json::Value = turn
         .towers()
         .iter()
         .map(|tower| {
             json!({"id": tower.id, "lvl": tower.level, "hp": tower.health, "cd": tower.cooldown})
         })
         .collect();
-    let roles: Vec<serde_json::Value> = turn
+    let roles: serde_json::Value = turn
         .controllable()
         .iter()
         .map(|role| json!({"id": role.id, "hp": role.health, "pack": role.backpack.len()}))
@@ -229,74 +229,131 @@ fn log_round(
         0
     };
     let residual = turn.total_score - state.cum_kill_score - survival_score;
-    let pairs: Vec<serde_json::Value> = state
+    let pairs: serde_json::Value = state
         .night_pairs
         .iter()
         .map(|(controller, tower)| json!({"controller": controller, "tower": tower}))
         .collect();
-    crate::log::event(
-        "round",
-        json!({
-            "round": turn.round_no,
-            "day": turn.day,
-            "isDay": turn.is_day,
-            "gold": turn.gold,
-            "score": turn.total_score,
-            "scoreDelta": score_delta,
-            "scoreAttr": {
-                "kill": state.cum_kill_score,
-                "killThisRound": killed,
-                "survival": survival_score,
-                "residual": residual,
-            },
-            "stationHp": turn.station().map(|station| station.health),
-            "stationLvl": turn.station().map(|station| station.level),
-            "enemyStationHp": turn.enemy_station().map(|station| station.health),
-            "enemyStationLvl": turn.enemy_station().map(|station| station.level),
-            "robotCount": robot_hp.len(),
-            "robotEvents": robot_events,
-            "wall": {"count": turn.walls().len(), "hp": wall_hp, "hpDelta": wall_hp_delta},
-            "enemyWall": {"count": turn.enemy_walls().len(), "hp": enemy_wall_hp},
-            "pairs": pairs,
-            "towers": towers,
-            "roles": roles,
-            "cmds": cmds,
-            "failures": failures,
-            "volley": volley.summary(),
-            "errors": turn.error_codes,
-            // The judger's own words for each code (e.g. `MissingNamedInput`) —
-            // the one authoritative schema signal for task answers, requested
-            // by the analysis workflow (WORKFLOW_REQUEST 请求四).
-            "errorDescs": turn.error_descriptions.iter().map(|text| crate::log::brief(text, 120)).collect::<Vec<_>>(),
-            "phaseTask": crate::log::brief(&turn.phase_task, 160),
-            "lastCmdResult": crate::log::brief(&turn.last_cmd_result, 160),
-            "promptChars": prompt.as_ref().map(String::len).unwrap_or(0),
-            "execChars": execute_cmd.as_ref().map(String::len).unwrap_or(0),
-            "llmToday": state.llm_used_today,
-            "task": {
-                "active": state.task.active,
-                "session": state.task.session_id,
-                "stage": format!("{:?}", state.task.stage),
-                "wrong": state.task.wrong_answers,
-                "submittedRound": state.task.submitted_round,
-                "phaseMissing": state.task.phase_missing_rounds,
-                "pointClosedRound": state.task.point_closed_round,
-            },
-            "treasure": {
-                "phase": format!("{:?}", state.treasure.phase),
-                "legends": state.treasure.legends.len(),
-                "summons": state.treasure.summon_attempts,
-            },
-            // 内置教练当前档位：让分析侧能把结果与"当时是哪一档"对上，
-            // 不必等一个跑不起来的 A/B（WORKFLOW_REQUEST 请求七）。
-            "policy": {
-                "stationPressure": state.coach.policy().station_pressure,
-                "gapFunding": state.coach.policy().gap_funding,
-                "harass": state.coach.policy().harass.as_str(),
-            },
-            "ms": started.elapsed().as_micros() as f64 / 1000.0,
-        }),
-    );
+    // `policy` and `scoreAttr` are written every round on purpose: the first is
+    // the documented way to tell which coach stance was in force at a given
+    // moment (WORKFLOW_REQUEST §5), the second is how `abreport` splits the
+    // running total into its three objectives, and `residual` moves whenever
+    // `score` does. Everything else below is change-gated — see `log::changed`.
+    // `stationHp`/`enemyStationHp` keep their flat names rather than becoming a
+    // `station` block: `abreport` reads `stationHp` and the A/B report's
+    // base-fall detection is downstream of it. A base that is gone writes
+    // `Null`, which `prune` drops; the signature still flips, so the round it
+    // fell is marked in `chg`.
+    // Our own base reports `0` rather than `null` once it is gone: `turn.station()`
+    // returning `None` IS the base having fallen, and `0` is the value the loss
+    // rule reads. The opponent's base is `null` instead, because `None` there
+    // usually means the base is out of our vision rather than destroyed.
+    let station_hp = turn.station().map(|station| station.health).unwrap_or(0);
+    let station_lvl = turn.station().map(|station| station.level).unwrap_or(0);
+    let enemy_station_hp = turn.enemy_station().map(|station| station.health);
+    let enemy_station_lvl = turn.enemy_station().map(|station| station.level);
+    let wall = json!({"count": turn.walls().len(), "hp": wall_hp, "hpDelta": wall_hp_delta});
+    let enemy_wall = json!({"count": turn.enemy_walls().len(), "hp": enemy_wall_hp});
+    let task = json!({
+        "active": state.task.active,
+        "session": state.task.session_id,
+        "stage": format!("{:?}", state.task.stage),
+        "wrong": state.task.wrong_answers,
+        "submittedRound": state.task.submitted_round,
+        "phaseMissing": state.task.phase_missing_rounds,
+        "pointClosedRound": state.task.point_closed_round,
+    });
+    let treasure = json!({
+        "phase": format!("{:?}", state.treasure.phase),
+        "legends": state.treasure.legends.len(),
+        "summons": state.treasure.summon_attempts,
+    });
+    let mut data = json!({
+        "round": turn.round_no,
+        "day": turn.day,
+        "isDay": turn.is_day,
+        "gold": turn.gold,
+        "score": turn.total_score,
+        "scoreDelta": score_delta,
+        "scoreAttr": {
+            "kill": state.cum_kill_score,
+            "killThisRound": killed,
+            "survival": survival_score,
+            "residual": residual,
+        },
+        "robotCount": robot_hp.len(),
+        "robotEvents": robot_events,
+        "cmds": cmds,
+        "failures": failures,
+        "volley": volley.summary(),
+        "errors": turn.error_codes,
+        // The judger's own words for each code (e.g. `MissingNamedInput`) —
+        // the one authoritative schema signal for task answers, requested
+        // by the analysis workflow (WORKFLOW_REQUEST 请求四).
+        "errorDescs": turn.error_descriptions.iter().map(|text| crate::log::brief(text, 120)).collect::<Vec<_>>(),
+        "phaseTask": crate::log::brief(&turn.phase_task, 160),
+        "lastCmdResult": crate::log::brief(&turn.last_cmd_result, 160),
+        "promptChars": prompt.as_ref().map(String::len).unwrap_or(0),
+        "execChars": execute_cmd.as_ref().map(String::len).unwrap_or(0),
+        "llmToday": state.llm_used_today,
+        // 内置教练当前档位：让分析侧能把结果与"当时是哪一档"对上，
+        // 不必等一个跑不起来的 A/B（WORKFLOW_REQUEST 请求七）。
+        "policy": {
+            "stationPressure": state.coach.policy().station_pressure,
+            "gapFunding": state.coach.policy().gap_funding,
+            "harass": state.coach.policy().harass.as_str(),
+        },
+        "ms": started.elapsed().as_micros() as f64 / 1000.0,
+    });
+    // Blocks that move a handful of times a match: the base and wall lines,
+    // the tower roster, the controller roster, the night pairing, the task
+    // session and the treasure plan. Writing them every round cost ~500 of the
+    // record's ~1400 bytes and answered nothing — the question a reader has is
+    // always "when did this change", and a change is exactly what gets written.
+    // The names of the blocks re-sent land in `chg`, so a round where something
+    // moved is marked as such and a round without `chg` is a quiet round.
+    let mut chg: Vec<&str> = Vec::new();
+    let object = data.as_object_mut().expect("round data is an object");
+    let base = json!([station_hp, station_lvl]);
+    let enemy_base = json!([enemy_station_hp, enemy_station_lvl]);
+    let gated: [(&str, &serde_json::Value, &mut Option<String>); 9] = [
+        ("base", &base, &mut state.log_sigs.station),
+        ("enemyBase", &enemy_base, &mut state.log_sigs.enemy_station),
+        ("wall", &wall, &mut state.log_sigs.wall),
+        ("enemyWall", &enemy_wall, &mut state.log_sigs.enemy_wall),
+        ("towers", &towers, &mut state.log_sigs.towers),
+        ("roles", &roles, &mut state.log_sigs.roles),
+        ("pairs", &pairs, &mut state.log_sigs.pairs),
+        ("task", &task, &mut state.log_sigs.task),
+        ("treasure", &treasure, &mut state.log_sigs.treasure),
+    ];
+    for (name, block, slot) in gated {
+        if !crate::log::changed(slot, block) {
+            continue;
+        }
+        match name {
+            // One `chg` entry for the two halves of a base, and the keys they
+            // land under are the ones `abreport` already reads.
+            "base" => {
+                object.insert("stationHp".into(), json!(station_hp));
+                object.insert("stationLvl".into(), json!(station_lvl));
+                chg.push("stationHp");
+            }
+            "enemyBase" => {
+                object.insert("enemyStationHp".into(), json!(enemy_station_hp));
+                object.insert("enemyStationLvl".into(), json!(enemy_station_lvl));
+                chg.push("enemyStationHp");
+            }
+            _ => {
+                object.insert(name.to_string(), block.clone());
+                chg.push(name);
+            }
+        }
+    }
+    if !chg.is_empty() {
+        object.insert("chg".to_string(), json!(chg));
+    }
+    crate::log::event("round", data);
     // Two actionable volley outcomes get their own record so a captured match
     // can be grepped for them directly instead of reconstructed from `round`.
     if !volley.rejected_towers().is_empty() || volley.no_robot_damage_round() {
