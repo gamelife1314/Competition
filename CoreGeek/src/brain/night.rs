@@ -15,6 +15,55 @@ const THREAT_RADIUS: i32 = 3;
 /// instead of holding its post (3 = the 30% the day rule heals at, so the two
 /// agree on what "critically wounded" means).
 pub const WITHDRAW_HEALTH_TENTHS: i64 = 3;
+/// Rounds without a robot inside the threat radius before a withdrawn
+/// controller is eligible to man a gun again (P1-4 hysteresis). Without the
+/// memory, a wounded controller re-enters the pairing the moment a robot steps
+/// out of the radius, walks back toward the gun, re-enters the radius and is
+/// withdrawn again — every round spent pacing is a round the gun does not fire
+/// (issues #22/#23: 30+ `controller_withdrawn` events with the tower silent in
+/// between).
+const WITHDRAW_HYSTERESIS_ROUNDS: i64 = 5;
+
+/// Refresh the withdrawal holdout set for this round (P1-4).
+///
+/// A controller enters the set when the withdrawal rule owns it (critically
+/// wounded, no Medicine, robots in reach). It leaves only on real evidence
+/// that it can hold a post again: healed back above the withdraw line
+/// (Medicine — the spare duty in `spare_night` is what delivers it), or the
+/// threat has been gone for [`WITHDRAW_HYSTERESIS_ROUNDS`] straight rounds.
+/// Holdout controllers are excluded from tower pairings and fall through to
+/// the spare duties — shelter and self-heal — which is exactly the loop that
+/// gets them back onto a gun. Timestamps carry across days, so a quiet day
+/// clears a stale holdout on the first night round.
+fn update_withdraw_holdout(turn: &Turn, state: &mut BotState) {
+    for role in turn.controllable() {
+        let threatened = turn
+            .robots
+            .iter()
+            .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= THREAT_RADIUS);
+        if threatened {
+            state.withdraw_last_threat.insert(role.id, turn.round_no);
+        }
+        if withdrawing(turn, role) {
+            state.withdraw_holdout.insert(role.id);
+        }
+        if state.withdraw_holdout.contains(&role.id) {
+            let max_hp = match role.kind {
+                UnitKind::Worker => 220,
+                UnitKind::Pioneer => 200,
+                _ => 0,
+            };
+            let recovered = max_hp > 0 && role.health * 10 >= max_hp * WITHDRAW_HEALTH_TENTHS;
+            let calm = match state.withdraw_last_threat.get(&role.id) {
+                Some(last) => turn.round_no - last >= WITHDRAW_HYSTERESIS_ROUNDS,
+                None => true,
+            };
+            if recovered || calm {
+                state.withdraw_holdout.remove(&role.id);
+            }
+        }
+    }
+}
 
 /// Is this controller one the night's withdrawal rule will pull off its gun?
 ///
@@ -64,6 +113,10 @@ pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
         .controllable()
         .into_iter()
         .filter(|role| !(state.task.active && role.kind == UnitKind::Pioneer))
+        // P1-4 hysteresis: a controller in withdrawal holdout mans nothing —
+        // it shelters and heals as a spare instead of pacing between the gun
+        // and the threat radius all night.
+        .filter(|role| !state.withdraw_holdout.contains(&role.id))
         .collect();
     let mut pairs: Vec<(i64, i64)> = Vec::new();
     for tower in towers {
@@ -119,7 +172,7 @@ pub fn stable_pairs(turn: &Turn, state: &mut BotState) -> Vec<(i64, i64)> {
     let mut withdrawing_ids: Vec<i64> = turn
         .controllable()
         .iter()
-        .filter(|role| withdrawing(turn, role))
+        .filter(|role| withdrawing(turn, role) || state.withdraw_holdout.contains(&role.id))
         .map(|role| role.id)
         .collect();
     withdrawing_ids.sort_unstable();
@@ -201,6 +254,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         );
         state.finish_task(false, "night_defense");
     }
+
+    // P1-4 hysteresis: settle who is in withdrawal holdout BEFORE pairing, so
+    // the pairing never hands a gun to a controller the withdrawal rule owns.
+    update_withdraw_holdout(turn, state);
 
     let mut pairs = stable_pairs(turn, state);
     // Fire the towers under the heaviest pressure first: they get first pick

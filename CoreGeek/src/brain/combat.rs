@@ -63,6 +63,17 @@ pub struct Weights {
     pub role_value: i64,
     pub tower_value: i64,
     pub wall_value: i64,
+    /// Sustained enemy-station pressure switch (P2-2): non-zero = a full-map
+    /// rocket, or any tower facing an already-damaged station, aims at the
+    /// station before ranked enemy assets. Default on: pk577297 won the half
+    /// by battering the station for 43 rounds, and a destroyed station ends
+    /// the half outright (任务书 ch.7).
+    pub station_focus: i64,
+    /// Kill-gap-driven funding switch (P1-1): non-zero = `intent_list`
+    /// reorders tonight's funding by [`firepower_gap`]; zero keeps the
+    /// committed fixed priorities. Default OFF so the dial proves itself in
+    /// A/B before it owns behaviour (Improve.kimi.md §7, P1-1 row).
+    pub clear_gap_drive: i64,
 }
 
 impl Default for Weights {
@@ -79,6 +90,8 @@ impl Default for Weights {
             role_value: 400,
             tower_value: 300,
             wall_value: 60,
+            station_focus: 1,
+            clear_gap_drive: 0,
         }
     }
 }
@@ -112,6 +125,8 @@ impl Weights {
         read("ROLE_VALUE", &mut weights.role_value);
         read("TOWER_VALUE", &mut weights.tower_value);
         read("WALL_VALUE", &mut weights.wall_value);
+        read("STATION_FOCUS", &mut weights.station_focus);
+        read("CLEAR_GAP", &mut weights.clear_gap_drive);
         weights
     }
 }
@@ -777,10 +792,109 @@ fn pad_targets(tower: &Unit, targets: &mut Vec<Pos>, projectiles: usize) {
     if tower.kind == UnitKind::Gatling && !within_cone(tower.pos, targets) {
         targets.truncate(1);
     }
+    // The judger wants EXACTLY `projectiles` targets — validate.rs drops the
+    // whole volley on a length mismatch, and a station footprint offers four
+    // cells, more than a level-1/2 volley may carry. Trimming here keeps the
+    // station volleys of `station_targets` legal instead of silently dropped.
+    targets.truncate(projectiles);
     while targets.len() < projectiles {
         let last = *targets.last().unwrap();
         targets.push(last);
     }
+}
+
+/// Full HP of a station at the given level (任务书 4.5.1). The protocol only
+/// carries CURRENT health, so "already damaged" must be derived from the
+/// level table — mirrors `wall_max_hp`.
+pub fn station_max_hp(level: i32) -> i64 {
+    match level.max(1).min(3) {
+        1 => 1500,
+        2 => 3000,
+        _ => 4500,
+    }
+}
+
+/// Sustained enemy-station pressure (P2-2). Two cases:
+///
+/// * a level-3 rocket, whose range is the whole map, can batter the station
+///   every cooldown cycle — pk577297 (issue #21) won the half exactly that
+///   way: 1490 damage over 43 rounds while the opponent's three guns cleared
+///   robots in the wrong half of the map;
+/// * any tower facing an already-damaged station finishes it, because a
+///   destroyed station ends the half outright (任务书 ch.7: 先被摧毁的一方判负),
+///   and station damage is permanent while operators revive in a day.
+///
+/// Ranked asset scoring (`enemy_unit_score`) still owns every other case:
+/// silencing a manned enemy tower is worth more than scratching a full-HP
+/// station nobody else is working on.
+pub fn station_focus_with(weights: &Weights, turn: &Turn, tower: &Unit, sim: &Sim) -> bool {
+    if weights.station_focus == 0 {
+        return false;
+    }
+    let Some(station) = turn
+        .enemy
+        .iter()
+        .find(|unit| unit.kind == UnitKind::Station && unit.alive())
+    else {
+        return false;
+    };
+    let hp = sim.building_hp(station);
+    if hp <= 0 {
+        return false;
+    }
+    if !station.footprint().iter().any(|cell| in_range(tower, *cell)) {
+        return false;
+    }
+    tower.range_of_attack() >= FULL_MAP_RANGE || hp < station_max_hp(station.level)
+}
+
+/// As [`station_focus_with`], against the active dial.
+pub fn station_focus(turn: &Turn, tower: &Unit, sim: &Sim) -> bool {
+    station_focus_with(weights(), turn, tower, sim)
+}
+
+/// Estimated total HP of tonight's robot wave (P1-1). Measured anchors from
+/// the issues: D1 = 70 smalls (issue #14), D2 = 90+ mixed (#8). Linear count
+/// model `50 + 20 × day` at a 45 HP blended average (smalls dominate; the
+/// middles and larges mixed in from D2 raise the mean above 40).
+pub fn estimated_wave_hp(day: i64) -> i64 {
+    (50 + 20 * day.max(1)) * 45
+}
+
+/// Damage our towers can theoretically put out across one 60-round night,
+/// assuming every tower is manned every round. The rocket's 3-round cooldown
+/// is amortised to a third of its volley; gatling bullets and railgun energy
+/// are per-round. This is the ceiling the wave estimate is compared against —
+/// the arithmetic of Improve.kimi.md §3.1: 2×L1 = 1200 < the D1 wave's 3150.
+pub fn night_fire_capacity(turn: &Turn) -> i64 {
+    turn.towers()
+        .iter()
+        .map(|tower| {
+            let level = tower.level.max(1) as i64;
+            let per_round = match tower.kind {
+                UnitKind::Gatling => 10 * level,
+                UnitKind::Railgun => {
+                    if tower.attack_power > 0 {
+                        tower.attack_power
+                    } else {
+                        10 * level
+                    }
+                }
+                UnitKind::Rocket => 20 * level / 3,
+                _ => 0,
+            };
+            per_round * 60
+        })
+        .sum()
+}
+
+/// Tonight's clear gap: positive means the wave out-HPs our guns and the
+/// difference lands on the wall ring and the base. The P1-1 funding order
+/// (`economy::intent_list` under `CG_TUNE_CLEAR_GAP`) keys on this: a gap
+/// forces firepower funding (third tower, weapon vouchers) before any
+/// station upgrade or harassment spend.
+pub fn firepower_gap(turn: &Turn) -> i64 {
+    estimated_wave_hp(turn.day) - night_fire_capacity(turn)
 }
 
 /// Cells of the enemy station, in range, padded out to `projectiles`, with the
@@ -823,6 +937,14 @@ fn choose_enemy_targets(
     sim: &mut Sim,
 ) -> Option<Vec<Pos>> {
     if station_killable(turn, sim) {
+        return station_targets(turn, tower, projectiles, sim);
+    }
+    // Sustained station pressure (P2-2): the wave is already covered — the
+    // caller's `spare_firepower` gate owns that ordering — and a volley into
+    // the enemy station is permanent progress toward the win condition, which
+    // outranks plinking operators. pk577297: 1490 damage in 43 rounds, half
+    // won while the opponent cleared robots on the wrong side of the map.
+    if station_focus(turn, tower, sim) {
         return station_targets(turn, tower, projectiles, sim);
     }
     let mut ranked: Vec<(i64, i64, Vec<Pos>)> = Vec::new(); // (score, id, reachable cells)

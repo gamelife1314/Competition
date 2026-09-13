@@ -20,6 +20,29 @@ const ALL_ITEMS: [&str; 6] = [
     "IronWhistle",
 ];
 
+/// Gold that must survive a treasure-item purchase (P2-1). The summon is a
+/// gamble — result code 3 consumes the sacrifice items for nothing — so it
+/// may never eat the night's medicine money. Ten gold is one Medicine.
+const TREASURE_GOLD_FLOOR: i64 = 10;
+
+/// Should the pioneer HOLD its current cell instead of falling through to
+/// loiter/retreat? Yes while it waits beside the altar for the opening day
+/// (P2-1). `plan_pioneer` returns no command for that wait — and every
+/// fall-through below it in `pioneer_day` (loiter at the task point, retreat
+/// inside the ring) walks the pioneer AWAY, so next round this walk drags it
+/// back: a two-step oscillation that can spend the whole opening window
+/// mid-commute, and that keeps the gate seal waiting on a role that is never
+/// home. Holding is one explicit predicate shared by the caller.
+pub fn holds_altar(turn: &Turn, state: &BotState, pioneer: &Unit) -> bool {
+    if !matches!(state.treasure.phase, TreasurePhase::HavePlan) {
+        return false;
+    }
+    let Some(plan) = &state.treasure.plan else {
+        return false;
+    };
+    turn.day < plan.open_day && chebyshev(pioneer.pos, plan.pos) <= 3
+}
+
 /// Consume a fresh `llmResp` addressed to the treasure hunt.
 pub fn on_llm_resp(state: &mut BotState, resp: &str, round_no: i64) {
     if !matches!(state.treasure.phase, TreasurePhase::AskedLlm { .. }) {
@@ -126,8 +149,12 @@ pub fn plan_pioneer(
     match state.treasure.phase.clone() {
         TreasurePhase::Done => None,
         TreasurePhase::Idle => {
-            // Ask the LLM once we have enough legends and spare budget.
-            let enough = state.treasure.legends.len() >= 2;
+            // Ask the LLM once we have enough legends and spare budget. Day 1
+            // is excluded (P2-1): the first day belongs to the wall ring and
+            // the towers, and a legend is still arriving every morning — an
+            // answer inferred from one more day of clues is an answer that
+            // does not burn 15-gold sacrifices on a wrong guess (code 3).
+            let enough = state.treasure.legends.len() >= 2 && turn.day >= 2;
             if enough && state.is_prompt_free() && plan.prompt.is_none() {
                 plan.prompt = Some(build_prompt(state));
                 state.consume_prompt_budget();
@@ -172,10 +199,14 @@ pub fn plan_pioneer(
                     .filter(|pos| turn.is_land(*pos))
                     .collect::<Vec<_>>();
                 if stand.iter().any(|pos| *pos == pioneer.pos) {
-                    // Buying one kind per round; gold is team-shared.
+                    // Buying one kind per round; gold is team-shared. The
+                    // purchase must leave the night's medicine money intact
+                    // (P2-1): a wrong sacrifice consumes the items for
+                    // nothing (result code 3), so the gamble is only taken
+                    // from surplus.
                     let (name, num) = &missing[0];
                     let price = turn.weapon_shop.get(name).copied().unwrap_or(15);
-                    if turn.gold >= price.saturating_mul(*num) {
+                    if turn.gold >= price.saturating_mul(*num) + TREASURE_GOLD_FLOOR {
                         return Some(RoleCommand::buy(name, *num));
                     }
                     return None; // wait for gold

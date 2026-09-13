@@ -9,8 +9,9 @@
 use serde_json::{json, Value};
 
 use coregeek::brain::combat::{
-    asset_damage_value, choose_attack, enemy_unit_score_with, init_sim, kill_score_value,
-    rounds_to_contact, spare_firepower, station_killable, urgency_value, weights, win_value,
+    asset_damage_value, choose_attack, enemy_unit_score_with, estimated_wave_hp, firepower_gap,
+    init_sim, kill_score_value, night_fire_capacity, rounds_to_contact, spare_firepower,
+    station_focus_with, station_killable, station_max_hp, urgency_value, weights, win_value,
     win_value_with, Weights,
 };
 use coregeek::model::{station_footprint, Turn, UnitKind};
@@ -519,5 +520,162 @@ fn the_dial_can_make_a_survivable_station_outrank_their_gun() {
         enemy_unit_score_with(&station_first, &turn, tower, station, &station_cells, &sim)
             > enemy_unit_score_with(&station_first, &turn, tower, gun, &gun_cells, &sim),
         "the dial makes the station the target"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-2: sustained enemy-station pressure
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_full_map_rocket_batters_the_station_when_the_wave_is_clear() {
+    // pk577297 (issue #21) won the half exactly this way: two guns, 43 rounds,
+    // 1490 damage into the enemy station while the opponent cleared robots on
+    // the wrong side of the map. With no robots on the board the spare-
+    // firepower gate is open, and a level-3 rocket's range is the whole map.
+    let turn = world(
+        vec![rocket(10040, 10, 24, 3, 0)],
+        vec![enemy(20001, "station", 30, 5, 1500)],
+        vec![],
+    );
+    let tower = turn.role_by_id(10040).unwrap();
+    let mut sim = init_sim(&turn);
+    assert!(station_focus_with(weights(), &turn, tower, &sim));
+    let targets = choose_attack(&turn, tower, &mut sim).expect("the volley exists");
+    let footprint = station_footprint(Pos { x: 30, y: 5 });
+    assert!(
+        targets.iter().all(|target| footprint.contains(target)),
+        "every missile lands on the station footprint {footprint:?}: {targets:?}"
+    );
+    assert_eq!(
+        targets.len(),
+        3,
+        "a level-3 volley is exactly three targets — the judger drops any \
+         other length (the pad_targets truncation fix)"
+    );
+}
+
+#[test]
+fn a_damaged_station_is_finished_by_any_tower_in_reach() {
+    // Not full-map, but the station is already hurt: damage is permanent and
+    // a destroyed station ends the half outright, so finishing outranks the
+    // ranked-asset order.
+    let turn = world(
+        vec![rocket(10040, 24, 8, 1, 10)],
+        vec![enemy(20001, "station", 30, 5, 1000)],
+        vec![],
+    );
+    let tower = turn.role_by_id(10040).unwrap();
+    let sim = init_sim(&turn);
+    assert!(
+        station_focus_with(weights(), &turn, tower, &sim),
+        "1000 < the level-1 max 1500: finish what somebody started"
+    );
+
+    // Undamaged, not full-map: the focus stays off and the ranked order owns.
+    let turn = world(
+        vec![rocket(10040, 24, 8, 1, 10)],
+        vec![enemy(20001, "station", 30, 5, 1500)],
+        vec![],
+    );
+    let tower = turn.role_by_id(10040).unwrap();
+    let sim = init_sim(&turn);
+    assert!(
+        !station_focus_with(weights(), &turn, tower, &sim),
+        "a full-HP station is chipped by ranked scoring, never by fiat"
+    );
+}
+
+#[test]
+fn the_station_focus_dial_turns_the_pressure_off() {
+    let turn = world(
+        vec![rocket(10040, 10, 24, 3, 0)],
+        vec![enemy(20001, "station", 30, 5, 1500)],
+        vec![],
+    );
+    let tower = turn.role_by_id(10040).unwrap();
+    let sim = init_sim(&turn);
+    let off = Weights {
+        station_focus: 0,
+        ..Weights::default()
+    };
+    assert!(
+        !station_focus_with(&off, &turn, tower, &sim),
+        "CG_TUNE_STATION_FOCUS=0 restores the pure ranked order"
+    );
+}
+
+#[test]
+fn station_max_hp_follows_the_level_table() {
+    assert_eq!(station_max_hp(1), 1500);
+    assert_eq!(station_max_hp(2), 3000);
+    assert_eq!(station_max_hp(3), 4500);
+    // Levels outside the table clamp, and a missing level field reads as 1.
+    assert_eq!(station_max_hp(0), 1500);
+}
+
+// ---------------------------------------------------------------------------
+// P1-1: the firepower gap estimate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_level_one_guns_cannot_clear_even_the_day_one_wave() {
+    // The arithmetic of Improve.kimi.md §3.1: 2×L1 = 20 damage/round = 1200
+    // over the night, against an estimated D1 wave of 3150 HP (70 smalls,
+    // issue #14). The gap is what forces firepower funding ahead of station
+    // upgrades when the dial is on.
+    let turn = world(
+        vec![gatling(10020, 10, 10, 1), rocket(10040, 12, 10, 1, 10)],
+        vec![],
+        vec![],
+    );
+    // roundNo 85 = day 1: wave estimate (50 + 20×1) × 45 = 3150.
+    assert_eq!(estimated_wave_hp(turn.day), 3150);
+    // gatling 10/round + rocket 20/3 per round → (10 + 6) × 60 = 960.
+    assert_eq!(night_fire_capacity(&turn), 960);
+    assert!(
+        firepower_gap(&turn) > 0,
+        "two L1 guns fall short of even the D1 wave — the D2–D3 night deaths"
+    );
+    let three_guns = world(
+        vec![
+            gatling(10020, 10, 10, 3),
+            gatling(10021, 11, 10, 3),
+            rocket(10040, 12, 10, 3, 10),
+        ],
+        vec![],
+        vec![],
+    );
+    assert!(
+        firepower_gap(&three_guns) < 0,
+        "three maxed guns clear the estimate with room to spare"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-4: the A/B dial covers the new switches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_dial_parses_the_new_switches_and_defaults_are_safe() {
+    // from_lookup takes the BARE field names; from_env adds the CG_TUNE_
+    // prefix, so the battle-time switches are CG_TUNE_STATION_FOCUS /
+    // CG_TUNE_CLEAR_GAP.
+    let flipped = Weights::from_lookup(|name| match name {
+        "STATION_FOCUS" => Some("0".to_string()),
+        "CLEAR_GAP" => Some("1".to_string()),
+        _ => None,
+    });
+    assert_eq!(flipped.station_focus, 0);
+    assert_eq!(flipped.clear_gap_drive, 1);
+
+    let defaults = Weights::from_lookup(|_| None);
+    assert_eq!(
+        defaults.station_focus, 1,
+        "station pressure ships on (pk577297 evidence)"
+    );
+    assert_eq!(
+        defaults.clear_gap_drive, 0,
+        "the funding reorder proves itself in A/B before it owns behaviour"
     );
 }
