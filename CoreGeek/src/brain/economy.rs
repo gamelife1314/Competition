@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 
+use crate::brain::coach::Harass;
 use crate::model::{chebyshev, Turn, Unit, UnitKind, ORES, STONE, WEAPON_BUILD_COST};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
@@ -352,9 +353,15 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
 
     // (Treasure sacrifice items are bought exclusively by the pioneer inside
     // treasure.rs — summonTreasure requires the items in the pioneer's pack.)
+    //
+    // The coach owns how hard we harass (brain/coach.rs): `Off` = the last
+    // summons bought nothing on the enemy side, `Rich` = they demonstrably bit.
+    // `Rhythm` is the shipped behaviour, so both gates below stay byte-for-byte
+    // what they were — the policy only widens or closes them.
+    let harass = state.coach.policy().harass;
     // Harassment: boss wave on the enemy, but only once our own defense
     // stands (all three towers) and we are rich.
-    if gold >= 500 && turn.towers().len() >= 3 && !state.harass_done_today {
+    if harass != Harass::Off && gold >= 500 && turn.towers().len() >= 3 && !state.harass_done_today {
         needs.push(Need {
             name: "BossRobotSummonOrder".into(),
             num: 1,
@@ -376,10 +383,11 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         .iter()
         .filter(|unit| unit.kind == UnitKind::Wall && unit.alive())
         .count();
-    if enemy_walls <= 3
+    if harass != Harass::Off
+        && enemy_walls <= harass.thin_wall_limit()
         && turn.towers().len() >= 3
         && gold >= 300
-        && stock_of(turn, "BossRobotSummonOrder") < 2
+        && stock_of(turn, "BossRobotSummonOrder") < harass.stock_cap()
         && !state.harass_done_today
     {
         needs.push(Need {
@@ -392,8 +400,14 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         });
     }
 
-    // P1-1: tonight's clear gap may reorder this list (dial-gated).
-    clear_gap_order(turn, &mut needs);
+    // P1-1: tonight's clear gap may reorder this list. The committed default is
+    // OFF; it is armed from outside either by the local A/B dial
+    // (`CG_TUNE_CLEAR_GAP=1`) or by the coach, which arms it itself the first
+    // night our station takes hits (brain/coach.rs — the dial was waiting on an
+    // A/B report the intranet workflow cannot run).
+    let gap_funding = crate::brain::combat::weights().clear_gap_drive != 0
+        || state.coach.policy().gap_funding;
+    clear_gap_order_with(gap_funding, turn, &mut needs);
     needs
 }
 
@@ -422,14 +436,6 @@ pub fn clear_gap_order_with(drive: bool, turn: &Turn, needs: &mut Vec<Need>) {
         }
     }
     needs.retain(|need| need.name != "BossRobotSummonOrder");
-}
-
-fn clear_gap_order(turn: &Turn, needs: &mut Vec<Need>) {
-    clear_gap_order_with(
-        crate::brain::combat::weights().clear_gap_drive != 0,
-        turn,
-        needs,
-    );
 }
 
 /// The affordable subset of `intent_list`, in purchase order.

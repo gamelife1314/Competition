@@ -292,6 +292,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         }
     }
     let mut sim = combat::init_sim(turn);
+    // Snapshot the coach's policy once: the tower loop below borrows `state`
+    // mutably (to report enemy fire back to the coach), and the stance must not
+    // change halfway through one round's firing sequence.
+    let coach_policy = state.coach.policy();
 
     for (controller_id, tower_id) in &pairs {
         let (Some(tower), Some(controller)) =
@@ -394,10 +398,17 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 idle_reason = "controller_healing";
                 plan.push(controller.id, cmd);
             } else if tower.cooldown == 0 {
-                if let Some((targets, kind)) = combat::choose_attack_kind(turn, tower, &mut sim) {
+                if let Some((targets, kind)) =
+                    combat::choose_attack_kind_with(&coach_policy, turn, tower, &mut sim)
+                {
                     targets_count = targets.len();
                     fired = true;
                     enemy_fire = kind == combat::TargetKind::EnemyAssets;
+                    if enemy_fire {
+                        // Tell the coach our own guns hit their buildings this
+                        // night: that damage is not evidence about the summons.
+                        state.coach.note_enemy_fire();
+                    }
                     plan.push(tower.id, RoleCommand::attack(controller.id, targets));
                 } else if !combat::spare_firepower(turn) {
                     // Robots hunting us are outside every ready tower's reach:

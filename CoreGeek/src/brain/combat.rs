@@ -380,6 +380,23 @@ pub fn choose_attack_kind(
     tower: &Unit,
     sim: &mut Sim,
 ) -> Option<(Vec<Pos>, TargetKind)> {
+    choose_attack_kind_with(&crate::brain::coach::Policy::committed(), turn, tower, sim)
+}
+
+/// As `choose_attack_kind`, against the adaptive policy the coach currently
+/// holds (`BotState::coach`). The committed policy reproduces the shipped
+/// behaviour bit for bit, so the plain entry point above is unchanged for every
+/// caller that has no coach to consult.
+///
+/// The two dials keep their meaning: `CG_TUNE_STATION_FOCUS=0` still pins the
+/// opportunistic station fire off (it is ANDed below), and
+/// `CG_TUNE_CLEAR_GAP` is untouched here (it lives in `economy::intent_list`).
+pub fn choose_attack_kind_with(
+    policy: &crate::brain::coach::Policy,
+    turn: &Turn,
+    tower: &Unit,
+    sim: &mut Sim,
+) -> Option<(Vec<Pos>, TargetKind)> {
     let projectiles = crate::model::tower_projectiles(tower.kind, tower.level.max(1)) as usize;
     if projectiles == 0 {
         return None;
@@ -416,7 +433,7 @@ pub fn choose_attack_kind(
     if !spare_firepower(turn) {
         return None;
     }
-    let targets = choose_enemy_targets(turn, tower, projectiles, sim);
+    let targets = choose_enemy_targets_with(policy, turn, tower, projectiles, sim);
     targets.map(|targets| {
         sim.fired.insert(tower.id);
         (targets, TargetKind::EnemyAssets)
@@ -930,7 +947,14 @@ fn station_targets(
 /// the best one, and any projectiles still unspent move down the ranking.
 /// Damage is reserved in `sim` as it is committed, so a later tower never
 /// re-kills a building this one already finished.
-fn choose_enemy_targets(
+///
+/// The sustained-pressure branch (P2-2) is
+/// gated by the coach's `station_pressure` switch: when our own station is the
+/// one taking hits, the guns come home instead of plinking their base.
+/// `station_killable` is NOT gated — a station that dies this round ends the
+/// half, and that is a rule, not a preference.
+fn choose_enemy_targets_with(
+    policy: &crate::brain::coach::Policy,
     turn: &Turn,
     tower: &Unit,
     projectiles: usize,
@@ -944,12 +968,21 @@ fn choose_enemy_targets(
     // the enemy station is permanent progress toward the win condition, which
     // outranks plinking operators. pk577297: 1490 damage in 43 rounds, half
     // won while the opponent cleared robots on the wrong side of the map.
-    if station_focus(turn, tower, sim) {
+    if policy.station_pressure && station_focus(turn, tower, sim) {
         return station_targets(turn, tower, projectiles, sim);
     }
     let mut ranked: Vec<(i64, i64, Vec<Pos>)> = Vec::new(); // (score, id, reachable cells)
     for unit in turn.enemy.iter().filter(|unit| unit.alive()) {
         if sim.building_hp(unit) <= 0 {
+            continue;
+        }
+        // The coach pulled the campaign off their base (our own station is the
+        // one bleeding): skip it here too, or "收火" would only demote it from
+        // first place to whatever the ranked order still gives a full-HP
+        // station. A station we can actually destroy this round never reaches
+        // this loop — `station_killable` above already took that shot, and that
+        // is a rule of the game, not a preference of ours.
+        if !policy.station_pressure && unit.kind == UnitKind::Station {
             continue;
         }
         let cells: Vec<Pos> = unit

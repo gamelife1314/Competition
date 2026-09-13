@@ -1,5 +1,6 @@
 //! Decision entry point and shared helpers.
 
+pub mod coach;
 pub mod combat;
 pub mod day;
 pub mod economy;
@@ -276,6 +277,13 @@ fn log_round(
                 "phase": format!("{:?}", state.treasure.phase),
                 "legends": state.treasure.legends.len(),
                 "summons": state.treasure.summon_attempts,
+            },
+            // 内置教练当前档位：让分析侧能把结果与"当时是哪一档"对上，
+            // 不必等一个跑不起来的 A/B（WORKFLOW_REQUEST 请求七）。
+            "policy": {
+                "stationPressure": state.coach.policy().station_pressure,
+                "gapFunding": state.coach.policy().gap_funding,
+                "harass": state.coach.policy().harass.as_str(),
             },
             "ms": started.elapsed().as_micros() as f64 / 1000.0,
         }),

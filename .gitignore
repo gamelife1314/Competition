@@ -4,3 +4,8 @@
 # repository root (where the workspace manifest lives) writes here; the crate's
 # own default remains `CoreGeek/target` (see CoreGeek/run.sh).
 /target
+
+# Adaptive coach state (brain/coach.rs): written at half-time / on every dial
+# move, read back at startup. Per-process learning scratch — never committed.
+coregeek_learn.json
+coregeek_learn.json.tmp

@@ -44,6 +44,15 @@ fn main() {
             "codegen_units": 1,
         }),
     );
+    // Adaptive coach: load what the previous battle taught us (best effort —
+    // a missing or unreadable file is simply a fresh coach) and let this battle
+    // write its own half-time summary back. See `brain::coach`.
+    coregeek::brain::coach::install();
+    // One guard, one statement: `BotState::locked()` hands out a `MutexGuard` and
+    // the global mutex is not reentrant, so a second `locked()` inside this same
+    // expression would deadlock the process before it ever serves a request.
+    let ready = coregeek::state::BotState::locked().coach.ready_json();
+    coregeek::log::event("coach_ready", ready);
     let local_set = tokio::task::LocalSet::new();
     rt.block_on(local_set.run_until(coregeek::server::serve(listener)));
 }

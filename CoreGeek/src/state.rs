@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use crate::brain::coach::Coach;
 use crate::brain::news;
 use crate::model::Turn;
 use crate::protocol::Pos;
@@ -361,6 +362,10 @@ pub struct BotState {
     /// Running estimate of earned kill score, used to split the total into
     /// kill / survival / residual (task) components.
     pub cum_kill_score: i64,
+
+    /// 内置教练（`brain::coach`）：不靠环境变量、不靠外部 workflow，从局势里读出
+    /// 证据自己移动三个策略开关。它随半场一起活着（见 `observe` 的重置分支）。
+    pub coach: Coach,
 }
 
 impl BotState {
@@ -384,8 +389,14 @@ impl BotState {
                 serde_json::json!({"fromRound": self.last_round, "toRound": turn.round_no}),
             );
             let task_session_seq = self.task_session_seq;
+            // The coach is the one piece of memory that MUST survive the wipe:
+            // what the last half taught it is exactly what the next half should
+            // start from (evidence decays by half inside `end_half`).
+            let mut coach = std::mem::take(&mut self.coach);
             *self = BotState::default();
             self.task_session_seq = task_session_seq;
+            coach.end_half(turn.day, turn.round_no);
+            self.coach = coach;
         }
         // Day rollover: reset daily budgets.
         if turn.day != self.current_day {
@@ -421,6 +432,20 @@ impl BotState {
         self.absorb_llm_and_cmd(turn);
         self.absorb_task_events(turn);
         self.absorb_treasure_events(turn);
+
+        // Adaptive coach: reads the situation (both sides' station/wall HP, the
+        // night's firepower gap, how many summon orders went out today) and
+        // moves its own switches. Runs last so it sees the same numbers the
+        // planners are about to.
+        let orders_today = self.summon_orders_today;
+        self.coach.observe(turn, orders_today);
+    }
+
+    /// Install the process-level coach (called once from `main.rs`; see
+    /// `brain::coach::install`). Tests never call it, so `BotState::default()`
+    /// stays pure in-memory and hermetic.
+    pub fn install_coach(coach: Coach) {
+        Self::locked().coach = coach;
     }
 
     fn absorb_news(&mut self, turn: &Turn) {

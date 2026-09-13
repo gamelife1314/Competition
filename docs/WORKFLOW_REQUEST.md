@@ -2,9 +2,11 @@
 
 > 载体：本文档 + git commit message（`git log` 可见完整请求）。
 > 目标读者：驱动自动对战、下载日志、分析对局、生成「改进任务」issue 的内部 code agent / workflow。
-> 版本：v6（本文档为唯一入口，取代原 `AGENT_REQUEST.md`）。
-> v6 增量：请求六（任务健康度口径）、请求七（A/B 拨盘对战）、事件表更新（本轮新增事件）、
-> 请求四备注（`errorDescs` 已由我方日志自带）。
+> 版本：v7（本文档为唯一入口，取代原 `AGENT_REQUEST.md`）。
+> v7 增量：**请求七改为「对战结果回执」**——原 A/B 拨盘实验（要求 workflow 设置
+> `CG_TUNE_*` 环境变量）作废，因为内网 workflow 无法设置环境变量；策略自适应已改为
+> **决策器内置的在线教练**，不依赖任何外部对照组。请求五事件表补充教练事件与
+> `round.policy` 字段。
 
 ---
 
@@ -146,6 +148,13 @@
 | `door_reseal` / `wall_gate_*` | 门切开/黄昏重封/墙门封合 |
 | `robotEvents` | 机器人出生（id + spawnHp） |
 | `wall` | 墙数量与总血量变化 |
+| `coach_ready` | 进程启动时教练的初始档位与已学半场数（`policy` / `halvesLearned`） |
+| `coach_night` | 每夜结算：双方基地/围墙损失、我方火力是否污染归因、火力缺口估计、档位、证据计数 |
+| `coach_move` | **教练移动了一个开关**：`switch` / `from` / `to` / `why` / `night` / `evidence`（分析的重点事件） |
+| `coach_half` | 半场结束：强制结算最后一夜、证据衰减一半、写盘 |
+
+此外 `round` 事件自带 `policy` 字段（`stationPressure` / `gapFunding` / `harass`），
+逐回合记录**当时是哪一档**，分析时不必去猜档位切换的时刻。
 
 ---
 
@@ -168,18 +177,78 @@
 
 ---
 
-## 请求七：A/B 拨盘对战实验
+## 请求七：对战结果回执（**取代**原 A/B 拨盘实验）
 
-自本版本对应 commit 起，决策器内置 `CG_TUNE_*` 环境变量拨盘（进程启动时读取，
-默认行为与当前 commit 完全一致）。请按 A/B 方式发起对战，验证以下假设：
+> **原请求七作废。** 上一版请你们用 `CG_TUNE_*` 环境变量发起 A/B 对战——**内网
+> workflow 无法设置环境变量**，这个请求从一开始就跑不起来。策略选择不该外包给一个
+> 跑不起来的实验，所以自本版本对应 commit 起，**决策器内置在线教练**
+> （`CoreGeek/src/brain/coach.rs`）：它在进程内部自己读局势、自己移动开关、自己
+> 记住跨场结论，**不需要任何环境变量、不需要对照组、不需要你们做任何额外操作**。
 
-| 实验 | 环境变量 | A 组（默认） | B 组 | 观察指标（`round.scoreAttr`） |
-|---|---|---|---|---|
-| 清怪缺口驱动资金排序 | `CG_TUNE_CLEAR_GAP` | `0` | `1` | kill / survival / residual 三项与基地存活天数 |
-| 敌基地持续压制 | `CG_TUNE_STATION_FOCUS` | `1` | `0` | `volley.enemyStationHp` 下降速度、先拆胜场数 |
+教练能看见的只有**场内量**：双方基地与围墙血量、我方当日召唤令计数、黄昏时的火力
+缺口估计、我方炮塔是否朝对方建筑开过火。它按"证据 → 移动一个开关 → 反证据 → 移回来"
+闭环工作，每夜结算一次，每次移动都打一条 `coach_move` 日志（含 `switch`/`from`/`to`/
+`why`/`evidence`）。
 
-**要求**：每组至少 5 场（请求二）、多对手、issue 中给出**分项得分对比**（不止总分），
-并标注每场使用的拨盘值（配合请求三的 base commit 字段）。
+它看不见的是**结果**：这局谁赢了、总分多少、分项得分如何。请把这块补上。
+
+### 请在每场对战后提供一条结果回执（JSON，一行）
+
+```json
+{
+  "match_id": "pk577716",
+  "base_commit": "b03b1c8",
+  "opponent": "teamB_4388_道化黄泉路",
+  "result": "win",
+  "rounds": 256,
+  "score": {"ours": 139, "enemy": 52},
+  "score_breakdown": {
+    "ours":  {"task": 91, "kill": 8, "survival": 40},
+    "enemy": {"task": 0,  "kill": 52, "survival": 0}
+  },
+  "station_down_day": {"ours": null, "enemy": 2},
+  "coach": {
+    "halves": 2,
+    "moves": [
+      {"round": 262, "day": 3, "switch": "harass", "from": "Rhythm", "to": "Off", "why": "summons_sterile"},
+      {"round": 391, "day": 4, "switch": "station_pressure", "from": "false", "to": "true", "why": "two_quiet_nights"}
+    ]
+  }
+}
+```
+
+字段说明：
+
+| 字段 | 含义 | 数据源 |
+|---|---|---|
+| `result` | `win` / `loss` / `draw` / `unknown` | 判题器结果（**我们看不到**） |
+| `score` / `score_breakdown` | 双方总分与 task/kill/survival 分项 | 同上（**我们看不到**） |
+| `station_down_day` | 基地被打掉的第几天，没掉填 `null` | 同上（**我们看不到**） |
+| `coach` | `coach_half` 的 `halves` + 全部 `coach_move` 事件（`round`/`day`/`switch`/`from`/`to`/`why`） | 我方 JSONL 直接提取（请求四） |
+
+### 请在 issue 头部给一行汇总
+
+```
+教练：本批次 N 场 | 移动 M 次（station_pressure a / gap_funding b / harass c）
+      | 至少移动过一次的场次 X / N | 结果分布（胜/负/平）
+```
+
+### 为什么这是现在最值钱的信息
+
+教练的证据全是**相对量**（我方掉了多少血、对方掉了多少血、令花出去对方有没有掉血）。
+它能判断"该不该收火"、"该不该继续买令"，但**无法判断**这些调整最终换来了什么。
+把胜负与分项得分按 `base_commit` + `match_id` 回执回来，才能回答：
+
+1. 收火档（`stationPressure=false`）赢的那些场，是不是靠少挨打、活到最后的
+   `survival` 分赢的？
+2. 加码档（`harass=Rich`）在哪些对手身上有效（令确实啃动了对方），在哪些对手身上
+   是白花钱？
+3. 教练每次移动**之后**的胜率是升是降——这是唯一能证伪"教练越学越好"这个假设的证据。
+4. 哪些 `why` 出现得最频繁（`our_station_bleeding` / `summons_sterile` / …），
+   说明当前承诺档在哪一类局面上系统性地不合适。
+
+**要求**：回执与请求三的 `base_commit` 对齐（同一 commit 的回执才可横向比较）；
+每场一条，不要只给汇总。
 
 ---
 
@@ -190,7 +259,7 @@ agent_request:
   target: workflow-driver
   repo: gamelife1314/Competition
   action: improve_workflow
-  version: 6
+  version: 7
   changes:
     - id: issue_header_stats
       desc: extend improvement-issue header with cumulative stats
@@ -232,12 +301,33 @@ agent_request:
         - {name: submission_rate, source: "task_answer_submit events / task.submittedRound", target: ">= 80% of sessions"}
         - {name: avg_pass_rate,   source: "scoreAttr.residual attribution"}
         - {name: true_zero_sessions, definition: "sessions with NO submission (cmdRounds=0 or no task_answer_submit)"}
-    - id: ab_dial_experiments
-      desc: run A/B battles with CG_TUNE_* env overrides
-      experiments:
-        - {env: CG_TUNE_CLEAR_GAP, a: "0", b: "1", watch: "scoreAttr kill/survival/residual + station survival days"}
-        - {env: CG_TUNE_STATION_FOCUS, a: "1", b: "0", watch: "volley.enemyStationHp drop speed, first-kill wins"}
-      requirements: ">= 5 battles per group, multiple opponents, per-objective score breakdown in the issue, dial value recorded per battle"
+    - id: battle_outcome_receipt
+      desc: per-battle machine-readable outcome receipt (REPLACES ab_dial_experiments)
+      supersedes: ab_dial_experiments
+      why: >
+        The intranet workflow cannot set environment variables, so the CG_TUNE_* A/B
+        request was unactionable. The bot now self-tunes in-process (brain::coach) and
+        needs no external control group. What it cannot observe from inside is the
+        OUTCOME: the winner, both totals, and the per-objective split.
+      include_coach:
+        source: our JSONL
+        fields: [coach_half.halves, "every coach_move: round/day/switch/from/to/why"]
+      per_battle:
+        - {name: match_id,         example: "pk577716"}
+        - {name: base_commit,      example: "b03b1c8"}
+        - {name: opponent,         example: "teamB_4388_道化黄泉路"}
+        - {name: result,           values: [win, loss, draw, unknown]}
+        - {name: score,            example: {"ours": 139, "enemy": 52}}
+        - {name: score_breakdown,  example: {"ours": {"task": 91, "kill": 8, "survival": 40}}}
+        - {name: station_down_day, example: {"ours": null, "enemy": 2}}
+      issue_header_line: >
+        coach: N battles | M moves (station_pressure a / gap_funding b / harass c) |
+        battles with >=1 move X / N | result distribution
+      requirements: "one receipt per battle (not just an aggregate), aligned with battle_base_commit, per-objective breakdown"
+    - id: coach_event_table
+      desc: our new coach_* log events + round.policy (see the event table in 请求五)
+      events: [coach_ready, coach_night, coach_move, coach_half]
+      note: round.* now carries a `policy` object each round, so the active dial is known per round
 ```
 
 ---
@@ -258,6 +348,22 @@ Please improve the battle workflow in five ways:
    currently discards it.
 5. **Log requirements feedback** — tell us what your analysis is missing, what
    new events/fields you want, and which existing events are noise.
+
+Change in v7 (please read request 七):
+
+* The old **A/B dial experiment is withdrawn** — the intranet workflow cannot set
+  environment variables, so `CG_TUNE_*` could never be exercised. The bot now
+  carries an **in-process adaptive coach** (`brain::coach`) that reads the board,
+  moves one of three existing switches on causal evidence, and logs every move as
+  a `coach_move` event. It needs nothing from you.
+* What it *cannot* see from inside is the **outcome**. So instead of an A/B, we ask
+  for a **per-battle outcome receipt**: match_id, base_commit, opponent, result,
+  both totals, the task/kill/survival split, which day each base fell, plus the
+  `coach_move` events extracted from our JSONL. One JSON object per battle.
+* Please also add a one-line coach summary to the issue header (battles, moves by
+  switch, share of battles that moved a dial, result distribution) and pick up the
+  new `coach_ready` / `coach_night` / `coach_move` / `coach_half` events and the
+  per-round `round.policy` field.
 
 ---
 
