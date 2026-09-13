@@ -112,6 +112,39 @@ issue 里没有说明这次对战用的是哪个版本的代码。
 
 ---
 
+## 请求四：日志系统持续优化（双向对齐）
+
+### 我们的承诺
+
+我们会**持续优化日志系统**，让 stdout 输出的 JSONL 事件日志尽可能包含分析所需信息，
+包括但不限于：回合决策上下文、武器并射结果核对、得分分项归因、任务状态机边沿、
+经济意图与结果、机器人出生/死亡、墙环血量变化。
+
+### 请 workflow 告诉我们
+
+为了对齐，请在 issue 或单独回复中明确列出：
+
+1. **当前分析时最缺哪类信息**（哪些字段/事件拿不到，导致只能猜测）
+2. **希望新增的事件名称与字段**（建议给出 JSON 示例）
+3. **哪些现有日志是噪音**（可以砍掉，降低体积与干扰）
+
+有明确清当后，我们就能在下一轮直接补齐，而不是反复猜测 workflow 需要什么。
+
+### 参考：当前已输出的事件
+
+| 事件 | 用途 |
+|---|---|
+| `round` | 每回合完整状态（含 cmds / failures / score / scoreAttr / scoreDelta） |
+| `night_debug` | 夜间控制器–炮塔配对、距离、冷却、是否开火 |
+| `volley` | 齐射结果核对（fired/executed/damaged/kills/rejected） |
+| `task_*` | 任务接取/开始/提交/结束、session、阶段 |
+| `shopping` / `buy` | 采购意图、价格、可负担性、买家距离 |
+| `tower_plan` / `build_blacklisted` | 建造计划与失败黑名单 |
+| `robotEvents` | 机器人出生（id + spawnHp） |
+| `wall` | 墙数量与总血量变化 |
+
+---
+
 ## 四项请求汇总（机器可读）
 
 ```yaml
@@ -119,7 +152,7 @@ agent_request:
   target: workflow-driver
   repo: gamelife1314/Competition
   action: improve_workflow
-  version: 3
+  version: 4
   changes:
     - id: issue_header_stats
       desc: extend improvement-issue header with cumulative stats
@@ -140,11 +173,18 @@ agent_request:
         - {name: battle_base_commit, desc: "git commit hash + time used to launch the battle", example: "b03b1c8 (2026-09-13 08:30)"}
       per_battle: true
       placement: after "生成时间" line
+    - id: log_requirements_feedback
+      desc: tell us which log fields/events the analysis needs
+      request: >
+        List (a) which information is currently missing and forces guesswork,
+        (b) desired new event names and fields (with a JSON example),
+        (c) which existing events are noise and can be dropped.
+      note: we commit to continuously improving the JSONL stdout log
 ```
 
 ## English summary
 
-Please improve the battle workflow in three ways:
+Please improve the battle workflow in four ways:
 
 1. **Issue header stats** — extend the auto-generated improvement-issue header
    with cumulative battle statistics: current rank, cumulative wins, losses,
@@ -161,6 +201,13 @@ Please improve the battle workflow in three ways:
    reported bug may already be fixed, and the log cannot be reproduced without
    checking out the exact revision. With the base commit we can check out that
    revision to reproduce, and correlate commits against win-rate changes.
+4. **Log requirements feedback** — we commit to continuously improving our
+   logging system so that the stdout JSONL events carry what the analysis
+   needs. In return, please tell us: (a) which information is currently
+   missing and forces guesswork, (b) the new event names and fields you want,
+   with a JSON example, and (c) which existing events are noise and can be
+   dropped. With an explicit list we can fill the gap in the next round
+   instead of guessing what the workflow needs.
 
 ---
 
