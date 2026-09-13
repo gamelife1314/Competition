@@ -577,9 +577,17 @@ fn worker_day(
         }
     }
     // 7. Shopping (dedicated buyer) — upgrades come after survival. When
-    //    nothing is affordable YET the buyer still sets off once a deadline is
-    //    within one trip, so the purchase lands the round the gold does.
-    if buyer_id == Some(role.id) {
+    //    nothing is affordable YET the buyer still sets off once the ore in its
+    //    pack covers the price, so the purchase lands the round the sale does.
+    //
+    //    The sale comes first. This branch outranks step 9, so a buyer sent to
+    //    the shop with an unsold pack never got to sell it: the shop refused
+    //    the purchase (it is paid in gold, not ore), the pack rode back to the
+    //    mine, and the round trip was spent twice over. A role with something
+    //    to sell sells it and shops next round — the gold in hand is what
+    //    `budget.shopping` is computed from, so this is also the only order in
+    //    which the purchase can happen at all.
+    if buyer_id == Some(role.id) && !economy::should_sell(turn, state, role, stone_demand) {
         if !budget.shopping.is_empty() {
             if let Some(cmd) = buyer_flow(turn, role, &budget.shopping, claimed) {
                 plan.push(role.id, cmd);
@@ -593,9 +601,10 @@ fn worker_day(
         }
     }
     // 7b. Personal Medicine: only its carrier can drink it, so this is a
-    //     per-role errand and never a detour — it fires only while already
-    //     standing at the shop, after the team list has had its turn.
-    if let Some(cmd) = self_provision(turn, role) {
+    //     per-role errand, after the team list has had its turn. For a
+    //     critically wounded role it is the recovery path, and the walk is
+    //     part of it.
+    if let Some(cmd) = self_provision(turn, role, claimed, true) {
         plan.push(role.id, cmd);
         return;
     }
@@ -792,8 +801,11 @@ fn pioneer_day(
         plan.push(pioneer.id, cmd);
         return;
     }
-    // 5b. Personal Medicine while already at the shop (no detour).
-    if let Some(cmd) = self_provision(turn, pioneer) {
+    // 5b. Personal Medicine: while already at the shop (no detour), and — for a
+    //     pioneer below the night withdrawal threshold, which is otherwise
+    //     stuck at that health forever — the walk there too, but only before
+    //     the dusk recall. After it the pioneer belongs at its gun.
+    if let Some(cmd) = self_provision(turn, pioneer, claimed, !recalled) {
         plan.push(pioneer.id, cmd);
         return;
     }
@@ -968,11 +980,28 @@ fn max_hp(role: &Unit) -> Option<i64> {
     }
 }
 
-/// Buy a Medicine for THIS role when it is already standing at the shop and is
-/// either hurt or close to the first night. Medicine cannot be handed to a
-/// team-mate, so a team-level purchase only ever equips the buyer — this is
-/// the errand that equips everyone else, and it never costs a detour.
-fn self_provision(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
+/// Buy a Medicine for THIS role. Medicine cannot be handed to a team-mate, so
+/// a team-level purchase only ever equips the buyer — this is the errand that
+/// equips everyone else, and for a role already at the shop it never costs a
+/// detour.
+///
+/// A critically wounded role walks there. That is the whole recovery path, and
+/// issue #22 measured what its absence costs: 20012 came out of the first night
+/// at 20 HP, and because nothing in the game restores health except a Medicine
+/// the wound never healed — HP frozen for 235 rounds, `night_withdraw` pulling
+/// it off tower 20020 every night it was threatened, the gun silent behind it
+/// and the withdrawn controller with no errand that could ever change its
+/// state. A controller below the night withdrawal threshold has already lost
+/// its gun; walking to the shop is the only action left that can give it back,
+/// so unlike the pre-night top-up this errand is worth the trip. It still obeys
+/// the hard dusk lock-in above (step 4 runs first), so a Medicine run can never
+/// cost a manned tower.
+fn self_provision(
+    turn: &Turn,
+    role: &Unit,
+    claimed: &mut HashSet<Pos>,
+    may_travel: bool,
+) -> Option<RoleCommand> {
     if role.count_item("Medicine") > 0 {
         return None;
     }
@@ -990,10 +1019,22 @@ fn self_provision(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
     if price <= 0 || price == i64::MAX || turn.gold < price {
         return None;
     }
-    if !at_shop(turn, role.pos) {
+    if at_shop(turn, role.pos) {
+        return Some(RoleCommand::buy("Medicine", 1));
+    }
+    // Below the night withdrawal threshold the role has nothing else to lose:
+    // a potion is the only way back onto its gun. Above it the shop trip is not
+    // worth abandoning the day's errand for, so the purchase waits until the
+    // role happens to be there (the buyer, or the pre-night top-up above).
+    let critical = role.health * 10 < max_hp * crate::brain::night::WITHDRAW_HEALTH_TENTHS;
+    if !critical || !may_travel {
         return None;
     }
-    Some(RoleCommand::buy("Medicine", 1))
+    crate::log::event(
+        "medicine_errand",
+        serde_json::json!({"round": turn.round_no, "role": role.id, "health": role.health}),
+    );
+    walk_to_shop(turn, role, claimed)
 }
 
 fn at_shop(turn: &Turn, pos: Pos) -> bool {

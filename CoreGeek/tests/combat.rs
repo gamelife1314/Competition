@@ -1000,6 +1000,207 @@ fn a_wounded_controller_with_nobody_nearby_is_still_recalled() {
 }
 
 #[test]
+fn a_gun_goes_to_a_controller_that_can_hold_it() {
+    // Issue #22's P1: 20012 came out of D1 night at 20 HP and never healed —
+    // nothing in the game restores health except a Medicine — so every night it
+    // was threatened `night_withdraw` pulled it off tower 20020, the gun stayed
+    // silent behind it, and the pairing held for 235 rounds while
+    // `controller_withdrawn` fired 35 times. A fit controller standing one cell
+    // away is the whole fix: pair the gun with the controller that can man it.
+    let turn = turn_from(world_zones(
+        vec![
+            station(20, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker_hp_items(10010, 11, 10, 20, vec![]), // 9%, nothing to heal with
+            worker(10011, 9, 10),                       // fit, same distance
+        ],
+        vec![robot(30001, 11, 9, 40, "challenger")],
+        vec![],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::night::plan(&turn, &mut state);
+    let fired = plan.commands.get(&10020).expect("the gun still fires");
+    assert_eq!(fired.action, "attack");
+    assert_eq!(
+        fired.controllerId.as_deref(),
+        Some("10011"),
+        "the fit controller mans the gun the wounded one cannot"
+    );
+    let wounded = plan.commands.get(&10010).expect("the wounded role acts");
+    assert!(
+        !(wounded.action == "attack"),
+        "the wounded controller is a spare this round, not a gunner"
+    );
+}
+
+#[test]
+fn a_wounded_controller_is_still_paired_when_nobody_else_can_reach_the_gun() {
+    // The preference is a preference, not a veto. One gun, one controller, and
+    // that controller is bleeding: an unmanned tower is still the worse defect,
+    // so the wounded one keeps the pairing and the ordinary withdrawal rule
+    // decides what it does with it.
+    let turn = turn_from(world_zones(
+        vec![
+            station(20, 20, 1),
+            gatling(10020, 10, 10, 1),
+            worker_hp_items(10010, 11, 10, 20, vec![]),
+        ],
+        vec![],
+        vec![],
+    ));
+    let mut state = BotState::default();
+    let pairs = coregeek::brain::night::stable_pairs(&turn, &mut state);
+    assert_eq!(
+        pairs,
+        vec![(10010, 10020)],
+        "with no one else to take the gun, the wounded controller keeps it"
+    );
+}
+
+#[test]
+fn a_wounded_controller_is_handed_back_its_gun_once_it_is_fit_again() {
+    // The pairing cache keys on who is too wounded to hold a gun, so the swap
+    // is not a one-way door: when the potion lands and the wound clears, the
+    // nearest fit controller is the wounded one again, and it gets its post
+    // back in the next round rather than at the next day rollover.
+    let armed = |hp: i64| {
+        turn_from(world_zones(
+            vec![
+                station(20, 20, 1),
+                gatling(10020, 10, 10, 1),
+                worker_hp_items(10010, 11, 10, hp, vec![]),
+                worker(10011, 9, 10),
+            ],
+            vec![robot(30001, 11, 9, 40, "challenger")],
+            vec![],
+        ))
+    };
+    let mut state = BotState::default();
+    let bleeding = armed(20);
+    assert!(
+        coregeek::brain::night::stable_pairs(&bleeding, &mut state).contains(&(10011, 10020)),
+        "the fit controller takes the gun while the wound is untreated"
+    );
+    let healed = armed(220);
+    assert!(
+        coregeek::brain::night::stable_pairs(&healed, &mut state).contains(&(10010, 10020)),
+        "and the nearer controller takes it back once it is fit"
+    );
+}
+
+#[test]
+fn a_critically_wounded_worker_walks_to_the_shop_for_the_only_cure() {
+    // Issue #22's "撤退后无恢复路径": 20012 survived D1 night at 20 HP and stayed
+    // there for 235 rounds. Nothing but a Medicine restores health, and the old
+    // errand only fired for a role that already happened to be standing at the
+    // shop — so a wounded controller could never leave the state that kept it
+    // off its gun. Below the night withdrawal threshold the walk is the cure.
+    let wounded = |hp: i64| {
+        turn_from(day_world_at(
+            day_round(5),
+            vec![
+                station(10, 20, 1),
+                // All three weapon slots are filled, so no gold is competing
+                // for a build site: the only question left is the errand.
+                gatling(10020, 10, 10, 1),
+                railgun(10030, 12, 10, 1),
+                rocket(10040, 10, 12, 1),
+                worker_hp_items(10010, 30, 30, hp, vec![]),
+                worker(10011, 28, 30), // the last worker is the buyer
+            ],
+            100,
+            vec![
+                voucher("Medicine", 20),
+                voucher("WeaponUpgradeVoucher1", 100),
+            ],
+            vec![zone(0, 0, "weaponShop"), zone(30, 31, "copper")],
+        ))
+    };
+    let state = || BotState::default();
+    let hurt = wounded(20);
+    let cmd = {
+        let mut state = state();
+        let plan = coregeek::brain::day::plan(&hurt, &mut state);
+        plan.commands.get(&10010).cloned()
+    }
+    .expect("the wounded worker acts");
+    assert_eq!(cmd.action, "move", "it sets off for the shop");
+    let destination = cmd
+        .targetPos
+        .as_ref()
+        .and_then(|targets| targets.first())
+        .copied()
+        .expect("a move carries a destination");
+    assert!(
+        coregeek::model::chebyshev(destination, Pos { x: 0, y: 0 })
+            < coregeek::model::chebyshev(Pos { x: 30, y: 30 }, Pos { x: 0, y: 0 }),
+        "and the step is toward the shop, not the mine under its feet"
+    );
+
+    // Above the threshold the same hurt worker stays on the day's errand: the
+    // shop trip is only worth abandoning everything for when the role has
+    // already lost its gun.
+    let scratched = wounded(150);
+    let cmd = {
+        let mut state = state();
+        let plan = coregeek::brain::day::plan(&scratched, &mut state);
+        plan.commands.get(&10010).cloned()
+    }
+    .expect("the hurt worker acts");
+    assert_ne!(
+        cmd.action, "move",
+        "a scratch is not worth a cross-map walk when the mine is right there"
+    );
+}
+
+#[test]
+fn the_buyer_sells_its_pack_before_it_walks_to_the_shop() {
+    // The buyer's shop trip outranks the sale, so a buyer that set off with an
+    // unsold pack never got to sell it: the shop is paid in gold, the purchase
+    // was refused, and the pack rode back to the mine. Issue #22's wallet froze
+    // that way. The sale comes first; the shop trip happens next round, with
+    // the gold in hand.
+    let turn = turn_from(with_vendor_prices(
+        day_world_at(
+            // Late enough that the pre-night Medicine need is on the list, so
+            // the worker is the nominated buyer and the shop trip is live.
+            day_round(45),
+            vec![
+                station(10, 20, 1),
+                json!({
+                    "id": 10010, "pos": {"x": 2, "y": 2}, "roleType": "worker",
+                    "health": 220, "attackPower": 0, "attackRange": 0,
+                    "backPackCapability": 100,
+                    "backpack": ["copper", "copper", "copper", "copper", "copper"]
+                }),
+            ],
+            0,
+            vec![
+                voucher("Medicine", 20),
+                voucher("WeaponUpgradeVoucher1", 100),
+            ],
+            vec![zone(0, 0, "weaponShop"), zone(9, 5, "vendor")],
+        ),
+        vec![voucher("copper", 20), voucher("stone", 5)],
+    ));
+    let mut state = BotState::default();
+    let plan = coregeek::brain::day::plan(&turn, &mut state);
+    let cmd = plan.commands.get(&10010).expect("the buyer acts");
+    assert_eq!(cmd.action, "move");
+    let destination = cmd
+        .targetPos
+        .as_ref()
+        .and_then(|targets| targets.first())
+        .copied()
+        .expect("a move carries a destination");
+    assert!(
+        coregeek::model::chebyshev(destination, Pos { x: 9, y: 5 })
+            < coregeek::model::chebyshev(Pos { x: 2, y: 2 }, Pos { x: 9, y: 5 }),
+        "the step closes on the vendor that pays, not on the shop it cannot pay"
+    );
+}
+
+#[test]
 fn dying_worker_heals_first() {
     // 40/220 HP with a Medicine in the backpack: healing outranks every other
     // daytime duty — a dead worker builds nothing.
@@ -2124,6 +2325,14 @@ fn voucher(name: &str, price: i64) -> Value {
     json!({"name": name, "price": price})
 }
 
+/// `day_world_at` builds its payload with an empty `vendorShopList`, so ore
+/// prices default to 1. The economy's "can we pay for this" questions are
+/// priced, so the tests that ask them have to publish what the vendor pays.
+fn with_vendor_prices(mut world: Value, prices: Vec<Value>) -> Value {
+    world["vendorShopList"] = json!(prices);
+    world
+}
+
 /// Day round (1-based `roundNo`) at which `in_day_round` is reached on day 1.
 fn day_round(in_day_round: i64) -> i64 {
     in_day_round + 1
@@ -2216,11 +2425,47 @@ fn purchase_deadline_shrinks_with_the_walk_to_the_shop() {
 }
 
 #[test]
-fn buyer_sets_off_before_the_gold_arrives() {
-    // Deadline two rounds away, buyer one trip away: the intent must push it
-    // toward the shop even though the 100 gold are not there yet, so the
-    // purchase lands the round the gold does.
-    let turn = turn_from(day_world_at(
+fn buyer_sets_off_before_the_gold_arrives_but_only_for_a_goal_its_pack_can_pay_for() {
+    // Deadline two rounds away, buyer one trip away, and 100 gold's worth of
+    // copper in its pack: the intent must push it toward the shop even though
+    // the purse holds 10, so the purchase lands the round the sale does.
+    let carrying: Vec<Value> = vec![
+        station(10, 20, 1),
+        gatling(10020, 10, 10, 1),
+        json!({
+            "id": 10010, "pos": {"x": 1, "y": 1}, "roleType": "worker",
+            "health": 220, "attackPower": 0, "attackRange": 0,
+            "backPackCapability": 100,
+            "backpack": ["copper", "copper", "copper", "copper", "copper",
+                         "copper", "copper", "copper", "copper", "copper",
+                         "copper", "copper", "copper", "copper", "copper",
+                         "copper", "copper", "copper", "copper", "copper"]
+        }),
+    ];
+    let turn = turn_from(with_vendor_prices(
+        day_world_at(
+            day_round(45),
+            carrying,
+            10,
+            vec![voucher("WeaponUpgradeVoucher1", 100)],
+            vec![zone(0, 0, "weaponShop")],
+        ),
+        vec![voucher("copper", 5)],
+    ));
+    let state = BotState::default();
+    let buyer = turn.role_by_id(10010).unwrap();
+    let budget = coregeek::brain::economy::budget(&turn, &state, 0);
+    assert!(budget.shopping.is_empty(), "10 gold buys nothing yet");
+    assert!(
+        coregeek::brain::economy::buyer_must_preposition(&turn, buyer, &budget.intent),
+        "the ore in the pack covers the price: be there the round the sale lands"
+    );
+
+    // The same intent with an EMPTY pack must not drag the buyer off the
+    // economy. Issue #22: a shop 20 rounds away and 5 gold in the purse fired
+    // this on day-round 11 of every day, and the one role that could have
+    // earned the 100 gold stood at the counter for the remaining 44 rounds.
+    let empty = turn_from(day_world_at(
         day_round(45),
         vec![
             station(10, 20, 1),
@@ -2231,15 +2476,19 @@ fn buyer_sets_off_before_the_gold_arrives() {
         vec![voucher("WeaponUpgradeVoucher1", 100)],
         vec![zone(0, 0, "weaponShop")],
     ));
-    let state = BotState::default();
-    let buyer = turn.role_by_id(10010).unwrap();
-    let budget = coregeek::brain::economy::budget(&turn, &state, 0);
-    assert!(budget.shopping.is_empty(), "10 gold buys nothing yet");
+    let empty_buyer = empty.role_by_id(10010).unwrap();
+    let empty_budget = coregeek::brain::economy::budget(&empty, &state, 0);
     assert!(
-        coregeek::brain::economy::buyer_must_preposition(&turn, buyer, &budget.intent),
-        "the buyer pre-positions once a deadline is within one trip"
+        !coregeek::brain::economy::buyer_must_preposition(
+            &empty,
+            empty_buyer,
+            &empty_budget.intent
+        ),
+        "a goal nothing can pay for is not a reason to stop earning"
     );
-    // Early in the day the same intent must NOT drag the buyer off the economy.
+
+    // Early in the day the same intent must not drag the buyer off the economy
+    // either — there is still time for the gold to arrive the honest way.
     let early = turn_from(day_world_at(
         day_round(5),
         vec![
@@ -2260,6 +2509,75 @@ fn buyer_sets_off_before_the_gold_arrives() {
             &early_budget.intent
         ),
         "no pointless shop camping at round 5"
+    );
+}
+
+#[test]
+fn held_back_wall_stone_is_not_spending_power() {
+    // Issue #22's frozen economy, in one assertion. The ring still wants 10
+    // walls, the worker carries 20 stone, and the shop sells the upgrade for
+    // 100: pricing that stone as cash made the team look funded, so the only
+    // economic worker walked to the shop to buy a voucher it could not pay for
+    // — and `sell_command` refuses to sell the ring's stone anyway.
+    let stone_pack = |stone: usize, gold: i64| {
+        let pack: Vec<&str> = std::iter::repeat("stone").take(stone).collect();
+        turn_from(with_vendor_prices(
+            day_world_at(
+                day_round(45),
+                vec![
+                    station(10, 20, 1),
+                    gatling(10020, 10, 10, 1),
+                    json!({
+                        "id": 10010, "pos": {"x": 1, "y": 1}, "roleType": "worker",
+                        "health": 220, "attackPower": 0, "attackRange": 0,
+                        "backPackCapability": 100, "backpack": pack
+                    }),
+                    // The wall line is ten cells short, so none of that stone is
+                    // surplus: the vendor would turn all of it away.
+                    worker(10011, 30, 30),
+                ],
+                gold,
+                vec![voucher("WeaponUpgradeVoucher1", 100)],
+                vec![zone(0, 0, "weaponShop")],
+            ),
+            vec![voucher("stone", 5)],
+        ))
+    };
+    let state = BotState::default();
+    let rich_in_stone = stone_pack(20, 5);
+    assert_eq!(
+        coregeek::brain::economy::liquid_gold(&rich_in_stone),
+        5,
+        "20 stone the ring still needs is not 100 gold"
+    );
+    assert!(
+        !coregeek::brain::economy::upgrade_reachable(&rich_in_stone, &state),
+        "a pack of wall stone must not keep the 100-gold upgrade 'reachable'"
+    );
+
+    // And the third tower it was gatekeeping: past the fallback round with 25
+    // gold the rocket must be built, stone in the packs or not.
+    let late = turn_from(day_world_at(
+        day_round(coregeek::brain::economy::DUSK_ROUND - 15),
+        vec![
+            station(10, 20, 1),
+            gatling(10020, 10, 10, 1),
+            railgun(10030, 12, 10, 1),
+            json!({
+                "id": 10010, "pos": {"x": 3, "y": 3}, "roleType": "worker",
+                "health": 220, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 100,
+                "backpack": ["stone", "stone", "stone", "stone", "stone",
+                             "stone", "stone", "stone", "stone", "stone"]
+            }),
+        ],
+        25,
+        vec![voucher("WeaponUpgradeVoucher1", 100)],
+        vec![zone(0, 0, "weaponShop")],
+    ));
+    assert!(
+        coregeek::brain::economy::may_build_weapon(&late, &state),
+        "the third tower must not be postponed by stone that cannot buy it"
     );
 }
 

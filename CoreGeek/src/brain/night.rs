@@ -14,7 +14,33 @@ const THREAT_RADIUS: i32 = 3;
 /// Max HP in tenths below which a controller with no Medicine breaks contact
 /// instead of holding its post (3 = the 30% the day rule heals at, so the two
 /// agree on what "critically wounded" means).
-const WITHDRAW_HEALTH_TENTHS: i64 = 3;
+pub const WITHDRAW_HEALTH_TENTHS: i64 = 3;
+
+/// Is this controller one the night's withdrawal rule will pull off its gun?
+///
+/// Split out of [`night_withdraw`] so the pairing can ask the same question
+/// before it hands out a tower. The two must agree exactly: a pairing that
+/// ignores this predicate parks a gun on a controller the very next branch
+/// refuses to let fire, and the tower goes silent with a healthy controller
+/// standing idle next to it — issue #22's 20012, 20 HP and frozen, holding
+/// tower 20020's pairing for 235 rounds while `controller_withdrawn` fired
+/// 35 times and the gun never fired at all.
+pub fn withdrawing(turn: &Turn, role: &Unit) -> bool {
+    if role.count_item("Medicine") > 0 {
+        return false;
+    }
+    let max_hp = match role.kind {
+        UnitKind::Worker => 220,
+        UnitKind::Pioneer => 200,
+        _ => return false,
+    };
+    if role.health * 10 >= max_hp * WITHDRAW_HEALTH_TENTHS {
+        return false;
+    }
+    turn.robots
+        .iter()
+        .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= THREAT_RADIUS)
+}
 
 /// Greedy pairing: every living tower gets the closest free controller that
 /// can actually REACH it. A pioneer busy with a self-evolution task must stay
@@ -59,7 +85,17 @@ pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
             best.map(|(_, index)| index)
         };
         let reachable = |role: &Unit| crate::brain::can_reach_any(turn, role, &stands);
-        let index = nearest(&reachable)
+        // A controller the night will withdraw mans nothing, so it must not
+        // take a gun away from one that can hold it: issue #22's 20012 spent
+        // 235 rounds at 20 HP holding tower 20020's pairing, and the tower was
+        // silent the whole time. Preferring a FIT reachable controller keeps
+        // the gun firing and lets the wounded one fall through to the spare
+        // duties — which is where the shelter and the heal live. The two
+        // fallbacks after it stay: reachable-but-wounded still beats a
+        // controller that cannot get to the tower at all, and distance still
+        // decides when nobody is fit.
+        let index = nearest(&|role: &Unit| reachable(role) && !withdrawing(turn, role))
+            .or_else(|| nearest(&reachable))
             .or_else(|| nearest(&|_| true))
             .expect("controllers is non-empty");
         let role = controllers.remove(index);
@@ -76,12 +112,24 @@ pub fn stable_pairs(turn: &Turn, state: &mut BotState) -> Vec<(i64, i64)> {
     let tower_ids: Vec<i64> = turn.towers().iter().map(|tower| tower.id).collect();
     let controller_ids: Vec<i64> = turn.controllable().iter().map(|role| role.id).collect();
     let task_busy = state.task.active;
+    // Who is too wounded to hold a gun this round. It belongs in the cache key
+    // with the other membership facts: the pairing now depends on it, and a
+    // cached pairing that outlives a controller's wound is exactly how the gun
+    // stays silent (issue #22).
+    let mut withdrawing_ids: Vec<i64> = turn
+        .controllable()
+        .iter()
+        .filter(|role| withdrawing(turn, role))
+        .map(|role| role.id)
+        .collect();
+    withdrawing_ids.sort_unstable();
 
     let needs_recompute = state.night_pairs.is_empty()
         || state.night_pair_day != turn.day
         || state.night_pair_tower_ids != tower_ids
         || state.night_pair_controller_ids != controller_ids
-        || state.night_pair_task_busy != task_busy;
+        || state.night_pair_task_busy != task_busy
+        || state.night_pair_withdrawing != withdrawing_ids;
 
     if needs_recompute {
         let reason = if state.night_pairs.is_empty() {
@@ -92,6 +140,8 @@ pub fn stable_pairs(turn: &Turn, state: &mut BotState) -> Vec<(i64, i64)> {
             "towers"
         } else if state.night_pair_controller_ids != controller_ids {
             "controllers"
+        } else if state.night_pair_withdrawing != withdrawing_ids {
+            "withdrawing"
         } else {
             "task_occupancy"
         };
@@ -100,6 +150,7 @@ pub fn stable_pairs(turn: &Turn, state: &mut BotState) -> Vec<(i64, i64)> {
         state.night_pair_tower_ids = tower_ids;
         state.night_pair_controller_ids = controller_ids;
         state.night_pair_task_busy = task_busy;
+        state.night_pair_withdrawing = withdrawing_ids;
         crate::log::event(
             "pair_recomputed",
             serde_json::json!({"round": turn.round_no, "reason": reason, "pairs": state.night_pairs}),
@@ -469,23 +520,10 @@ fn night_medicine(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
 ///
 /// Returns true when the survival rule owns this controller's round.
 fn night_withdraw(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) -> bool {
-    if role.count_item("Medicine") > 0 {
+    if !withdrawing(turn, role) {
+        // Unwounded, carrying a potion, or merely hurt with nobody in reach:
+        // the post is still the best place for it.
         return false;
-    }
-    let max_hp = match role.kind {
-        UnitKind::Worker => 220,
-        UnitKind::Pioneer => 200,
-        _ => return false,
-    };
-    if role.health * 10 >= max_hp * WITHDRAW_HEALTH_TENTHS {
-        return false;
-    }
-    let under_fire = turn
-        .robots
-        .iter()
-        .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= THREAT_RADIUS);
-    if !under_fire {
-        return false; // hurt but unthreatened: the post is still the best place
     }
     if crate::brain::interior_cells(turn).contains(&role.pos) {
         return true; // already behind the ring: hold, do not walk back out

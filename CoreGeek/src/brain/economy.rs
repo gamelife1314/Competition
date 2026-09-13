@@ -400,18 +400,28 @@ pub fn budget(turn: &Turn, state: &BotState, reserve: i64) -> Budget {
     }
 }
 
-/// Rounds of slack the buyer waits at the shop before a deadline, so the
-/// purchase lands the round the gold does rather than the round after it.
-const PREPOSITION_LEAD: i64 = 3;
-
 /// Gold the team could raise today: coins in hand plus every ore in a backpack
-/// valued at the vendor's current price. The economy's real spending power —
-/// used to tell a goal that is merely not-yet-affordable from one that is out
-/// of reach entirely.
+/// the vendor would ACTUALLY TAKE, valued at the current price. The economy's
+/// real spending power — used to tell a goal that is merely not-yet-affordable
+/// from one that is out of reach entirely.
+///
+/// Stone counts for nothing here. It is the wall line's raw material, and
+/// `sell_command` refuses to sell it while the ring still wants it, so pricing
+/// it as cash read spending power out of a backpack the shop will not honour.
+/// Issue #22 paid for that twice in one match. The ring's stone read as "the
+/// 100-gold upgrade is still reachable", so `third_tower_fallback` never fired
+/// and the match was fought with two guns for the fourth battle running; and
+/// `buyer_must_preposition` marched the only economic worker to the shop on
+/// stone it could not sell, where it camped while the purse froze at 5 gold and
+/// the whole match produced exactly one sale. Only `gold` and the ore the
+/// vendor buys can pay a shop, so only those are counted.
 pub fn liquid_gold(turn: &Turn) -> i64 {
     let mut liquid = turn.gold;
     for role in turn.controllable() {
         for ore in ORES {
+            if ore == STONE {
+                continue;
+            }
             let count = role.count_item(ore) as i64;
             if count > 0 {
                 liquid += turn.vendor_prices.get(ore).copied().unwrap_or(1).max(1) * count;
@@ -424,16 +434,22 @@ pub fn liquid_gold(turn: &Turn) -> i64 {
 /// Should the buyer set off for the shop even though nothing on the list is
 /// affordable yet?
 ///
-/// Two cases, and only two. *Last chance*: the round to leave has arrived and
-/// there will be no more time to earn, so the walk has to start now whatever
-/// the purse says. *Funded*: the deadline is within one trip and the ore
-/// already in our backpacks covers the price, so leaving now means the purchase
-/// lands the round the sale does instead of a cross-map walk later.
+/// One case, and only one: *funded*. The deadline is within one trip and the
+/// ore already in our backpacks — ore the vendor will actually buy, see
+/// [`liquid_gold`] — covers the price, so leaving now means the purchase lands
+/// the round the sale does instead of a cross-map walk later.
 ///
 /// Deliberately NOT "any deadline is within one trip": that parked the only
 /// economic worker at a far shop for half the day for a 100-gold voucher the
 /// team was never going to afford, which is how the day ended with two towers,
-/// no walls and a frozen purse (issues #12/#14).
+/// no walls and a frozen purse (issues #12/#14). The narrower "last chance"
+/// version of the same mistake — leave now because there is no time left for a
+/// second trip — survived that fix and cost issue #22 the match: with a shop 20
+/// rounds away and 5 gold in the purse it fired on day-round 11, every day, and
+/// the one role that could have earned the 100 gold stood at the counter for
+/// the remaining 44 rounds of the day. A goal nothing can pay for is not a
+/// reason to stop earning; the buyer keeps the collect→sell→buy loop running
+/// and sets off the round the pack covers the price.
 pub fn buyer_must_preposition(turn: &Turn, role: &Unit, needs: &[Need]) -> bool {
     let travel = shop_travel(turn, role.pos);
     let liquid = liquid_gold(turn);
@@ -450,18 +466,11 @@ pub fn buyer_must_preposition(turn: &Turn, role: &Unit, needs: &[Need]) -> bool 
             return false;
         }
         // A deadline the walk can no longer meet is a dead goal, not a reason
-        // to set off. Reading it the other way ("we would arrive late, so
-        // leave now") parked the only economic worker at a far shop for the
-        // whole afternoon, chasing a 100-gold voucher the team could never
-        // afford — gold froze because the buyer was never at the mine or the
-        // vendor (issues #12/#14).
-        let arrival = turn.in_day_round + travel;
-        if arrival > need.latest_round {
+        // to set off (issues #12/#14).
+        if turn.in_day_round + travel > need.latest_round {
             return false;
         }
-        // Funded: be there the round the gold lands. Not funded yet: only
-        // worth leaving early if there is no time left for a second trip.
-        liquid >= price * need.num || arrival + PREPOSITION_LEAD >= need.latest_round
+        liquid >= price * need.num
     })
 }
 

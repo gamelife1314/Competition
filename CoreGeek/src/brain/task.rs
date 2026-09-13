@@ -224,16 +224,19 @@ pub fn plan_pioneer(
             // the last few rounds the partial pass rate is worth more than the
             // chance of a complete answer, so the check yields.
             let gaps = answer_schema_gaps(&state.task.description, &answer);
-            if !gaps.is_empty() && rounds_left > SCHEMA_GRACE {
+            let extras = answer_schema_extras(&state.task.description, &answer);
+            if (!gaps.is_empty() || !extras.is_empty()) && rounds_left > SCHEMA_GRACE {
                 crate::log::event(
                     "task_answer_schema",
                     serde_json::json!({
                         "session": state.task.session_id,
                         "missing": gaps,
+                        "extra": extras,
                         "roundsLeft": rounds_left,
                     }),
                 );
                 state.task.schema_gaps = gaps;
+                state.task.schema_extras = extras;
                 state.task.stage = TaskStage::Planning;
                 return None;
             }
@@ -289,6 +292,8 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
     prompt.push_str("3. 脚本要可复用：把可变参数（如城市名、文件名、数量）写成 `{{参数名}}` 占位符，参数名必须与任务描述里出现的字段名完全一致（例如描述里的“城市名”就用 `{{城市名}}`），脚本中不要写死具体取值；同一类任务下次会复用这段脚本并按新描述自动填参。\n");
     prompt.push_str("4. 尽量在一个脚本内完成全部步骤（find 找文件 → cat 读取 → 计算 → 打印 ANSWER），不要分多轮试探；只有带 `ANSWER:` 标记的输出才会被当作答案提交。\n");
     prompt.push_str("5. `ANSWER:` 后面必须是真实结果（数字/字符串/JSON）。找不到文件或算不出来时，**不要**打印 ANSWER 行，也不要用 `xxx`、`failed_to_extract`、`TODO`、`unknown`、`N/A` 之类的占位符占位——那会被判错并浪费一整轮；直接把报错信息打印到 stderr 即可，脚本会带着错误重试。\n");
+    prompt.push_str("6. `ANSWER:` 后面**只放任务要的那个值**：是数字就只放数字（不要带单位、不要加解释），是 Markdown 标题、表格或说明文字都不算答案。多字段答案只写任务描述里点名的字段，不要自行增加 `status`、`note`、`task_id` 这类字段——判分按要求的字段逐个比对，多写一个字段会被判错。\n");
+    prompt.push_str("7. 打印 ANSWER 前先自检一次：确认这个值确实由脚本从任务数据里算出来（而不是照着题面猜的或照抄示例），位数/单位/大小写与任务要求一致。\n");
     if !state.task.result_history.is_empty() {
         prompt.push_str("\n上次执行输出（请修正错误）：\n");
         let start = state.task.result_history.len().saturating_sub(2);
@@ -307,6 +312,12 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
         prompt.push_str(&format!(
             "\n上次打印的答案缺少任务要求的字段：{}。请在 ANSWER 的 JSON 中补全这些字段（字段名与任务描述一致）。\n",
             state.task.schema_gaps.join("、")
+        ));
+    }
+    if !state.task.schema_extras.is_empty() {
+        prompt.push_str(&format!(
+            "\n上次打印的答案多出了任务未要求的字段：{}。判分会按任务要求的字段逐个比对，多写的字段同样算错——请只保留任务描述里点名的字段，不要自行添加 status/note 之类的字段。\n",
+            state.task.schema_extras.join("、")
         ));
     }
     prompt
@@ -452,12 +463,41 @@ pub fn submittable_answer(description: &str, answer: &str) -> String {
 /// True when the answer describes the parsing step instead of the result —
 /// e.g. `{"status":"parsed","content_length":534}`. Submitting these scores
 /// nothing, so they are filtered out before submission.
+///
+/// Markdown headings belong here too. Issue #22's session 3 submitted one: the
+/// script echoed a section title (`## 结果`) instead of a value, which is the
+/// same defect as a sentinel — the `ANSWER:` marker carrying the shape of an
+/// answer rather than an answer. The marker is matched on length first (see
+/// `is_markdown_heading`), so a real result that merely starts with `#` — a hex
+/// colour, a tag — is left alone.
 pub fn is_meta_answer(answer: &str) -> bool {
     let lower = answer.to_lowercase();
     lower.contains("content_length")
         || lower.contains("contentlength")
         || lower.contains("content-length")
         || (lower.contains("\"status\"") && lower.contains("parsed"))
+        || is_markdown_heading(answer)
+}
+
+/// True when the answer is markdown decoration rather than a value: a heading
+/// (`# 标题`, `## 结果`) or a bolded title, i.e. a `#`/`*` run that is followed
+/// by whitespace and carries the whole line.
+///
+/// The trailing-space requirement is what keeps this safe: `#fff` and
+/// `#123456` are colour values, not headings, and are still answers.
+pub fn is_markdown_heading(answer: &str) -> bool {
+    let trimmed = answer.trim();
+    if trimmed.contains('\n') {
+        return false; // a heading is one line; several lines are output, not an answer
+    }
+    let decorated = trimmed.starts_with('#')
+        && trimmed
+            .trim_start_matches('#')
+            .starts_with(|c: char| c.is_whitespace());
+    let bold = trimmed.starts_with("**")
+        && trimmed.ends_with("**")
+        && trimmed.trim_matches('*').trim().chars().count() < trimmed.chars().count();
+    decorated || bold
 }
 
 /// True when the `ANSWER:` marker carries the script's own failure notice
@@ -679,6 +719,32 @@ pub fn answer_schema_gaps(description: &str, answer: &str) -> Vec<String> {
             let name = field.to_lowercase();
             !keys.iter().any(|key| *key == name) && !lower.contains(&name)
         })
+        .collect()
+}
+
+/// Keys the answer carries that the task never asked for. Empty means "pass".
+///
+/// The other half of [`answer_schema_gaps`], and a scoring failure in its own
+/// right: the judger compares the submitted object against the schema it asked
+/// for, so an extra field is a wrong answer even when every required field is
+/// right. Issue #22's session 5 submitted
+/// `{"city": "Nanjing", "task_id": 2, "status": "completed"}` for a task that
+/// asked for two fields and got the `status` it invented on top. Same gate as
+/// the missing-field check: only when the task text names a real schema (two or
+/// more fields), and only when the answer is actually a JSON object — a bare
+/// scalar has no keys to be extra.
+pub fn answer_schema_extras(description: &str, answer: &str) -> Vec<String> {
+    if expected_fields(description).len() < 2 {
+        return Vec::new();
+    }
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(answer)
+    else {
+        return Vec::new();
+    };
+    let lower = description.to_lowercase();
+    map.keys()
+        .filter(|key| !lower.contains(&key.to_lowercase()))
+        .cloned()
         .collect()
 }
 

@@ -5,7 +5,8 @@
 use serde_json::{json, Value};
 
 use coregeek::brain::task::{
-    answer_schema_gaps, expected_fields, merge_json_fields, partial_answer,
+    answer_schema_extras, answer_schema_gaps, expected_fields, is_meta_answer, merge_json_fields,
+    partial_answer,
 };
 use coregeek::brain::Plan;
 use coregeek::model::Turn;
@@ -241,6 +242,111 @@ fn a_real_answer_is_still_an_answer() {
         None,
         "a sentinel is not a partial answer either"
     );
+}
+
+#[test]
+fn a_markdown_heading_is_not_an_answer() {
+    // Issue #22, session 3: with the sentinels gone the model answered with a
+    // section title — the shape of an answer instead of a value. Same defect,
+    // same treatment: a failed run that re-plans instead of a recorded answer
+    // that blocks the session until the timeout.
+    for heading in ["## 结果", "# 统计结果", "### 答案：", "**结果**"] {
+        let mut state = BotState::default();
+        state.task.active = true;
+        state.task.session_id = 3;
+        state.task.task_type = "自进化类1".into();
+        state.task.description = "统计 /tmp/selfEvolutionTask 下的文件数量".into();
+        state.task.cmd_history = vec!["find /tmp/selfEvolutionTask | wc -l".into()];
+        state.task.stage = TaskStage::WaitingCmdResult { attempts: 0 };
+        state.task.cmd_request_round = Some(4);
+        coregeek::brain::task::on_cmd_result(
+            &mut state,
+            &format!("[exitCode:0]\nANSWER: {heading}"),
+        );
+        assert!(
+            matches!(state.task.stage, TaskStage::Planning),
+            "`{heading}` is decoration, not a result"
+        );
+        assert!(
+            state.task.best_answer.is_empty(),
+            "`{heading}` must never become the recorded answer"
+        );
+        assert!(state.task.sop_cmd.is_none(), "nor teach the SOP cache");
+    }
+    // The marker is a `#` RUN followed by space, so a value that merely starts
+    // with the character — a colour, a tag — is still an answer.
+    for value in ["#fff", "#123456", "##41"] {
+        assert!(!is_meta_answer(value), "`{value}` is a value");
+    }
+}
+
+#[test]
+fn a_field_the_task_never_asked_for_is_a_wrong_answer() {
+    // Issue #22, session 5: `{"city": "Nanjing", "task_id": 2, "status":
+    // "completed"}` for a task that asked for two fields. The judger scores the
+    // submitted object against the schema it named, so the invented `status` is
+    // wrong on its own — and the only place to catch it is before submission,
+    // because nothing about the answer looks malformed.
+    let description = "任务：输出 city 与 task_id";
+    assert_eq!(
+        expected_fields(description),
+        vec!["city", "task_id"],
+        "the task text names a two-field schema"
+    );
+    let invented = r#"{"city": "Nanjing", "task_id": 2, "status": "completed"}"#;
+    assert_eq!(
+        answer_schema_extras(description, invented),
+        vec!["status"],
+        "an invented field is reported"
+    );
+    assert!(
+        answer_schema_gaps(description, invented).is_empty(),
+        "every required field is present — the extra one is the whole defect"
+    );
+
+    // The judge: an answer that carries the invented field goes back to
+    // Planning with the field named in the next prompt; the same answer without
+    // it is submitted.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 5;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = description.into();
+    state.task.stage = TaskStage::HaveAnswer {
+        answer: invented.into(),
+    };
+    let turn = turn_from(task_world(40));
+    state.task.timeout_round = turn.round_no + 20;
+    let pioneer = turn.pioneer().expect("the world has a pioneer");
+    let mut plan = Plan::default();
+    assert!(
+        coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan).is_none(),
+        "nothing is submitted while the shape is wrong"
+    );
+    assert!(
+        matches!(state.task.stage, TaskStage::Planning),
+        "the session re-plans instead of submitting a guaranteed zero"
+    );
+    assert_eq!(state.task.schema_extras, vec!["status"]);
+    assert!(coregeek::brain::task::build_prompt(&state, &turn).contains("status"));
+
+    // The corrected answer — exactly the two fields the task asked for — is
+    // submitted unchanged.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 6;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = description.into();
+    let correct = r#"{"city": "Nanjing", "task_id": 2}"#;
+    state.task.stage = TaskStage::HaveAnswer {
+        answer: correct.into(),
+    };
+    state.task.timeout_round = turn.round_no + 20;
+    let mut plan = Plan::default();
+    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan)
+        .expect("a conforming answer is submitted");
+    assert_eq!(cmd.action, "submitAnswer");
+    assert_eq!(cmd.taskAnswer.as_deref(), Some(correct));
 }
 
 fn sop(task_type: &str, keywords: &[&str], template: &str) -> SopEntry {

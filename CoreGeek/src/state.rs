@@ -81,6 +81,11 @@ pub struct TaskSession {
     /// Fields the task text asked for that the produced answer did not carry.
     /// Fed back into the next prompt so the retry can close the gap.
     pub schema_gaps: Vec<String>,
+    /// Fields the answer carried that the task never asked for. The judger
+    /// scores the object against the schema it named, so an invented field is
+    /// wrong on its own (`{"city":…,"task_id":…,"status":"completed"}` — issue
+    /// #22's session 5). Fed back into the next prompt like `schema_gaps`.
+    pub schema_extras: Vec<String>,
     /// Consecutive `[JUDGER_ERROR]` verdicts that name `executeCmd` as
     /// unavailable. That error is the judger telling us the task's execution
     /// window is shut — issue #17's two sessions fired four and one command
@@ -289,6 +294,10 @@ pub struct BotState {
     pub night_pair_tower_ids: Vec<i64>,
     pub night_pair_controller_ids: Vec<i64>,
     pub night_pair_task_busy: bool,
+    /// Controllers too wounded to hold a gun this round (see
+    /// `brain::night::withdrawing`). Sorted. The pairing prefers a fit
+    /// controller, so a change here invalidates it.
+    pub night_pair_withdrawing: Vec<i64>,
 
     /// D1 gate stays open until every controller has reached an inside/tower
     /// stand, then remains sealed for the rest of the half.
