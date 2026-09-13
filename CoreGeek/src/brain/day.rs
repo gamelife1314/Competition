@@ -426,12 +426,13 @@ fn worker_day(
     // 3b. 黄昏封门（D2+，P0-3）：`open_door` 为白天经济切开的门，从黄昏起就是
     //    普通缺口。step 3 要等 `wall_gate_sealed` 旗标（散兵未归队时不封），
     //    step 5 受每日预算与批量闸限制——两条路都可能让门整夜敞开。带石工人从
-    //    黄昏起直接把门砌上，不必等散兵：他们还有指定的 gate 可以归队。窗口与
-    //    step 3 相同（黄昏 + SEAL_GRACE），一门炮也不会因此误了夜防。
+    //    黄昏起直接把门砌上，不必等散兵：他们还有指定的 gate 可以归队。窗口
+    //    延到白天最后一回合：封门若因绕路错过 SEAL_GRACE，门会整夜敞开（be 的
+    //    复核意见 C）；操炮由夜间无条件召回兜底（night.rs 的红线不动）。
     if turn.day > 1
         && role.count_item(STONE) > 0
         && turn.in_day_round >= economy::DUSK_ROUND
-        && turn.in_day_round < economy::DUSK_ROUND + SEAL_GRACE
+        && turn.in_day_round < crate::model::DAY_ROUNDS
     {
         let mut doors: Vec<Pos> = state.door_cells.iter().copied().collect();
         doors.sort_by_key(|site| chebyshev(role.pos, *site));
