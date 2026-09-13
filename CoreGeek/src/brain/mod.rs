@@ -254,6 +254,10 @@ fn log_round(
             "failures": failures,
             "volley": volley.summary(),
             "errors": turn.error_codes,
+            // The judger's own words for each code (e.g. `MissingNamedInput`) —
+            // the one authoritative schema signal for task answers, requested
+            // by the analysis workflow (WORKFLOW_REQUEST 请求四).
+            "errorDescs": turn.error_descriptions.iter().map(|text| crate::log::brief(text, 120)).collect::<Vec<_>>(),
             "phaseTask": crate::log::brief(&turn.phase_task, 160),
             "lastCmdResult": crate::log::brief(&turn.last_cmd_result, 160),
             "promptChars": prompt.as_ref().map(String::len).unwrap_or(0),

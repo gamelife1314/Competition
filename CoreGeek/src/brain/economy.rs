@@ -365,6 +365,33 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         });
     }
 
+    // P2-3 召唤令节奏: a boss wave is a half-ender against a wall-less enemy
+    // base — 对手无墙时 BOSS 令可直接终结半场 (v1). The rich gate above stays;
+    // this cheaper trigger arms only while the enemy ring is thin enough for
+    // the extra wave to matter (enemy walls are globally visible, 接口文档
+    // 1.4), and tops the stock up to two so the pressure is a rhythm across
+    // nights instead of one spike the daily 10-use cap never reaches anyway.
+    let enemy_walls = turn
+        .enemy
+        .iter()
+        .filter(|unit| unit.kind == UnitKind::Wall && unit.alive())
+        .count();
+    if enemy_walls <= 3
+        && turn.towers().len() >= 3
+        && gold >= 300
+        && stock_of(turn, "BossRobotSummonOrder") < 2
+        && !state.harass_done_today
+    {
+        needs.push(Need {
+            name: "BossRobotSummonOrder".into(),
+            num: 1,
+            priority: 8,
+            latest_round: 0,
+            value: 0,
+            reason: "harass_finisher",
+        });
+    }
+
     // P1-1: tonight's clear gap may reorder this list (dial-gated).
     clear_gap_order(turn, &mut needs);
     needs

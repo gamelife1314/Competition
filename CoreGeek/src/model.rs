@@ -260,6 +260,12 @@ pub struct Turn {
     pub official_news: String,
     pub folk_legends: String,
     pub error_codes: Vec<i64>,
+    /// The judger's text for each error code — e.g. the `MissingNamedInput`
+    /// rejection reason the opponent used to fix their task answers (issue
+    /// #10). Parsed since protocol.rs day one but DROPPED here until now;
+    /// kept for logging so the analysis workflow finally sees WHY a
+    /// submission was rejected instead of only that it was.
+    pub error_descriptions: Vec<String>,
 }
 
 impl Turn {
@@ -334,6 +340,7 @@ impl Turn {
             official_news: req.world_news.official_news,
             folk_legends: req.world_news.folk_legends,
             error_codes: req.errors.iter().map(|e| e.error_code).collect(),
+            error_descriptions: req.errors.iter().map(|e| e.description.clone()).collect(),
         }
     }
 

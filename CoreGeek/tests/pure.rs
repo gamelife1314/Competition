@@ -145,3 +145,29 @@ fn keyword_extraction_bigrams() {
     let keywords = keywords_of("query weather in Beijing");
     assert!(keywords.contains(&"beijing".to_string()), "{keywords:?}");
 }
+
+#[test]
+fn error_descriptions_are_kept_not_dropped() {
+    // The judger's rejection text (e.g. `MissingNamedInput`) is the one
+    // authoritative schema signal for task answers — the opponent used it to
+    // fix theirs (issue #10). It used to be dropped at the parse layer; the
+    // analysis workflow reads it from the round log now (errorDescs).
+    let payload = serde_json::json!({
+        "roundNo": 1,
+        "mapInfo": {"width": 41, "height": 32, "zones": []},
+        "teamOur": {"type": "challenger", "roles": []},
+        "teamEnemy": {"roles": []},
+        "robot": {"roles": []},
+        "errors": [
+            {"errorCode": 2, "description": "MissingNamedInput: city"},
+            {"errorCode": 1, "description": "任务超时"},
+        ],
+    });
+    let req: Request = serde_json::from_value(payload).unwrap();
+    let turn = Turn::from_request(req);
+    assert_eq!(turn.error_codes, vec![2, 1]);
+    assert_eq!(
+        turn.error_descriptions,
+        vec!["MissingNamedInput: city".to_string(), "任务超时".to_string()]
+    );
+}
