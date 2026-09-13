@@ -2,10 +2,14 @@
 
 > **版本 v11** · 本文档是内网自动对战 workflow 的**交付规范**。
 > 读者：拉代码 → 发起对战 → 抓日志 → 分析对局 → 生成改进 issue 的 code agent。
-> **v11 改的是交付通道**：没有文件路径可用，我拿不到你机器上的任何东西——**issue 正文
-> 就是交付物**。§1 已按这条重写，§7.3 因此给每张表加了**行数预算**（按真实批次量过），
-> §8 的 `deliverables` 也从 `path:` 改成 `paste:`。对手日志与"原始行 tsv"这两项不再要，
-> 理由见 §1。
+> **v11 改的是交付通道，而且把活变少了**：没有文件路径可用，我拿不到你机器上的任何东西
+> ——**issue 正文就是交付物**，§8 的 `deliverables` 因此从 `path:` 改成 `paste:`；对手日志
+> 与"原始行 tsv"这两项不再要，理由见 §1。
+> 相应地，**§7.3 的十三条配方收成了一条命令**：仓库里的 `tools/collect_log.sh` 就是那份
+> 规范的机器版，给它一个日志文件，它直接印出六张表那**一页**，整段贴进 issue 即可；每张表
+> 的行数上限写在脚本里（跑一次最多 560 行，典型一场 193 行 / 4.8 KB），所以**不需要判断
+> "贴多少才够"**。§0 是新的：**只做三件事**（每场一行胜负 · 跑那条命令 · 缺口写一句），
+> 做不完就只做这三件——§1 的 P0/P1/P2 优先级的依据在这里。
 > 其余与 v10 相同：v10 把表 5（封门）加厚了——`wall_gate_open` 现在带 `away`/`stuck`，
 > 能直接读出**门卡在谁身上**，并且明确了"这个窗口总共只有 15 回合，15 行 = 整夜没封"。
 > §7 是正面清单（issue 正文要给我哪五部分、怎么取、长什么样，全部给示例），你不需要回答
@@ -14,10 +18,30 @@
 
 ---
 
-## 0. 一句话
+## 0. 最短路径：只做三件事，我就能干活
 
-每批在 issue 正文里给：头部 8 个字段 + **每场一份结果回执** + **六张证据表**（§7）。
-**没有文件路径这回事**——stdout 之外的东西我拿不到，贴进 issue 的字就是全部（§1）。
+每批就这三件。做不完就只做这三件，其余照 §7.4 写一句"没拿到"。
+
+```text
+1. 每场一行结果：对局ID + 代码版本 + 胜负 + 比分      ← 从对局详情页抄
+2. 每场跑一条命令，把整段输出贴进来：
+     bash tools/collect_log.sh <你的日志文件>
+3. 拿不到的东西，写一句"拿不到 + 为什么"
+```
+
+| 做什么 | 为什么是它 | 做不了怎么办 |
+|---|---|---|
+| 第 1 件：胜负与比分 | **唯一的硬数据**。没有它，"这轮改动是不是真的变好了"只能靠猜——我连输赢都看不见 | 详情页没有就写 `null`，**不要填 0**（§3.4） |
+| 第 2 件：那条命令的输出 | **唯一的现场证据**。棋盘我看得见，过程只有日志记得；而这条命令把日志压成一页 | 命令跑不了就说"跑不了 + 报错原文"，别自己另编一张表 |
+| 第 3 件：缺口 | "配方命中 0 行"和"这件事没发生过"是两件事，分不清就说分不清 | —— |
+
+**做得更多当然更好**：§1 是完整清单，§3 是 15 个字段的完整回执，§7 是五部分正文。
+但那些是**加分项，不是及格线**。两件不要做的事：**不要填猜的数**（一个编的 `score` 比
+`null` 更糟，因为我会拿它去归因）；**不要贴没跑过的表**（一行都没跑就说没跑，别用"结论：
+正常"顶上）。
+
+**交付通道只有一条：issue 正文。** 你机器上的路径我一个都拿不到——文件下载到本地就停在
+本地了。所以"交付"= 把内容**贴进 issue**，不是"把文件放在某个目录里"（§1）。
 
 分界线只有一条：**棋盘我看得见，结果我看不见。**
 
@@ -36,28 +60,32 @@
 
 ## 1. 交付物清单
 
-**交付通道只有一条：issue 正文。** 你机器上的任何路径我都拿不到——文件下载到本地之后
-就停在本地了，我读到的只有贴进 issue 的字。所以本规范的"交付"= **把下面的东西贴进 issue**，
-不是"把文件放在某个目录里"。
+下面是完整清单，按**优先级**排。`P0` 三件是 §0 那三件，其余是加分项——**做完 P0 再谈
+P1，别把 P1 做成半成品**。
 
-| # | 内容 | 从哪来 | 硬性要求 |
+| 优先级 | 内容 | 从哪来 | 做不成的代价 |
 |---|---|---|---|
-| 1 | §4 的 8 个头部字段 | 平台页面 + §5 教练配方 | 每批一次 |
-| 2 | **每场一份** `receipt.json`（§3），整段贴 | 对局详情页 | 字段一个不少，取不到填 `null`；一个 `match_id` 一份，不合并 |
-| 3 | §5 的教练汇总一行 | 你的 `ours.jsonl` | 格式固定，我会 grep |
-| 4 | **§7.3 的六张表**，每张贴配方的**输出原文** | 你的 `ours.jsonl` | 见 §7.3 的行数预算 |
-| 5 | §7.4 缺口：拿不到的东西和原因 | 你自己 | 不许静默省略 |
+| **P0** | 每场一行结果：`对局ID 代码版本 胜负 比分` | 对局详情页 | 我无法判断任何改动的效果。**这一项缺失，整批数据基本作废** |
+| **P0** | **一条命令的输出**：`bash tools/collect_log.sh <日志>` 整段贴 | 你的日志文件 | 我失去全部现场证据，只能看结果猜过程 |
+| **P0** | §7.4 缺口：拿不到的和原因 | 你自己 | 我会把"没写"读成"没发生" |
+| P1 | §3 的完整回执（15 个字段），一场一份 | 对局详情页 | 分项得分、逐 session 任务分、对手身份拿不到——归因会变粗 |
+| P1 | §4 的 8 个头部字段 | 平台页面 + §5 教练配方 | 看不出跨批次的趋势（排名、胜率） |
+| P2 | §5 教练汇总一行 | 你的日志 | 看不出内置教练移动过开关没有 |
+| P2 | §7 的第一、二、五部分（批级概况 / 逐场回执正文 / 本轮已改） | 汇总上面几项 | 组织性损失，不是信息损失 |
 
-`workflow/` 那套目录（`workflow/logs/<match_id>/…`）**是给你自己用的**：原始 stdout 存在
-哪里、叫什么名字、怎么组织，与本规范无关，也不必在 issue 里报路径。**只要保证随时能重跑
-配方**——表里的每一行都是从原始 stdout 跑出来的，我问"某天黄昏门卡在谁身上"的时候，你要能
-当场再跑一条贴上来。
+**`tools/collect_log.sh` 是 §7.3 十三条配方的机器版**——跑哪些命令、怎么聚合、每张表印多少行
+都写死在脚本里，所以你不用判断"贴多少才够"。跑不了（没有 bash / jq）就照 §7.3 的配方手工跑，
+或照 §7.4 说明原因；**不要自己另编一张表**。
+
+**原始日志你自己留着。** 存在哪、叫什么、怎么组织都行，也不必在 issue 里报路径——**只要保证
+随时能重跑那条命令**，因为表里每一行都是从它跑出来的。我问"某天黄昏门卡在谁身上"的时候，
+你要能当场再跑一次贴上来。
 
 **不再要的两项**（v10 及更早的清单里有，现在取消）：
 
 - **对手日志 `enemy.jsonl`**。它到不了我手里，而我要的那点对手事实（基地等级 / 塔数 / 墙数）
   已经在 `receipt.enemy_seen` 里了。拿不到也不必写 `.missing`，§7.4 提一句就够。
-- **"原始行另存 tsv + 给路径"**。路径对我无效。原始行留在本地备查，贴的是**配方的输出**。
+- **"原始行另存 tsv + 给路径"**。路径对我无效。原始行留在本地备查，贴的是**脚本的输出**。
 
 每批：issue 头部 8 个字段（§4）+ 每场一份 `receipt.json`（§3）+ 一行教练汇总（§5）+
 **§7.3 的六张证据表**（整个 issue 的正文就是 §7 那五部分）。
@@ -291,15 +319,14 @@ issue 头部请给这一行（我直接 grep）：
 5. `receipt.coach.halves` == 最后一个 `coach_half` 的 `halves`（一场都没有则为 `0`）。
 6. 没有把 `null` 写成 `0` / `""` / `"unknown"`；`result` 之外的字段出现 `"unknown"` 一律算错。
 7. 对手那一侧拿不到的东西，在 §7.4 写明原因，而不是静默省略。
-8. §7.3 的六张表**每张都跑过**（哪怕命中 0 行也要有那张表和一个 0），且每张表都不是
-   一句结论。
+8. §7.3 的六张表**是表，不是结论**。一张命中 0 行的表就让它印「（0 行）」——"表 6a 结论：
+   正常"和一张空表是两回事，前者我看不出你有没有跑过。
 9. issue 正文里**没有**任何"请你回答"式的反向提问——不存在这样的问题。
 10. 表 5 命中 15 行的那天，写的是"**整夜没封**"而不是"开了 15 回"；`away`/`stuck` 里出现的
    角色 id 在表里点名了——门卡在谁身上是这张表存在的理由。
-11. 六张表的输出**加起来 ≤ 400 行**（贴之前 `… | wc -l` 加起来看一眼）。超了就是贴了原始行
-   而不是配方输出，回 §7.3 换成那张表的汇总式——**表 5 例外**，它开得久正是要看的东西。
-12. **issue 正文里不出现任何本地路径**。`workflow/logs/…` 这种写给自己看就行：路径到我这里
-   是死字，我打不开。
+11. 六张表是**一条命令**跑出来的（`bash tools/collect_log.sh <日志>`），整段贴，没有手工删改；
+    被截断的节带着「本表共 N 行」的声明。**不用自己数行数——脚本已经封顶了。**
+12. **issue 正文里不出现任何本地路径**。写给自己看就行：路径到我这里是死字，我打不开。
 
 ---
 
@@ -347,28 +374,40 @@ issue 头部请给这一行（我直接 grep）：
 **这是整份 issue 里我最需要的部分**，也是唯一能从日志里挖出来的部分——胜负你能看见，过程
 只有我能看见，而这六张表就是过程的切片。
 
-统一约定：
+**一条命令，整段贴。** 不用手工跑十三条配方，也不用判断贴多少：
+
+```sh
+bash tools/collect_log.sh <你的日志文件>        # .jsonl 或 .jsonl.gz 都行
+```
+
+它的输出就是这一节要的六张表，一节一块，带列名，某张表命中 0 行会明写「（0 行）」而不是
+消失，超长会截断并写明「本表共 N 行」。**把整段输出贴进 issue 即可**，一个字都不用改。
+
+跑不了这条命令（机器没有 bash / jq）就照下面的配方手工跑，再不行照 §7.4 写"跑不了 + 报错
+原文"。**两条底线**：不要自己另编一张表；不要用"结论：正常"代替表。
+
+下面是**脚本里到底跑了什么**，手工跑或核对输出时看这一节：
 
 - 每条配方都以 `grep '^{' ours.jsonl |` 开头，跳过首行非 JSON 的 `listening on` 行（§2）。
-  `ours.jsonl` 是你本地那份原始 stdout，路径你自己知道就行——**贴的是配方的输出**。
-- **每张表都有行数预算**。下表的"实测"是拿一场 10 天 / 3 座塔 / 16 个 session 的对局按真实
-  批次的形状跑出来的：**六张表全部跑完 193 行 / 4.8 KB**，平均每张 32 行。某张表远超它那一行，
-  只有两种可能——要么这场真的异常（**那就贴**，并在表下写一句哪里异常），要么你贴的是原始行
-  而不是配方输出（回去换汇总式）。
+  `ours.jsonl` 是你本地那份原始 stdout，路径你自己知道就行——**贴的是输出**。
+- **每张表都有行数预算**（脚本按这个封顶）。"实测"是拿一场 10 天 / 3 座塔 / 16 个 session
+  的对局按真实批次的形状跑出来的：**六张表全部跑完 193 行 / 4.8 KB**，平均每张 32 行。
 
-| 表 | 配方 | 实测行数 | 预算 | 增长源 |
+| 表 | 配方 | 实测 | 脚本封顶 | 增长源 |
 |---|---|---|---|---|
-| 1 造塔计划 | 1 | 3 | ≤ 15 | 聚合式，恒定 |
-| 2 经济台账 | 2a / 2b / 2c | 33 / 2 / 50 | ≤ 150 | 钱动了多少回 |
-| 3 任务结局 | 3a / 3b | 2 / 15 | ≤ 40 | session 数 |
-| 4 判题器裁定 | 4a / 4b | 14 / 8 | ≤ 80 | 提交次数 / 出错回合数 |
-| 5 封门 | 5a / 5b / 5c | 52 / 3 / 1 | ≤ 80（5a） | **每天最多 15 行** |
-| 6 夜间塔况 | 6a / 6b | 3 / 7 | ≤ 40 | 聚合式，恒定 |
+| 1 造塔计划 | 1 | 3 | 20 | 聚合式，恒定 |
+| 2 经济台账 | 2a / 2b / 2c | 33 / 2 / 50 | 60 / 20 / 60 | 钱动了多少回 |
+| 3 任务结局 | 3a / 3b | 2 / 15 | 20 / 40 | session 数 |
+| 4 判题器裁定 | 4a / 4b | 14 / 8 | 40 / 40 | 提交次数 / 出错回合数 |
+| 5 封门 | 5a / 5b / 5c | 52 / 3 / 1 | 160 / 20 / 20 | **每天最多 15 行** |
+| 6 夜间塔况 | 6a / 6b | 3 / 7 | 20 / 40 | 聚合式，恒定 |
 
-- 表 5 的 5a 是唯一按回合线性长的：黄昏窗口一天就 15 回合，所以**每天封顶 15 行**，10 天最多
-  150 行加 10 行封门。它超预算不是"贴多了"，是"门开太久了"——正是我要看的，**照贴**。
-  真想省地方就先贴 5b（每天几行），我点名要哪天的 5a 再补。
-- 总量目标 **≤ 400 行 / 15 KB**。issue 正文上限 65536 字符，这个预算留了 4 倍余量给回执和正文。
+**封顶在脚本里，不用你数**：跑一次最多 560 行（那是"每天都出问题"的极端场），典型一场 193 行
+/ 4.8 KB。被截断的节会自己写明「本表共 N 行」——**看到那句就照贴，我会知道哪节被切了**。
+
+- 表 5 的 5a 是唯一按回合线性长的：黄昏窗口一天就 15 回合，所以**每天封顶 15 行**，10 天
+  150 行加 10 行封门，正好是它 160 的上限。它长不是"贴多了"，是"门开太久了"——正是我要看的。
+  真想省地方就先贴 5b（一行一天），我点名要哪天的 5a 再补。
 - 不要只贴头几行，也不要用"结论：正常"代替表格——结论由我来下，你给我行。
 - 表下可以写一两句你怎么读它，但**行必须在**。
 
@@ -681,6 +720,7 @@ grep '^{' ours.jsonl | jq -r 'select(.event=="night_debug")
 receipt.tasks_ours[].score：拿不到——对局详情页只有总分，没有逐 session 分。
 receipt.enemy_seen：拿不到——对手基地等级/塔数/墙数在详情页上没有，我方 stdout 也看不见。
 表 4b：本场 ours.jsonl 里 errors 全程缺席，不确定是"真没错误"还是"事件没写"。
+collect_log.sh：跑不了——机器上没有 jq，报错原文：jq: command not found；六张表这次没跑。
 ```
 
 最后一条尤其重要：**"配方命中 0 行"和"这件事没发生过"是两件事**，分不清就说分不清。
@@ -749,7 +789,7 @@ agent_request:
       - issue_header_fields
       - coach summary line
       - the six evidence tables (issue_body.parts[2])
-      - budget_lines_total: 400
+      - pasted_via: bash tools/collect_log.sh <log>  (one command, output pasted whole)
     local_only:
       desc: yours to keep, never to send
       items:
@@ -797,7 +837,7 @@ agent_request:
     - anything unobtainable is named in the gaps part with a reason, never silently omitted
     - all six evidence tables were run, each present even when it matched zero rows
     - no evidence table was replaced by a verdict
-    - the six tables together are <= 400 lines (the gate table is the one allowed to run over)
+    - the six tables came from `bash tools/collect_log.sh <log>`, pasted whole, nothing hand-edited
     - no local path appears anywhere in the issue body
     - the issue asks us nothing back
   issue_body:
@@ -821,7 +861,8 @@ agent_request:
           path — a file on your disk is not a deliverable. If one table blows past its budget
           either paste it anyway and say why (gate table: the gate WAS open that long) or
           paste the summary recipe instead.
-        budget_lines_total: 400
+        produced_by: bash tools/collect_log.sh <log>
+        cap_lines_total: 560   # what the script's per-section caps add up to; a typical battle prints 193
         tables:
           - id: tower_plan
             name: 造塔计划
@@ -940,7 +981,8 @@ day rather than an aggregate. Do not attach it, and do not send the opponent log
 4. **Six evidence tables** (§7.3) — tower_plan, the buy/sell/shopping ledger, task_ended
    endings, the judger's verdicts, the wall gate, and night_debug. Every recipe is already an
    aggregate: all six together come to 193 lines / 4.8 KB on a 10-day, 3-tower, 16-session
-   battle, against a 400-line budget. **This is the part we need most**: you can see the
+   battle. One command produces all six (`tools/collect_log.sh`), so there is nothing to
+   decide about how much to paste. **This is the part we need most**: you can see the
    result and we cannot, so these tables are the only process data that reaches us. A table
    replaced by a verdict is worth nothing, and "the recipe matched zero lines" is not the same
    claim as "it did not happen".
