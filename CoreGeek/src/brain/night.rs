@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use crate::brain::{
-    combat, economy, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan,
+    break_out, combat, economy, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan,
 };
 use crate::model::{chebyshev, footprint_distance, Turn, Unit, UnitKind};
 use crate::protocol::{Pos, RoleCommand};
@@ -330,6 +330,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         // single hardest failure to diagnose from the logs (battles pk575060 /
         // pk575098 / pk575557), so each idle tower now carries its own reason.
         let mut idle_reason = "fired";
+        // Set when the round's command is a demolition rather than a step: the
+        // row then reads `controller_digging`, which keeps "cutting a way in"
+        // distinguishable from "walking in" in table 6b.
+        let mut digging = false;
         // `(pos, operating cells, adjacent walls of ours)` when the recall
         // could not move the controller at all — see the `controller_stuck`
         // branch below for what the three numbers answer.
@@ -367,6 +371,31 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 if let Some(cmd) = walk_or_remove_wall(turn, controller, &stands, &mut ignored) {
                     plan.push(controller.id, cmd);
                     moved = true;
+                } else if let Some(cmd) = break_out(turn, controller, &stands, &mut ignored) {
+                    // POCKET ESCAPE (issues #126-#130). `walk_or_remove_wall`
+                    // refuses to cut a wall unless that one cut reopens the
+                    // route, so a controller two walls deep — or in a pocket
+                    // whose single adjacent wall leads nowhere — issues NO
+                    // command at all and stands on the same cell until dawn:
+                    // 126's 20040 for 11 rounds at (27,13), 129's 20020 for 14
+                    // at (32,10). Both guns were silent for the whole night —
+                    // and 126's role is the one `wall_gate_open` named on all 11
+                    // dusk rounds of that day, so the ring only closed on the
+                    // hard deadline. Cutting and stepping toward the post are
+                    // the only moves that change anything; see `break_out`.
+                    crate::log::event(
+                        "break_out",
+                        serde_json::json!({
+                            "round": turn.round_no,
+                            "role": controller.id,
+                            "tower": *tower_id,
+                            "action": cmd.action,
+                            "from": [controller.pos.x, controller.pos.y],
+                        }),
+                    );
+                    digging = cmd.action == "remove";
+                    plan.push(controller.id, cmd);
+                    moved = true;
                 }
             }
             // WHY IT COULD NOT MOVE (issues #121-#125). `controller_stuck` is
@@ -400,7 +429,9 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             // off, so the gun is still reached the honest way. A controller
             // that cannot get there at all reports `controller_stuck` instead
             // of standing in the open all night.
-            idle_reason = if moved {
+            idle_reason = if digging {
+                "controller_digging"
+            } else if moved {
                 "controller_walking"
             } else {
                 "controller_stuck"
@@ -433,6 +464,33 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 }
             } else {
                 idle_reason = "cooldown";
+                // THE RELOAD IS MASON TIME (issues #126-#130).
+                //
+                // A rocket pad fires once every three rounds
+                // (`choose_rocket` + the 3-round cooldown of 任务书 4.5), so it
+                // spends most of the night reloading: `cooldown` is 36 rounds
+                // for 129's 20040, 33 for 127's 10040, **51 for 126's 20040** —
+                // the single largest idle bucket in the batch after `fired`.
+                // The operator stands next to the gun doing nothing, because
+                // every spare duty below belongs to an UNPAIRED role and every
+                // controller is paired during an assault.
+                //
+                // Those are exactly the rounds the wall needs. The wall is what
+                // the night is actually spent on — `ourWallLost` ran 2000-14335
+                // a night in these five matches, and the station behind it fell
+                // on night 1-3 in four of them — and `WallFixer` restores its
+                // target to FULL HP for 10 gold (任务书 5.x: "目标坐标所在围墙
+                // 回满血"), which is the cheapest HP on the board by a wide
+                // margin. A round the gun cannot fire is a free round of it.
+                //
+                // Gated on `tower.cooldown != 0` so a shot is never traded for a
+                // mend, and on no robot being ADJACENT to the operator: a robot
+                // within one cell means it is being meleed, and that is the
+                // withdraw/heal case, not the mason's.
+                if let Some(cmd) = cooldown_repair(turn, controller) {
+                    idle_reason = "mending";
+                    plan.push(controller.id, cmd);
+                }
             }
             // The controller holds position (no command) to stay adjacent.
         }
@@ -626,6 +684,52 @@ fn night_medicine(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
         return Some(RoleCommand::use_item("Medicine"));
     }
     None
+}
+
+/// Mend the weakest wall this operator is standing beside, if the gun it mans
+/// cannot fire this round anyway.
+///
+/// See the call site for why the cooldown window is the one place a paired
+/// controller may spend a round on the wall. The predicates, in order:
+///
+///   * it carries a `WallFixer` — the item is the whole errand, and a role
+///     without one has nothing to mend with;
+///   * no live robot is ADJACENT to the operator (chebyshev <= 1). Robots shoot
+///     from three cells (任务书 4.7.2), so a wall being chewed from two cells
+///     out is still repairable; a robot on the operator's own cell means it is
+///     being meleed and the heal/withdraw rules own that round;
+///   * an own wall of ours is ADJACENT and below its level's maximum, taken
+///     weakest first — the same ranking the day's `repair_target` uses, and the
+///     wall the night is closest to losing.
+///
+/// Bounded to one mend per round, which is what one action per role allows.
+fn cooldown_repair(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
+    if role.count_item("WallFixer") == 0 {
+        return None;
+    }
+    let meleed = turn
+        .robots
+        .iter()
+        .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= 1);
+    if meleed {
+        return None;
+    }
+    let target = turn
+        .walls()
+        .into_iter()
+        .filter(|wall| chebyshev(role.pos, wall.pos) == 1)
+        .filter(|wall| wall.health < combat::wall_max_hp(wall.level))
+        .min_by_key(|wall| (wall.health, wall.pos.x, wall.pos.y))?
+        .pos;
+    crate::log::event(
+        "wall_mend",
+        serde_json::json!({
+            "round": turn.round_no,
+            "role": role.id,
+            "target": [target.x, target.y],
+        }),
+    );
+    Some(RoleCommand::use_item_at("WallFixer", target))
 }
 
 /// Break contact with a controller that has run out of ways to survive.

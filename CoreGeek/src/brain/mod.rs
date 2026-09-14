@@ -138,7 +138,17 @@ pub fn decide_with(state: &mut BotState, raw_body: &[u8]) -> Result<String, Stri
     let response = Response {
         roleCommandMap: sanitized,
         prompt: plan.prompt.unwrap_or_default(),
-        executeCmd: plan.execute_cmd.unwrap_or_default(),
+        // The sandbox prelude is prepended HERE, at the boundary where bytes
+        // leave for the judger, rather than inside the task loop: `Plan`
+        // stays the model's script (which is what the SOP cache stores and
+        // replays) and every caller that inspects `execute_cmd` keeps seeing
+        // the script rather than the environment. See `task::sandbox_prelude`
+        // for the three sandbox failures it removes.
+        executeCmd: plan
+            .execute_cmd
+            .as_deref()
+            .map(task::sandbox_command)
+            .unwrap_or_default(),
     };
     serde_json::to_string(&response).map_err(|err| err.to_string())
 }
@@ -537,6 +547,87 @@ pub fn tower_stand_cells(turn: &Turn, tower_pos: Pos) -> Vec<Pos> {
     } else {
         inner
     }
+}
+
+/// The escape of last resort for a role our own ring has shut out.
+///
+/// [`walk_or_remove_wall`] only ever tears down a wall whose removal makes the
+/// goal reachable **this round**. That is right when the pocket is one wall
+/// deep and wrong when it is not: with no single removal that opens the route
+/// the predicate is false for every candidate, no command is issued at all, and
+/// the role stands on the same cell until the night ends. Measured across
+/// issues #126-#130, which is exactly what the `stuck` triple added in v17 was
+/// built to expose:
+///
+///   * 126 tower 20040 `controller_stuck@27,13/5/1` — **11 consecutive rounds**
+///     on one cell with one adjacent own wall, its gun silent for the whole of
+///     day 3's night, and the same role the one `wall_gate_open` named on all 11
+///     dusk rounds of that day (the seal happened only on the hard deadline);
+///   * 129 tower 20020 `controller_stuck@32,10/3/3` — **14 rounds**, three
+///     adjacent own walls, none of which alone reopened the route;
+///   * 128 `20040@34,5/5/0` x3 and 130 `20020@30,11/3/0` x5 — the same freeze
+///     with nothing adjacent to cut at all, which is the half of the batch the
+///     fix must stay silent on;
+///   * 127's 19 `controller_stuck` rounds, from before v17's triple existed to
+///     say which cell they were on.
+///
+/// §15.3 of the workflow spec predicted the reading: a repeated `@x,y` is a
+/// pocket, not slowness, and `M > 0` with the role still stuck is the shape of
+/// the wall line rather than a missing demolition. So the post is approached by
+/// MOVEMENT when no route exists, in two steps, whichever makes progress:
+///
+///   1. cut an adjacent wall of ours that strictly shortens the distance to the
+///      nearest operating cell — one wall per round, the same rate the ring crew
+///      builds them, and the only move that changes the position at all;
+///   2. failing that, STEP onto a neighbour that strictly shortens the same
+///      distance. Without this the trick above is a one-round cure: the role
+///      cuts `(6,5)`, and on the next round it has no adjacent wall left to cut
+///      and no route to walk, so it freezes one cell short of the gap it just
+///      opened. The step is the half that actually gets it home.
+///
+/// Deliberately narrow. Every candidate must strictly reduce the distance to the
+/// post, so a role in a pocket whose only walls lead nowhere still reports
+/// `controller_stuck` rather than chewing the ring for nothing; the search is
+/// monotone, so it cannot oscillate; and the day planner keeps
+/// `walk_or_remove_wall`'s stricter predicate untouched — the demolition hatch
+/// that protects the dusk seal is not widened by this.
+pub fn break_out(
+    turn: &Turn,
+    role: &Unit,
+    stands: &[Pos],
+    claimed: &mut HashSet<Pos>,
+) -> Option<RoleCommand> {
+    if stands.is_empty() {
+        return None;
+    }
+    let distance = |from: Pos| {
+        stands
+            .iter()
+            .map(|stand| chebyshev(from, *stand))
+            .min()
+            .unwrap_or(i32::MAX)
+    };
+    let here = distance(role.pos);
+    if let Some(pos) = turn
+        .walls()
+        .into_iter()
+        .map(|wall| wall.pos)
+        .filter(|pos| chebyshev(role.pos, *pos) == 1)
+        .filter(|pos| distance(*pos) < here)
+        .min_by_key(|pos| (distance(*pos), pos.x, pos.y))
+    {
+        return Some(RoleCommand::remove(pos));
+    }
+    let blocked = turn.blocked_for(role.id);
+    let closer: Vec<Pos> = neighbours(role.pos)
+        .into_iter()
+        .filter(|pos| turn.is_land(*pos) && !blocked.contains(pos))
+        .filter(|pos| distance(*pos) < here)
+        .collect();
+    if closer.is_empty() {
+        return None;
+    }
+    walk_toward(turn, role, &closer, claimed)
 }
 
 /// Walk toward `stands`; when the pathfinder finds no route (our own wall

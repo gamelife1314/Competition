@@ -1,5 +1,18 @@
 # 对战数据交付规范（workflow agent 接口）
 
+> **版本 v18** · 本文档是内网自动对战 workflow 的**交付规范**。
+> **v18 只加一节：§16 请求十一**，别的什么都没动——交付方式、**收集命令一个字没变**，
+> 你那边**不需要做任何新动作**：重跑一次那条命令就会多印一段**表 9（逐 session 分数
+> 归属）**。行数预算 680 → **700**。
+> 起因是 2026-09-14 那五场（issue #126-#130）：**又是五场 0:3**，而表 8 给出的答案是
+> 「**我方基地在夜 1-夜 3 被打爆**」——五场里四场活不过第二夜，`scoreAttr.survival`
+> 全程停在 0-30，而应得是 100-150。基地一倒 `score` 就冻住（#130 停在 102，#127 停在
+> 53），后面四天的击杀分全部不计。所以这一批的两处改动都在防守侧（见 §16.4），而它们
+> **没法只靠现有的表验收**：表 8 的 `residual` 是**全场累计**的，一场里改了任务线、
+> 分数涨在一个 session 上，累计列上看不出来；城墙被修回来多少血，现在**一格都没有**。
+> §16 就是把这两件事补成可直接读的两列。**收集命令一个字没变**，照旧：
+> `python tools/collect_log.py <日志文件>`。
+>
 > **版本 v17** · 本文档是内网自动对战 workflow 的**交付规范**。
 > **v17 加两节：§14 请求九 + §15 请求十**，别的什么都没动——交付方式、**收集命令一个字
 > 没变**，你那边**不需要做任何新动作**：重跑一次那条命令就会多印一段**表 8（分数拆解）**，
@@ -1417,3 +1430,88 @@ python tools/collect_log.py <你的日志文件>
 
 **`@x,y` 每回合都在变** = 角色其实在走，只是走得慢（`controller_walking` 那一类），
 不用动召回逻辑，该动的是黄昏归位的提前量。
+
+---
+
+## 16. 请求十一：把 score_1 摊到每个 session 上，把城墙的血记成一本账（v18）
+
+### 16.1 这一节要什么
+
+**一半不用你做新动作**：重跑一次那条命令就行，
+
+```bash
+python tools/collect_log.py <你的日志文件>
+```
+
+脚本会自己多印一段**表 9**（每个 session 一行，封顶 30 行）。字段全部来自我们自己
+`round` 记录里已经有的 `scoreAttr` / `taskGoldEarned`，加上 `task_started` /
+`task_ended` 的回合号：
+
+```text
+----- 表 9 · 逐 session 分数归属　列：session 接取回合 结束回合 结束原因 成功 回合内 residual 变化 回合内 taskGoldEarned 变化 -----
+1	11	27	timeout	false	-38	0
+2	26	40	timeout	false	-22	0
+3	31	46	timeout	false	+9	0
+```
+
+**另一半是新字段，一条就够**：`task_started` 请带上这个任务点的
+`scoreReward` 与 `goldReward`（`teamOur.playerTasks[]` 里一直有，我们没有落盘）：
+
+```json
+{"event":"task_started","data":{"round":12,"timeout":26,"scoreReward":150,"goldReward":30,"head":"请阅读task_1_beijing.md，获取任务信息"}}
+```
+
+### 16.2 为什么需要
+
+**第一，`score_1` 是这五场里唯一一笔没被量过的分。** 表 8 的 `residual`（= `score_1`
+加归属误差）**是全场累计的**：#130 从 R1 的 -10 走到 D4 的 -123，中间七个 session
+哪一个贡献了多少，累计列上完全看不出来。而我们这一批改的正是任务线的两处——
+沙盒前的固定预处理（`表 4d` 的 `exit_nonzero`/`no_answer_marker` 一共 22 次）和
+答案形状，两处都**只影响某一个 session**。没有表 9，「改了有没有用」只能靠
+「表 3a 的 `confirmed_success` 从 0 变成几」去猜，而那一列**本来就是 0**（五场 27 个
+session 全部 `success: false`）。
+
+**第二，`task_started.scoreReward` 是一个 session 的天花板。** ch.6 写明
+`score_1 = 任务积分奖励 + 5 × 标准回合数 / 实际完成回合`，而"任务积分奖励"我们从没记过。
+一个值 300 分的 session 和一个值 20 分的 session 值得投入完全不同的回合数——现在
+日志里两者长得一模一样，于是每个 session 都被当成 250 回合的通用任务在跑。
+
+**第三，城墙只记了"丢"没记"补"。** `coach_night` 有 `ourWallLost`，表 6a 有塔的沉默
+原因，而**城墙回血一格都没有**。这一批新加了夜间的修墙（炮冷却时操作手用 WallFixer
+补身边那面墙，见 §16.4），它每回合最多修 1 面、修一次回满——效果**只体现在"第二天
+天亮城墙还剩多少"上**，而那个数现在读不到。
+
+### 16.3 建议格式
+
+**表 9（脚本印）**：按 session 把 `scoreAttr.residual` 和 `taskGoldEarned` 的
+**首末差值**摊出来。一个 session 的区间 = `task_started.round` 到 `task_ended.round`，
+没有 `task_started` 的用 `task_accept.round`。
+
+**新增字段（一行）**：`task_started.scoreReward` / `task_started.goldReward`，
+取自 `teamOur.playerTasks[]` 里该任务点的 `scoreReward`/`goldReward`。
+
+**夜间城墙收支（一行）**：每天夜里（我们自己的 `round` 里 `isDay:false` 的区间）
+把 `wall.hp` 的**首值、末值、以及区间内每一次上升之和**印成一行，形如
+`第几夜 黄昏HP 天亮HP 修回HP`。`wall.hp` 是 `round` 里 `chg` 带 `wall` 时才有值的块，
+按 §2 规则 2 带值前行即可；`sum(上升)` 就是修墙真正补回来的血。
+
+### 16.4 这一批改了什么（不必再报）
+
+- **固定沙盒预处理**（`executeCmd` 开头自动加一段，模型看不到也不用写）：把任务目录下
+  `check`/`*.sh` 的 CRLF 去掉并加执行位、导出 UTF-8 locale 与 `PYTHONIOENCODING`。
+  对应 `表 4c` 里点名过两次的 `/bin/sh^M: bad interpreter`（#127 r18、r173）
+  和 `'ascii' codec can't encode characters in position 33-34`（#127 r39）。
+  **预期**：`表 4d` 的 `exit_nonzero` 从每场 2-8 降到 0-2。
+- **夜召的死口袋**（`表 6b` 的 `@x,y/N/M`）：`walk_or_remove_wall` 只在"拆这一面就能通"
+  时才动手，口袋深两层就一条指令都不发。现在改成**朝炮位拆**、拆完**再走进那个缺口**。
+  对应 `#126 20040@27,13/5/1 ×11`（同一角色也是当天 11/11 个黄昏回合 `wall_gate_open`
+  点名的那一个）、`#129 20020@32,10/3/3 ×14`。
+  **预期**：`表 6b` 里 `controller_stuck` 的同一格连续回合数从 11-14 降到 ≤3，
+  多出 `controller_digging` 与 `break_out` 两个事件名。
+- **炮冷却时修墙**：塔 `cooldown` 那 33-51 个回合（#126 的 20040 独占 51）操作手原本
+  站着不动，现在用 WallFixer 补身边最破的那面己方墙（**同格有机器人时不修**）。
+  **预期**：新增 `wall_mend` 事件；配合 §16.3 的城墙收支，`修回HP` 应显著大于 0，
+  且 `表 8` 的 `我方基地HP` 每天收盘值抬升。
+
+**拿不到就照 §7.4 写「拿不到 + 为什么」，不要填 0。** 「修了 0 面墙」和「没记这件事」
+长得一样，而这两件事的结论正好相反。

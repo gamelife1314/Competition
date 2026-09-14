@@ -189,6 +189,61 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
     }
 }
 
+/// The fixed setup block prepended to every command that goes to the sandbox.
+///
+/// The model's script is the answer to the task; this is the answer to the
+/// ENVIRONMENT, and it is the same bytes every round because the three failures
+/// it removes are properties of the sandbox rather than of any one task.
+/// Measured across issues #126-#130 (`表 4d` counts them as `exit_nonzero` and
+/// `no_answer_marker`):
+///
+///   * `表 4d` counts, per match, `8 exit_nonzero` + `6 no_answer_marker` (#126),
+///     `5 + 4` (#128), `7 + 3` (#129), `2 + 7` (#127), `3` (#130) — 22 commands
+///     across the batch that never reached their own `ANSWER:` line. A session
+///     has a 24-46 round budget and a failed command costs about four of them,
+///     so three failures is the session: all 27 ended `success: false`.
+///   * the one named cause with a verbatim line attached is the Windows
+///     checkout the task files come from. #127 r18 and r173 both died on
+///     `/bin/bash: ./check: /bin/sh^M: bad interpreter: No such file or
+///     directory` — session 1 lost six rounds to it and session 4 eight.
+///   * `'ascii' codec can't encode characters in position 33-34: ordinal not in
+///     range(128)` (#127 r39) — a Python sandbox that defaults to ASCII because
+///     the locale is unset, on a task whose field names are Chinese.
+///
+/// The prompt has warned about the first since v14 (rule 12) and the model still
+/// walks into it; doing it in the prelude is deterministic and costs the model
+/// nothing.
+///
+/// Three rules the block obeys, because it runs in front of arbitrary model
+/// output:
+///
+///   1. it prints NOTHING, so `ANSWER:`/`FIELDS:`/`SCHEMA:` scanning is
+///      unaffected;
+///   2. every statement ends in `|| true` and none of them is `set -e`, so a
+///      sandbox without `find`/`sed`/`chmod` still runs the model's script;
+///   3. it never changes the working directory — a relative path the model was
+///      told to verify must still resolve the way the model expects.
+///
+/// `sed -i` without a suffix is the GNU form, which is what the sandbox has
+/// (the failure text above is Linux bash with python3.11). `|| true` covers the
+/// rest.
+pub fn sandbox_prelude() -> &'static str {
+    concat!(
+        "# --- coregeek prelude: fixed sandbox setup, not model output ---\n",
+        "export LC_ALL=C.UTF-8 LANG=C.UTF-8 PYTHONIOENCODING=utf-8 PYTHONUTF8=1 2>/dev/null || true\n",
+        "find /tmp/selfEvolutionTask -type f -name 'check' -exec chmod +x {} + 2>/dev/null || true\n",
+        "find /tmp/selfEvolutionTask -type f \\( -name 'check' -o -name '*.sh' \\) ",
+        "-exec sed -i 's/\\r$//' {} + 2>/dev/null || true\n",
+        "# --- end prelude ---\n",
+    )
+}
+
+/// The exact bytes that go to the sandbox for a script the task loop produced.
+/// Split out so the prelude can be asserted on the wire without a whole match.
+pub fn sandbox_command(cmd: &str) -> String {
+    format!("{}{}", sandbox_prelude(), cmd)
+}
+
 /// Parse the "[exitCode:N]" header; None for TIMEOUT/JUDGER_ERROR/raw output.
 pub fn exit_code(result: &str) -> Option<i64> {
     let rest = result.strip_prefix("[exitCode:")?;
@@ -486,6 +541,10 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     prompt.push_str("10. **不要使用 `set -e`**：脚本中途任何一条命令非 0 退出都会让整条命令以非 0 结束、丢掉后面所有的输出。要容错就写 `cmd || true`。\n");
     prompt.push_str("11. `FIELDS:`、`SCHEMA:`、`ANSWER:` 这三行**必须用 `echo` 打印**（例如 `echo \"FIELDS: $F\"`）。直接写成裸行会被 shell 当成命令，报 `FIELDS:: command not found` 并让整条命令失败——上一批有 4 个 session 就是这么丢掉答案的。\n");
     prompt.push_str("12. 任务文件自带的检查脚本（如 `ws_1/check`）可能是 Windows 换行，直接 `./check` 会报 `bad interpreter: /bin/sh^M`。**先 `sed -i 's/\\r$//' <脚本>` 再用 `bash <脚本>` 运行**，不要因为这一步失败就放弃答案：答案往往就在这个脚本的输出里（例如它打印的 `TOKEN: …`）。\n");
+    // The prelude does 12 for the model, so a script that opens with it is
+    // spending a round on a step that already ran. Say so, or the model keeps
+    // narrating the setup it no longer needs to do.
+    prompt.push_str("13. 命令开头已经自动加好了一段固定环境预处理（UTF-8 locale、把任务目录下 `check`/`*.sh` 的 CRLF 去掉并加执行位），**不要再写这些准备步骤**，直接从侦察/计算开始；也不要 `cd` 到没有 `find`/`ls` 确认过的路径（`cd` 失败会让后面所有相对路径写到只读目录、报 `Permission denied`——上一批 4 个 session 因此丢掉了答案）。\n");
     if !state.task.discovered_fields.is_empty() {
         prompt.push_str(&format!(
             "\n已从任务文件确认的输出字段：{}。ANSWER 的 JSON 必须恰好包含这些字段，不多不少。\n",
