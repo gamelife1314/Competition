@@ -414,6 +414,35 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 "deadline": head.latest_round,
                 "affordable": !budget.shopping.is_empty(),
                 "buyerShopDist": buyer_dist,
+                // WHY THE BUYER IS NOT AT THE COUNTER (issues #156-#160). The
+                // purchase is the whole errand and the two numbers that decide
+                // it — the round trip and the round the buyer has to be home by
+                // — were nowhere in the log, so "75 rounds affordable, no
+                // purchase" (表 2b/2a of pk590730) could only be read as a
+                // mystery. `shopTrip` is the decision `worker_day` will take
+                // this round: `walk` (the errand is worth taking), `no_time`
+                // (it cannot be finished before dusk), `pack_full` (no slot for
+                // the goods) or `sale_first` (there is ore to sell and the trip
+                // is not worth taking yet). `trip` is the round-trip estimate in
+                // rounds and `lockRound` the pre-position deadline it is
+                // measured against.
+                "shopTrip": buyer_id
+                    .and_then(|id| turn.role_by_id(id))
+                    .map(|role| shop_trip_decision(turn, role, &pairs, &budget.shopping))
+                    .unwrap_or("no_buyer"),
+                "trip": buyer_id
+                    .and_then(|id| turn.role_by_id(id))
+                    .and_then(|role| shop_round_trip(turn, role, &pairs)),
+                "lockRound": buyer_id
+                    .and_then(|id| turn.role_by_id(id))
+                    .map(|role| {
+                        pairs
+                            .iter()
+                            .find(|(controller, _)| *controller == role.id)
+                            .and_then(|(_, tower)| turn.role_by_id(*tower))
+                            .map(|tower| preposition_round(chebyshev(role.pos, tower.pos)))
+                            .unwrap_or(economy::DUSK_ROUND)
+                    }),
                 "needs": budget.intent.iter().map(|need| need.name.as_str()).collect::<Vec<_>>(),
                 "ready": budget.shopping.iter().map(|need| need.name.as_str()).collect::<Vec<_>>(),
             }),
@@ -704,7 +733,42 @@ fn worker_day(
                 .iter()
                 .any(|vendor| chebyshev(role.pos, *vendor) == 1)
                 && economy::should_sell(turn, state, role, stone_demand);
-            if turn.in_day_round >= deadline && !at_counter {
+            // THE SECOND COUNTER EXCEPTION, and it is the same one (issues
+            // #156-#160): a buyer already on a shop errand that still finishes
+            // before dusk is worth more at the counter than at the post, and
+            // the lock-in is what has been turning it around four cells short
+            // of it. `shop_errand_fits` is the same predicate `buyer_flow`
+            // starts the walk with, so the two cannot disagree: a trip that was
+            // allowed to start is a trip this lock waits for, and one that was
+            // not allowed to start never gets this far.
+            //
+            // The arrival it allows is bounded by dusk, not by
+            // `preposition_round`'s three rounds of detour slack — so the post
+            // is still manned before nightfall, and the unconditional night
+            // recall (night.rs) owns the rest. What it buys is the purchase
+            // itself: pk590730's 130 gold never reached the counter, and a
+            // 1500-HP base at level 2 is what the night was missing.
+            let on_shop_errand =
+                Some(role.id) == buyer_id && shop_trip_worth_taking(turn, role, pairs, &budget.shopping);
+            // Logged only on the rounds the lock actually gives way, which is
+            // the whole finding: the three or four rounds a match where the
+            // buyer is past its deadline with the counter still reachable. A
+            // record on every shopping round would be forty lines a day of the
+            // same facts.
+            if on_shop_errand && turn.in_day_round >= deadline {
+                crate::log::event(
+                    "shop_trip",
+                    serde_json::json!({
+                        "round": turn.round_no,
+                        "role": role.id,
+                        "decision": "protected",
+                        "inDayRound": turn.in_day_round,
+                        "trip": shop_round_trip(turn, role, pairs),
+                        "lockRound": deadline,
+                    }),
+                );
+            }
+            if turn.in_day_round >= deadline && !at_counter && !on_shop_errand {
                 // "Arrived" is a cell the gun can be OPERATED from, not merely
                 // one within a chebyshev cell of it. A gun's diagonal
                 // neighbours sit on the radius-2 wall ring: a controller that
@@ -1013,9 +1077,12 @@ fn worker_day(
     if committed {
         // fall through: steps 8 and 9 still run, everything below them is
         // replaced by the lock-in.
-    } else if buyer_id == Some(role.id) && !economy::should_sell(turn, state, role, stone_demand) {
+    } else if buyer_id == Some(role.id)
+        && (shop_trip_worth_taking(turn, role, pairs, &budget.shopping)
+            || !economy::should_sell(turn, state, role, stone_demand))
+    {
         if !budget.shopping.is_empty() {
-            if let Some(cmd) = buyer_flow(turn, role, &budget.shopping, claimed) {
+            if let Some(cmd) = buyer_flow(turn, role, &budget.shopping, pairs, claimed) {
                 plan.push(role.id, cmd);
                 return;
             }
@@ -1648,6 +1715,7 @@ fn buyer_flow(
     turn: &Turn,
     role: &Unit,
     shopping: &[economy::Need],
+    pairs: &[(i64, i64)],
     claimed: &mut HashSet<Pos>,
 ) -> Option<RoleCommand> {
     let need = shopping.first()?;
@@ -1676,7 +1744,145 @@ fn buyer_flow(
         }
         return None; // wait for gold or backpack space
     }
+    // NOT WITHOUT TIME TO FINISH (issues #156-#160).
+    //
+    // The shop is the farthest errand on the board and this is the one walk on
+    // it that has to end back at a POST: the buyer is the dedicated economy
+    // worker, which is also a tower controller with a dusk deadline
+    // (`preposition_round`). Nothing used to compare the two, so the walk was
+    // started whenever the shopping list turned non-empty and step 4's lock-in
+    // then turned the role around wherever it happened to be when
+    // `in_day_round + dist_to_post` ran out.
+    //
+    // Measured, pk590730 (day 2): the purse jumps to 130 at day-round 23 — 表 2c
+    // prints exactly that — the buyer walks twelve rounds toward the shop,
+    // reaching (28,24), four cells short of the counter, and the lock turns it
+    // around. 表 2a for that match has no voucher in it at all, 表 2b prints 75
+    // rounds with an affordable voucher at the head of the list, and the base
+    // falls on night 2 with score_3 at 10 of a possible 550. Reproduced in
+    // `tests/day1_sim.rs` before this branch existed: the day ends with 144 gold
+    // in the purse and not one `buy`.
+    //
+    // So the errand is time-boxed here instead: it may only be started if the
+    // whole round trip — out to a stand, one round at the counter, back to the
+    // post — still lands before dusk, which is the same budget step 4 measures
+    // the lock-in against. A trip that fits at the start still fits at the
+    // counter (walking out is what shrinks it), and step 4 waives the lock-in
+    // for exactly that window, so a started trip is completed. A trip that does
+    // not fit is not started: the role keeps today's work instead of spending
+    // a dozen rounds being turned around with the purse unspent.
+    if !shop_errand_fits(turn, role, pairs) || role.backpack_full() {
+        crate::log::event(
+            "shop_trip",
+            serde_json::json!({
+                "round": turn.round_no,
+                "role": role.id,
+                "decision": "no_time",
+                "inDayRound": turn.in_day_round,
+                "trip": shop_round_trip(turn, role, pairs),
+                "need": need.name,
+            }),
+        );
+        return None;
+    }
     walk_toward(turn, role, &stands, claimed)
+}
+
+/// Rounds the buyer needs to complete a shop errand from where it stands: walk
+/// out to a stand, spend one round at the counter, walk back to its post.
+/// `None` when no shop stand exists on the board at all.
+///
+/// The geometry is the Chebyshev one the rest of the day planner budgets in
+/// (`economy::shop_travel`, `walk_home`), so this agrees with the deadline
+/// arithmetic rather than with a second estimate of it. It is deliberately not
+/// a path length: a detour around the ring only makes the estimate optimistic,
+/// and the number it feeds is a bound on when to STOP, not a promise of
+/// arrival — the night recall still owns the post.
+fn shop_round_trip(turn: &Turn, role: &Unit, pairs: &[(i64, i64)]) -> Option<i64> {
+    let post = pairs
+        .iter()
+        .find(|(controller, _)| *controller == role.id)
+        .and_then(|(_, tower)| turn.role_by_id(*tower))
+        .map(|tower| tower.pos);
+    let mut best: Option<i64> = None;
+    for shop in turn.weapon_shops() {
+        for stand in stand_cells(turn, shop) {
+            let back = match post {
+                Some(post) => chebyshev(stand, post) as i64,
+                None => walk_home(turn, stand),
+            };
+            let trip = chebyshev(role.pos, stand) as i64 + 1 + back;
+            best = Some(best.map_or(trip, |best: i64| best.min(trip)));
+        }
+    }
+    best
+}
+
+/// Can the buyer still be back behind the wire before dusk?
+///
+/// See [`buyer_flow`] for what the answer decides. The bound is `DUSK_ROUND`
+/// itself and not `HARD_SEAL_ROUND`: a trip that ends inside the dusk window is
+/// the trip that holds the gate open (`wall_gate_open` naming the buyer on
+/// every round of it), which is the hole `dusk_recall_round` exists to close.
+fn shop_errand_fits(turn: &Turn, role: &Unit, pairs: &[(i64, i64)]) -> bool {
+    shop_round_trip(turn, role, pairs)
+        .map(|trip| turn.in_day_round + trip <= economy::DUSK_ROUND)
+        .unwrap_or(false)
+}
+
+/// Is there a purchase to make this round, and can this role still make it?
+///
+/// One predicate for the three places that have to agree about the shop errand
+/// (issues #156-#160), because the defect was exactly that they did not:
+///
+///   * step 7 uses it to let the errand outrank the sale. The buyer is the
+///     dedicated economy worker, whose pack is full of SELLABLE ore by
+///     construction — that is its job — so `should_sell` was true for most of
+///     the day and the shop branch never ran. The one round it did run was the
+///     round after a sale, which is the round the buyer is standing at the
+///     VENDOR, the far corner of the board from the shop, with the pre-position
+///     lock already firing.
+///   * step 4 uses it to hold the lock-in off the walk it would otherwise cut
+///     short (see the call site).
+///   * [`buyer_flow`] uses it to refuse a walk that cannot be finished.
+///
+/// `budget.shopping` non-empty is the whole of "there is a purchase to make":
+/// that list is computed from the gold in hand, so a sale is not what stands
+/// between the buyer and the counter — the walk is. A full backpack is the one
+/// thing that can still make the errand pointless (the goods need a slot), and
+/// the sale that empties it is the next step of the same day.
+fn shop_trip_worth_taking(
+    turn: &Turn,
+    role: &Unit,
+    pairs: &[(i64, i64)],
+    shopping: &[economy::Need],
+) -> bool {
+    !shopping.is_empty() && !role.backpack_full() && shop_errand_fits(turn, role, pairs)
+}
+
+/// The same decision, named — the `shopTrip` column of the `shopping` event.
+///
+/// The three "no" answers are the three ways the errand dies, and they call for
+/// different fixes: `no_time` is a scheduling problem (this batch), `pack_full`
+/// is a slot problem, and `sale_first` is the ore in the pack being worth more
+/// than the trip it would displace. Without the split the next batch reads them
+/// as one number again.
+fn shop_trip_decision(
+    turn: &Turn,
+    role: &Unit,
+    pairs: &[(i64, i64)],
+    shopping: &[economy::Need],
+) -> &'static str {
+    if shopping.is_empty() {
+        return "nothing_affordable";
+    }
+    if role.backpack_full() {
+        return "pack_full";
+    }
+    if !shop_errand_fits(turn, role, pairs) {
+        return "no_time";
+    }
+    "walk"
 }
 
 /// Use a carried robot-summon order against the enemy (harassment), one per

@@ -791,11 +791,17 @@ def drill_day(records, day):
          for r in pick(records, "night_debug") if on_day(r)],
         DRILL_CAP,
     )
+    # 末三列是 v21 §19 要的买家出门账：`shopTrip` 是这一回合买家的决定（walk 出门 /
+    # no_time 当天来回走不完 / pack_full 背包没格 / sale_first 有矿要先卖 /
+    # nothing_affordable 什么都买不起），`trip` 是往返商店需要的回合数，`lockRound`
+    # 是它必须回到炮位的那一回合。表 2b 只印「买得起否」，看不出买得起却没买是卡在
+    # 路上、卡在背包还是卡在没时间——这三列就是那条分界。
     drill(
-        "drill · 第 %d 天商店逐回合　列：回合 买得起否 需求 需求量 价格 金币 预留 最近商店 截止" % day,
+        "drill · 第 %d 天商店逐回合　列：回合 买得起否 需求 需求量 价格 金币 预留 最近商店 截止 出门决策 往返 归位截止" % day,
         [tsv([data(r).get("round"), data(r).get("affordable"), data(r).get("need"),
               data(r).get("needNum"), data(r).get("price"), data(r).get("gold"),
-              data(r).get("reserve"), data(r).get("buyerShopDist"), data(r).get("deadline")])
+              data(r).get("reserve"), data(r).get("buyerShopDist"), data(r).get("deadline"),
+              data(r).get("shopTrip"), data(r).get("trip"), data(r).get("lockRound")])
          for r in pick(records, "shopping") if on_day(r)],
         DRILL_CAP,
     )

@@ -114,6 +114,11 @@ struct World {
     idle_rounds: HashMap<i64, Vec<i64>>,
     /// Per-role command count per round, for the "never stands idle" invariant.
     commands: Vec<(i64, i64, String)>,
+    /// Every step a role was told to take: (round, role, from, to). Kept
+    /// beside `commands` rather than folded into it because the shop-errand
+    /// tests below ask a question about the TARGET CELL — "which way did it
+    /// walk" — and a (round, role, action) triple cannot answer it.
+    moves: Vec<(i64, i64, Pos, Pos)>,
     /// Ore sold per round, so a frozen economy is visible.
     gold_track: Vec<(i64, i64)>,
     /// Every vein the planner dug this match, with the round it was dug from.
@@ -195,6 +200,7 @@ impl World {
             zones,
             wall_builds: vec![],
             removed_walls: vec![],
+            moves: vec![],
             tower_builds: vec![],
             idle_rounds: HashMap::new(),
             commands: vec![],
@@ -348,6 +354,20 @@ impl World {
             let cmd = map[&id.to_string()].clone();
             let action = cmd["action"].as_str().unwrap_or("").to_string();
             self.commands.push((self.round, id, action.clone()));
+            if action == "move" {
+                if let Some(target) = cmd["targetPos"]
+                    .as_array()
+                    .and_then(|list| list.first())
+                    .map(|pos| Pos {
+                        x: pos["x"].as_i64().unwrap_or(0) as i32,
+                        y: pos["y"].as_i64().unwrap_or(0) as i32,
+                    })
+                {
+                    if let Some(from) = self.units.iter().find(|unit| unit.id == id).map(|u| u.pos) {
+                        self.moves.push((self.round, id, from, target));
+                    }
+                }
+            }
             self.apply(id, &action, &cmd);
         }
         self.gold_track.push((self.round, self.gold));
@@ -1041,4 +1061,239 @@ fn the_same_board_produces_the_same_plan_twice() {
         "the same board produced two different plans; a set-iteration order has \
          leaked into a decision"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The shop errand (issues #156-#160).
+//
+// `pk590730`'s day 2 in one line: the purse jumps to 130 gold at day-round 23
+// (表 2c prints 23 → 130 and nothing else until round 152), the buyer walks out
+// toward the weapon shop, and the pre-position lock-in turns it around short of
+// the counter. 表 2a for that match contains no upgrade voucher at all, 表 2b
+// prints 75 rounds with an affordable voucher at the head of the list, and the
+// base falls on night 2 with score_3 at 10 of a possible 550. Four of the five
+// reports in the batch have the same shape (159 is the one that got lucky on
+// the geometry and bought a weapon voucher at r26).
+//
+// `torn_ring_day` rebuilds that board: day 1 is played normally, day 2 starts
+// with six ring cells gone — the night damage every one of those matches took
+// (`ourWallLost` ran 6340-19960 in this batch) — which is also what makes the
+// economy worker the buyer (`wall_work_done` false).
+// ---------------------------------------------------------------------------
+
+/// The buyer: `workers.last()`, the dedicated economy worker.
+const BUYER: i64 = 10003;
+
+/// Play day 1, tear six ring cells out of the night's damage, and play `day`.
+/// `purse_round` is the day-round on which the team's gold jumps to 130 — the
+/// task reward 表 2c shows landing mid-morning in that match. `None` plays the
+/// day with the purse it has.
+fn torn_ring_day(day: i64, purse_round: Option<i64>) -> World {
+    let mut world = run_day_one();
+    let ring: Vec<Pos> = world.ring();
+    let mut removed = 0;
+    for cell in ring.iter() {
+        if removed >= 6 {
+            break;
+        }
+        let before = world.units.len();
+        world.units
+            .retain(|unit| !(unit.kind == "wall" && unit.pos == *cell));
+        if world.units.len() != before {
+            removed += 1;
+        }
+    }
+    let start = (day - 1) * 130 + 1;
+    world.round = start;
+    let last = start + DAY_END - 1;
+    while world.round <= last {
+        let day_round = world.round - start + 1;
+        if Some(day_round) == purse_round {
+            world.gold = 130;
+        }
+        world.step();
+    }
+    world
+}
+
+fn weapon_shop(world: &World) -> Pos {
+    world
+        .zones
+        .iter()
+        .find(|(_, kind)| kind.as_str() == "weaponShop")
+        .map(|(pos, _)| *pos)
+        .expect("the harness board always has a weapon shop")
+}
+
+/// The cells a role can reach the shop from (任务书 4.4: `buy` is issued from
+/// within one cell of the shop). Computed here rather than through
+/// `brain::stand_cells` because that one takes a parsed `Turn`.
+fn shop_stands(world: &World, shop: Pos) -> Vec<Pos> {
+    let mut out = Vec::new();
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let pos = Pos {
+                x: shop.x + dx,
+                y: shop.y + dy,
+            };
+            if pos.x < 0 || pos.y < 0 || pos.x >= WIDTH || pos.y >= HEIGHT {
+                continue;
+            }
+            if world.zones.contains_key(&pos) {
+                continue;
+            }
+            out.push(pos);
+        }
+    }
+    out
+}
+
+#[test]
+fn a_purse_that_arrives_mid_morning_still_reaches_the_counter() {
+    // The regression for issues #156-#160. Measured before the fix: the buyer
+    // closes to (26,22) — two cells from the shop — and the lock-in turns it
+    // around there; the day ends with 144 gold and not one `buy` in it. After:
+    // it reaches a stand cell on day-round 34 and spends 100 gold of it.
+    let world = torn_ring_day(2, Some(23));
+    let shop = weapon_shop(&world);
+
+    let bought = world
+        .commands
+        .iter()
+        .find(|(_, id, action)| *id == BUYER && action == "buy");
+    let (round, _, _) = *bought.unwrap_or_else(|| {
+        panic!(
+            "the buyer never bought anything: the purse reached 130 gold on day-round 23 \
+             and the day ended with {} gold. per-round: {:?}",
+            world.gold,
+            world
+                .gold_track
+                .iter()
+                .map(|(round, gold)| format!("{round}:{gold}"))
+                .collect::<Vec<_>>()
+        )
+    });
+
+    // Where it was standing when it spent the gold: ON a cell the shop can be
+    // bought from, so "it bought" and "it got to the counter" are one fact.
+    let at = world
+        .pos_at(BUYER, round)
+        .expect("the buyer has a recorded position on every round");
+    assert!(
+        chebyshev(at, shop) == 1,
+        "the buyer bought from ({},{}) — {} cells from the shop at ({},{}), not \
+         adjacent to it",
+        at.x,
+        at.y,
+        chebyshev(at, shop),
+        shop.x,
+        shop.y
+    );
+
+    // And the purchase was a real one: at least a voucher's worth left the
+    // purse on that round (任务书 4.6.3: the upgrade vouchers are 100 each).
+    let gold_at = |round: i64| {
+        world
+            .gold_track
+            .iter()
+            .find(|(seen, _)| *seen == round)
+            .map(|(_, gold)| *gold)
+            .expect("gold is tracked every round")
+    };
+    let spent = gold_at(round - 1) - gold_at(round);
+    assert!(
+        spent >= 100,
+        "the buyer spent {spent} gold on round {round}; the upgrade voucher this errand \
+         exists for costs 100"
+    );
+}
+
+/// Six ring cells gone, the night damage every match in the batch took. Also
+/// what makes the economy worker the buyer: `wall_work_done` is false while the
+/// ring has gaps, and the buyer is `workers.last()` (see `plan`).
+fn tear_the_ring(world: &mut World) -> usize {
+    let ring: Vec<Pos> = world.ring();
+    let mut removed = 0;
+    for cell in ring.iter() {
+        if removed >= 6 {
+            break;
+        }
+        let before = world.units.len();
+        world
+            .units
+            .retain(|unit| !(unit.kind == "wall" && unit.pos == *cell));
+        if world.units.len() != before {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+#[test]
+fn a_shop_trip_that_cannot_finish_before_dusk_is_not_started() {
+    // The other half of the same rule, and the reason the fix is a time-box and
+    // not a blanket "shopping outranks the lock-in".
+    //
+    // Board: day 2, day-round 45, ring torn open (so the economy worker is the
+    // buyer) and the purse at 130 with an empty pack. The buyer stands five
+    // cells from its post and ten from the nearest shop stand: the round trip
+    // needs 26 rounds and there are ten left before dusk, and the pre-position
+    // lock-in is not due until day-round 46, so step 7 gets its turn.
+    //
+    // Before the fix the buyer set off anyway — nothing compared the two
+    // numbers — and the lock-in turned it around partway with the purse
+    // unspent. The assertion is on the TARGET CELL of the step it takes.
+    let mut world = run_day_one();
+    assert!(tear_the_ring(&mut world) >= 6, "the day-1 ring was never built");
+    {
+        let buyer = world
+            .units
+            .iter_mut()
+            .find(|unit| unit.id == BUYER)
+            .expect("the buyer is on the board");
+        buyer.pos = Pos { x: 17, y: 20 };
+        buyer.backpack.clear();
+    }
+    world.gold = 130;
+    let shop = weapon_shop(&world);
+    let stands = shop_stands(&world, shop);
+    let nearest_stand = |pos: Pos| -> i32 {
+        stands
+            .iter()
+            .map(|stand| chebyshev(pos, *stand))
+            .min()
+            .unwrap_or(i32::MAX)
+    };
+
+    world.round = 130 + 45; // day 2, day-round 45
+    let here = world.units.iter().find(|unit| unit.id == BUYER).unwrap().pos;
+    world.step();
+
+    // It has to be DOING something — a buyer that froze would pass this test
+    // for the wrong reason.
+    let action = world
+        .commands
+        .iter()
+        .find(|(round, id, _)| *round == 175 && *id == BUYER)
+        .map(|(_, _, action)| action.clone())
+        .unwrap_or_else(|| panic!("the buyer issued no command at all from {here:?}"));
+    // Standing still and working are both fine; walking toward the shop is not.
+    if let Some((_, _, from, to)) = world
+        .moves
+        .iter()
+        .find(|(round, id, _, _)| *round == 175 && *id == BUYER)
+    {
+        assert!(
+            nearest_stand(*to) >= nearest_stand(*from),
+            "the buyer {action}ed its way toward the shop ({:?} -> {:?}: {} -> {} cells \
+             from the counter) with ten rounds left before dusk and a 26-round round trip",
+            from,
+            to,
+            nearest_stand(*from),
+            nearest_stand(*to)
+        );
+    }
 }
