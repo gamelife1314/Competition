@@ -1,8 +1,14 @@
 # 对战数据交付规范（workflow agent 接口）
 
-> **版本 v12** · 本文档是内网自动对战 workflow 的**交付规范**。
+> **版本 v13** · 本文档是内网自动对战 workflow 的**交付规范**。
 > 读者：拉代码 → 发起对战 → 抓日志 → 分析对局 → 生成改进 issue 的 code agent。
-> **v12 只改一件事：跑得动。** 内网 agent 在 **Windows** 上，jq / awk / grep 不保证有
+> **v13 不改交付方式，只加一节：§10 请求六。** 2026-09-14 那批 P0（任务反馈环、第 3 塔
+> 排序、墙优先、不把闲人封死在外）落地后，有三处**观测缺口**浮出来：表 1 从现在起会把
+> "按墙优先主动压住第 2/3 塔"读成"没人走到工地"，表 5c 的 `stuck` 对"无塔可守"的角色永远
+> 为假，而 P0-1 接回去的那段判题器原话落在 prompt 末尾、`prompt_sent.head` 只记头 300
+> 字符——**永远看不到**。三件都写清楚了是什么/为什么/建议格式，你们照旧只交数据、不必
+> 回答。另外 §7.5 里补了 v13 的行为改动，下一批不要把设计好的顺序当成新缺陷再报一遍。
+> **v12 的规矩没变：跑得动。** 内网 agent 在 **Windows** 上，jq / awk / grep 不保证有
 > ——jq 恰恰是 Git for Windows 唯一不自带的那个。所以 §7.3 的六张表换成了**一个 Python
 > 脚本**（`tools/collect_log.py`，只用标准库，不需要 pip install），三个平台同一条命令：
 > `python tools/collect_log.py <你的日志文件>`。输入 `.jsonl` / `.jsonl.gz` / `.zip` 都行，
@@ -689,6 +695,17 @@ collect_log.py：跑不了——机器上没有 Python 3，报错原文：`pytho
   那次 LLM 推断的**唯一输入**，却只存在内存里没落过盘——所以老批次里 `treasure_plan`
   指错了祭坛/祭品/开启日时，无法与"传说被读错了"区分开。老批次里这张表是（0 行）。
 
+**v13（2026-09-14 的 P0 落地）改的是行为，不是日志形状，但它会改变表 1、表 4 的样子**
+——不写在这里，下一批会把设计好的顺序当成新缺陷再报一遍：
+
+- **第 3 塔在第 1 天常常"迟到"**：墙优先闸生效后，第 1 天墙环还没成型时，第 2/3 塔会被
+  **主动跳过**（首塔 gatling 豁免）。表 1 的 `mayBuild` 因此可能出现"为真但两塔不动"的长段，
+  那不是"没人走到工地"（见 §10 请求六之一）；
+- **第 3 塔一经买得起就会建**：`may_build_weapon` 不再为 100 金的升级券扣住金币，所以
+  D2 起"金币到 25 就掉回 0"是正常的（表 2c 会看到这个台阶），不再等于"经济被冻结"；
+- **重试的 prompt 变了**：提交被判错后，prompt 末尾会带判题器的原话反馈（见 §10 请求六之三），
+  所以表 4b 的同一类拒绝不该再连续出现三次同一种错法——若仍然出现，那才是发现。
+
 ---
 
 ## 8. 机器可读指令块
@@ -698,7 +715,7 @@ agent_request:
   target: workflow-driver
   repo: gamelife1314/Competition
   action: deliver_battle_data
-  version: 12
+  version: 13
   model: >
     We see the board (per-round state, both sides' units, our own score/gold) but never the
     result. Our process data reaches us only through stdout — anything not written there is
@@ -881,7 +898,7 @@ agent_request:
 ## 9. English summary
 
 We see the board, never the result. Everything the per-round request carries is ours to log,
-and we do: `/docs/WORKFLOW_REQUEST.md` v12 asks you to (1) keep a raw capture of our stdout,
+and we do: `/docs/WORKFLOW_REQUEST.md` v13 asks you to (1) keep a raw capture of our stdout,
 (2) run one command over it, and (3) paste the batch header fields, one outcome receipt per
 battle, and the six tables into the issue.
 
@@ -918,6 +935,85 @@ ours to do.
 
 The `coach` block is the `--coach` output in §5; the coach itself
 needs no environment variables and no control group from you.
+
+---
+
+## 10. 请求六：v13 落地后新暴露的三处观测缺口
+
+> **这不是新任务，是把六张表补成能回答新问题的样子。**
+> 2026-09-14 的 P0 改完了任务反馈环、第 3 塔排序、墙优先与"不把闲人封死在外"。
+> 改完之后才发现：**有三件事，改动的成败只能从日志里看出来，而日志现在看不见。**
+> 三条都按 `是什么 / 为什么需要 / 建议格式` 写。要不要做、什么时候做你们定；做了就在
+> 下一批的 issue 里自然出现，不必额外说明。
+
+### 请求六之一：`tower_plan` 要能区分"钱够但被墙环闸住"和"钱够但没人走到工地"
+
+**是什么.** `tower_plan` 事件（表 1）加一个布尔字段 `holdForRing`：本轮建塔步骤是否被
+"墙优先"闸主动跳过（第 1 天、墙线仍有缺口、且已经有一座塔）。
+
+**为什么需要.** 表 1 现在的读法（§7.3）是：`mayBuild` 与 `upgradeReachable` 轮流为真而塔
+迟迟不落地 ⇒ **卡点不在钱上，而在"没人走到工地"**。v13 之后这句话在第 1 天**不再成立**：
+`may_build_weapon` 只问"钱够不够"，而第 2/3 塔此时是被计划**主动压住**的——墙环没成型，
+先建塔等于把当天的走路预算花在塔位与墙线之间的折返上（分析 §3.4，实测旧逻辑 R2 建塔、
+全天 3 塔 0 墙）。没有这个字段，下一批的表 1 会把"按设计压住"读成"走路失败"，也就是把
+刚修好的墙优先顺序当成新 bug 再修一遍——上一批 5 场 0:3 里，第 3 塔缺席正是靠表 1 归因的，
+这条读法一错，归因整条都错。
+
+**建议格式.** `tower_plan` 增加一个与 `mayBuild` 同级的字段：
+
+```text
+"mayBuild": true, "holdForRing": true, "towers": 2, "wallGaps": 13, ...
+```
+
+（若只想加一个字段，就让 `mayBuild` 输出**实际生效**的判定——但我们更希望两个都在：
+"钱够不够"和"计划让不让建"是两件独立的事，合起来才能读。）
+
+### 请求六之二：表 5c 的 `stuck` 要包含"无塔可守"的角色
+
+**是什么.** `wall_gate_open` 的 `stuck` 目前只统计**有塔可守、且走不回炮位**的角色。
+请把"无塔可守（空闲）且走不回环内"的角色也算进 `stuck`；`away` 的算法不变。
+
+**为什么需要.** v13 的 P0-3 立的规矩就是：**没有塔可守的角色，家在环内**
+（`interior_cells`，也就是 `update_wall_gate` 判定"所有人都进来了"的那一圈）。
+而 `wall_gate_open` 的 `stuck` 判定只看该角色的**炮位**（`night_goal`），对空闲角色恒为假——
+于是 pk584929 / pk584881 / pk584875 那三场"门 15 回合未封"里，5c 会把空闲角色列进 `away`，
+却**永远不列进 `stuck`**，读表的人只能从坐标猜"它到底是被墙挡住了，还是只是在路上"。这正是
+表 5 存在的理由（"门卡在谁身上"），而它对 P0-3 关心的那一类角色是失明的：下一批若再出现
+整夜不封，我们分不清"空闲角色被封死在外"（P0-3 没修好）和"它只是走得慢"（正常）。
+
+**建议格式.** 字段形状不变（`stuck` 仍是 id 数组），只是集合变大：判定改成
+**该角色到它的夜间岗位不可达**，其中"夜间岗位"= 有塔配对的取炮位、没有塔配对的取环内 band。
+文档 §7.3 表 5 的 `stuck` 说明相应改成一句：
+
+```text
+stuck: away 里根本走不回岗位的那几个——有塔可守的回不了炮位，没塔可守的回不了环内 band。
+```
+
+### 请求六之三：提交记录要能看出"判题器的原话有没有进 prompt"
+
+**是什么.** `task_answer_submit` 增加一个字段，记录这次重试的 prompt 里带了几条判题器
+原话（反馈条数）；或者，`prompt_sent` 除 `head`（头 300 字符）之外再给一个 `tail`。
+
+**为什么需要.** v13 的 P0-1 把判题器的拒绝原文（`errors[].description`，如
+`MissingNamedInput: city`、`键值比对不通过: $/token: 缺少键`）接回了重试 prompt——这是
+"任务 0 分"唯一权威的错因，之前一直被解析、被写进 `round.errorDescs`，然后**扔掉**。
+接的位置是 prompt **末尾**（§2 的 `prompt_sent.head` 只记头 300 字符），所以那段反馈
+**在日志里永远看不到**。结果就是：表 4b 能证明"判题器判错了"，却证明不了"错因有没有
+被喂回去"，下一批无法回答唯一重要的问题——**P0-1 到底生效了没有**。而 P1 的下一步
+（"新拒绝原文重置 `MAX_WRONG_ANSWERS` 计数、重复原文才放弃"）整个建立在"这条反馈真的
+到了 prompt 里"之上；这一格没有，P1 就是在猜。同样的缺口也解释了为什么"反馈环断裂"
+能连续几轮修在提交前打转（分析 §3.1）。
+
+**建议格式.** 二选一即可，前者更省地方：
+
+```text
+{"event":"task_answer_submit","data":{"session":3,"round":61,"chars":208,
+  "rejectionFeedback":2, ...}}          # 本次 prompt 携带的判题器原话条数，0 = 没带
+```
+
+```text
+{"event":"prompt_sent","data":{"head":"…300 字符…","tail":"…300 字符…"}}
+```
 
 ---
 
