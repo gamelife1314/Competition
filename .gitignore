@@ -9,3 +9,11 @@
 # move, read back at startup. Per-process learning scratch — never committed.
 coregeek_learn.json
 coregeek_learn.json.tmp
+
+# codegraph index cache
+.codegraph/
+.cac
+.idea
+CoreGeek.tar.gz
+CoreGeek/.cargo
+workflow
