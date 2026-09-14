@@ -257,3 +257,84 @@ fn the_shell_wrapper_only_finds_an_interpreter() {
         "the wrapper has to prove the interpreter actually runs"
     );
 }
+
+/// The body of a top-level `def name(...)` in the collector, up to the next
+/// top-level definition.
+fn function_body(text: &str, name: &str) -> String {
+    let opener = format!("\ndef {name}(");
+    let at = text
+        .find(&opener)
+        .unwrap_or_else(|| panic!("the collector defines `{name}`"))
+        + 1;
+    let rest = &text[at..];
+    let end = rest[1..]
+        .find("\ndef ")
+        .map(|offset| offset + 1)
+        .unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+#[test]
+fn the_base_columns_are_read_through_the_carry_forward_not_the_raw_key() {
+    // `stationHp` / `stationLvl` / `enemyStationHp` are written by a DELTA
+    // mechanism: `brain::mod::respond`'s `gated` loop only re-sends the `base`
+    // block on the round it CHANGES (`chg` names it), so on a quiet round the
+    // key is absent from the record entirely. Reading it with a bare
+    // `block.get(...)` therefore renders "the base took no damage this round"
+    // as "the base's HP is unknown".
+    //
+    // That is what happened in the ten reports behind issues #161-#170: table
+    // 0's 我方基地 column is blank in nine of them, and table 8's likewise,
+    // because the round the script samples is a day's last round and the base
+    // had usually last been hit a round or two earlier. The column is the only
+    // direct evidence of `score_3` (capped at 550) and of whether a station
+    // upgrade ever landed, so losing it costs the next batch its measurement.
+    //
+    // These two tables must resolve those keys with `carried(rounds, ...)`,
+    // which replays the deltas. The assertion is on the table builders and not
+    // on the helper's existence: a bare `block.get("stationHp")` anywhere in
+    // either body fails this test, whatever else the body does.
+    let text = collector();
+    assert!(
+        function_body(&text, "score_rows").contains("carried("),
+        "table 0 has to replay the delta-coded base fields"
+    );
+    assert!(
+        function_body(&text, "score_split_rows").contains("carried("),
+        "table 8 has to replay the delta-coded base fields"
+    );
+    for name in ["score_rows", "score_split_rows"] {
+        let body = function_body(&text, name);
+        for key in ["stationHp", "stationLvl", "enemyStationHp"] {
+            let raw = format!("block.get(\"{key}\")");
+            assert!(
+                !body.contains(&raw),
+                "{name} reads `{raw}` directly; that key is only present on the \
+                 round it changes, so the column blanks out on quiet rounds"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_base_level_is_a_column_so_an_upgrade_is_visible() {
+    // `stationLvl` is the one field that says whether a station upgrade was
+    // ever bought — 任务书 4.6.1: 1500 HP at level 1, 3000 at level 2, 4500 at
+    // level 3, and no item in the game restores station HP. Without it in the
+    // tables the next batch can only infer the purchase from a slower HP
+    // decay. Both headers must name the column they print.
+    let text = collector();
+    for (name, marker) in [("表 0", "我方基地等级"), ("表 8", "我方基地等级")] {
+        assert!(
+            text.contains(marker),
+            "{name} has to name the {marker} column it prints"
+        );
+        let _ = name;
+    }
+    for name in ["score_rows", "score_split_rows"] {
+        assert!(
+            function_body(&text, name).contains("stationLvl"),
+            "{name} prints the level column"
+        );
+    }
+}

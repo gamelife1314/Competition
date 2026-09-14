@@ -210,6 +210,29 @@ def one_line(value):
     return " ".join(str(value).split())
 
 
+def carried(rounds, key):
+    """把「只在变动那一回合才写」的字段补成每一回合都有值。
+
+    `round` 记录里的 `stationHp` / `stationLvl` 走的是 `chg` 增量机制
+    （CoreGeek/src/brain/mod.rs 的 `gated` 循环）：`base` 块**只在它变动的那一回合**
+    才被写进记录，没变动的回合里这个键根本不存在。`block.get("stationHp")` 于是把
+    「这一回合基地没掉血」读成了「基地血量未知」——表 0 / 表 8 的「我方基地」列在
+    issues #161-#170 的十份报告里九份是空的，而这一列是整批唯一能回答
+    「基地当天还活着吗」的东西，也正是 `score_3`（满 550）唯一的直接证据。
+
+    返回与 `rounds` 等长的列表，第 i 项是第 i 条的当时值；该条没写就沿用上一次看到的。
+    沿用是安全的：基地血量只减不增（升级券是唯一例外，而它会把 `stationLvl` 一起写出来）。
+    第一条记录一定带着它——签名槽从空开始，`log::changed` 第一回合必然为真。
+    """
+    out, last = [], None
+    for rec in rounds:
+        block = data(rec)
+        if key in block:
+            last = block.get(key)
+        out.append(last)
+    return out
+
+
 def day_of(round_no):
     return (round_no - 1) // ROUNDS_PER_DAY + 1
 
@@ -405,6 +428,9 @@ def score_rows(records):
     rounds = pick(records, "round")
     if not rounds:
         return []
+    our_hp = carried(rounds, "stationHp")
+    our_lvl = carried(rounds, "stationLvl")
+    their_hp = carried(rounds, "enemyStationHp")
     rows, seen = [], set()
     for index, rec in enumerate(rounds):
         block = data(rec)
@@ -423,7 +449,7 @@ def score_rows(records):
         rows.append(tsv([
             day_of(round_no), round_no, block.get("score"),
             attr.get("kill"), attr.get("survival"), attr.get("residual"),
-            block.get("stationHp"), block.get("enemyStationHp"),
+            our_hp[index], their_hp[index], our_lvl[index],
         ]))
     return rows
 
@@ -451,6 +477,9 @@ def score_split_rows(records):
     rounds = pick(records, "round")
     if not rounds:
         return []
+    our_hp = carried(rounds, "stationHp")
+    our_lvl = carried(rounds, "stationLvl")
+    their_hp = carried(rounds, "enemyStationHp")
     rows, seen = [], set()
     for index, rec in enumerate(rounds):
         block = data(rec)
@@ -469,7 +498,7 @@ def score_split_rows(records):
         rows.append(tsv([
             day, round_no, block.get("score"),
             attr.get("kill"), attr.get("survival"), attr.get("residual"),
-            5 * day * (day + 1), block.get("stationHp"), block.get("enemyStationHp"),
+            5 * day * (day + 1), our_hp[index], their_hp[index], our_lvl[index],
         ]))
     return rows
 
@@ -499,17 +528,20 @@ def stuck_reason(pair):
 def build_tables(records, day):
     # ------------------------------------------------------------ 表 0 分数归属
     section(
-        "表 0 · 分数归属（每天最后一个回合）　列：第几天 回合 总分 击杀分 survival residual 我方基地 对方基地"
-        "（`survival` = 任务书第六章的 score_3，满 550；`residual` = score_1 加归属误差）",
+        "表 0 · 分数归属（每天最后一个回合）　列：第几天 回合 总分 击杀分 survival residual 我方基地 对方基地 我方基地等级"
+        "（`survival` = 任务书第六章的 score_3，满 550；`residual` = score_1 加归属误差；"
+        "基地血量是 e2 增量字段，本表已按回合回填——`我方基地` 空说明日志里还没出现过它）",
         score_rows(records), CAPS["score_attr"],
     )
 
     # ------------------------------------------- 表 8 分数拆解（v17 §14）
     section(
         "表 8 · 我方分数三块与生存分应得（每天最后一个回合）　列：第几天 回合 总分 "
-        "scoreAttr.kill scoreAttr.survival scoreAttr.residual 生存分应得 我方基地HP 对方基地HP"
+        "scoreAttr.kill scoreAttr.survival scoreAttr.residual 生存分应得 我方基地HP 对方基地HP 我方基地等级"
         "（前三列是 `round.scoreAttr` 的**我方**原值；生存分应得 = Σ10×d，满 550——"
-        "它和 `scoreAttr.survival` 的差额就是 score_3 丢掉的分数）",
+        "它和 `scoreAttr.survival` 的差额就是 score_3 丢掉的分数。《我方基地等级》是"
+        "`stationLvl`：基地升级券（level1 1500 → level2 3000 → level3 4500，任务书 4.6.1）"
+        "是唯一能给基地加血的东西，这一列直接从 1 变成 2 就证明它买到了）",
         score_split_rows(records), CAPS["score_split"],
     )
 

@@ -442,7 +442,20 @@ fn day_world_at(
 }
 
 #[test]
-fn shopping_list_prioritizes_weapon_upgrade_voucher() {
+fn shopping_list_prioritizes_the_station_voucher_over_the_weapon_voucher() {
+    // REPLACES `shopping_list_prioritizes_weapon_upgrade_voucher`, which
+    // asserted the opposite. The old order was commissioned when the guns were
+    // killing nothing; issues #161-#170 measure the reverse (kill 70-424) and
+    // the cost of the old order exactly: ten matches, ten opponents, not one
+    // `StationUpgradeVoucher1` bought in any of them (表 2a), nine bases lost,
+    // `scoreAttr.survival` 0-30 against a 应得 of 10-100 (表 8). See
+    // `economy::intent_list`'s station block and `tests/station_upgrade.rs`.
+    //
+    // The coverage the old test carried is kept in both directions: (a) an
+    // UPGRADE voucher buys through the build reserve — the head here costs 50
+    // of a 75-gold purse while `reserve` is 50, so a head that respected the
+    // reserve would not be in the list at all; and (b) whichever voucher leads
+    // consumes the purse, so the other is not bought in the same round.
     let turn = turn_from(day_world(
         vec![
             station(10, 20, 1),
@@ -462,8 +475,14 @@ fn shopping_list_prioritizes_weapon_upgrade_voucher() {
     let list = coregeek::brain::economy::shopping_list(&turn, &state, reserve);
     assert_eq!(
         list.first().map(|need| need.name.as_str()),
-        Some("WeaponUpgradeVoucher1"),
-        "weapon upgrade outranks the station voucher and consumes the reserve"
+        Some("StationUpgradeVoucher1"),
+        "the base outranks the gun on the survival ranking, and buys through \
+         the build reserve (75 gold, 50 reserved, a 50-gold voucher)"
+    );
+    assert!(
+        !list.iter().any(|need| need.name == "WeaponUpgradeVoucher1"),
+        "and it consumes the purse, so the gun waits for the next sale: {:?}",
+        list.iter().map(|need| need.name.as_str()).collect::<Vec<_>>()
     );
 }
 

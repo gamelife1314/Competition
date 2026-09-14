@@ -102,11 +102,21 @@ fn a_positive_gap_demotes_the_station_and_suppresses_harassment() {
 
 #[test]
 fn the_committed_order_stands_when_the_dial_is_off_or_the_gap_is_closed() {
+    // The dial-off order IS the committed order, and it now puts the station
+    // voucher in the same tier as the weapon voucher (priority 0, decided by
+    // `survival_value`). This assertion used to read `Some(1)`: issues
+    // #161-#170 overturn that, and the evidence is in `tests/station_upgrade.rs`
+    // and in the block comment in `economy::intent_list` — ten matches, ten
+    // opponents, not one `StationUpgradeVoucher1` bought (表 2a), nine bases
+    // lost, `scoreAttr.survival` 0-30 against a 应得 of 10-100. The tier was set
+    // when the guns were killing nothing (the batches behind `clear_gap_order_with`
+    // read kill=0); this batch reads kill 70-424, so firepower is no longer the
+    // binding constraint and the base is.
     let turn = turn_from(rich_board(1));
     let state = BotState::default();
     let mut needs = intent_list(&turn, &state, 0);
     clear_gap_order_with(false, &turn, &mut needs);
-    assert_eq!(priority_of(&needs, "StationUpgradeVoucher1"), Some(1));
+    assert_eq!(priority_of(&needs, "StationUpgradeVoucher1"), Some(0));
     assert!(priority_of(&needs, "BossRobotSummonOrder").is_some());
 
     // 3×L3 towers: capacity 80×60 = 4800 ≥ the 4050 estimate — no gap, and
@@ -114,6 +124,6 @@ fn the_committed_order_stands_when_the_dial_is_off_or_the_gap_is_closed() {
     let turn = turn_from(rich_board(3));
     let mut needs = intent_list(&turn, &state, 0);
     clear_gap_order_with(true, &turn, &mut needs);
-    assert_eq!(priority_of(&needs, "StationUpgradeVoucher1"), Some(1));
+    assert_eq!(priority_of(&needs, "StationUpgradeVoucher1"), Some(0));
     assert!(priority_of(&needs, "BossRobotSummonOrder").is_some());
 }

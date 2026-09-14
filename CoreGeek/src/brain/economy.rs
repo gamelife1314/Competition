@@ -253,6 +253,35 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
 
     // 3. Station upgrade: survival score (score3 caps at 550). Ranked against
     //    the walls by HP per gold rather than by fiat.
+    //
+    //    SAME TIER AS THE WEAPON VOUCHER, and that is the whole fix (issues
+    //    #161-#170). The two vouchers cost the same 100 gold (任务书 4.6.3) and
+    //    the purse in those ten matches peaked at 130-155 (表 2c) — enough for
+    //    one and never for both. At priority 1 the station voucher was behind
+    //    the weapon voucher for every round of every match, so it was head of
+    //    the list exactly ONCE per match (round 1, before a tower exists and the
+    //    weapon voucher is not yet queued) and unaffordable in that one round.
+    //    表 2a across all ten reports: not a single `StationUpgradeVoucher1`
+    //    bought, while nine of the ten bases fell, `scoreAttr.survival` sat at
+    //    0-30 against a 应得 of 10-100, and the round score froze with the base
+    //    (163 counted 152 of the 424 kill points it had earned, 167 64 of 309).
+    //
+    //    `survival_value` already ranks this pair correctly — the station is
+    //    credited 2250 effective HP per 100 gold against the weapon's 1500
+    //    (`effective_hp`: "the station is the loss condition itself, so its HP
+    //    counts half again as much") — and a priority number was overriding it.
+    //    In the same tier the recorded ranking decides, which is what this
+    //    block's own docstring says it does.
+    //
+    //    The previous tier was set when the guns were killing nothing: the
+    //    batches behind `clear_gap_order_with` (issues #8/#18/#19/#20, #131-#135)
+    //    read kill=0 and base-fell-D2, so firepower was the binding constraint
+    //    and a bigger base behind dead guns bought nothing. This batch reads the
+    //    opposite — kill 70/143/174/187/248 in 170, 225 in 167, 309 in 163's
+    //    day 4 — the guns work, and the base is what ends the half. The
+    //    firepower-first reorder is not deleted: `clear_gap_order_with` still
+    //    demotes the station to 5 the moment `firepower_gap` is positive, which
+    //    is the firepower case stated exactly.
     if let Some(station) = turn.station() {
         let voucher = match station.level {
             1 => "StationUpgradeVoucher1",
@@ -260,7 +289,7 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             _ => "",
         };
         if !voucher.is_empty() && stock_of(turn, voucher) == 0 {
-            needs.push(upgrade_need(turn, voucher, 1, 1, latest(6)));
+            needs.push(upgrade_need(turn, voucher, 1, 0, latest(6)));
         }
     }
 
@@ -526,7 +555,22 @@ pub fn clear_gap_order_with(drive: bool, turn: &Turn, needs: &mut Vec<Need>) {
 /// slot. A need that only partly fits is bought partly, not skipped.
 pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     let mut intents = intent_list(turn, state, reserve);
-    intents.sort_by_key(|need| (need.priority, std::cmp::Reverse(need.value)));
+    // The station upgrade wins its ties. `value` alone leaves one: the level-2
+    // -> 3 station voucher (150 gold, `effective_hp` 2250) and the level-1
+    // weapon voucher (100 gold, 1500) both compute to exactly 1500 effective HP
+    // per 100 gold, so which of them led was decided by the order `intent_list`
+    // happened to push them in. A tie is not a reason to let the loss condition
+    // wait behind a gun: the station is the only asset with no repair item
+    // (`WallFixer` mends a wall, `Medicine` mends a unit, nothing mends the
+    // base) and the only one whose destruction ends the half outright
+    // (任务书 ch.7) — and it takes the round's gold out of reach with it.
+    intents.sort_by_key(|need| {
+        (
+            need.priority,
+            std::cmp::Reverse(need.value),
+            std::cmp::Reverse(need.name.starts_with("StationUpgradeVoucher")),
+        )
+    });
     let urgent = turn.in_day_round >= DUSK_ROUND - READINESS_URGENT;
     let mut remaining = turn.gold;
     let mut out = Vec::new();
