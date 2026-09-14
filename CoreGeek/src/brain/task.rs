@@ -73,7 +73,17 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
         return;
     }
     state.task.judger_window_errors = 0;
-    state.task.result_history.push(truncate(result, 1200));
+    // The entry has to survive at least as far as the prompt's window, or the
+    // model is shown a cut-down copy of a cut-down copy. `RESULT_CONTEXT_LAST`
+    // is the widest window `build_prompt` uses, so that is the floor here.
+    state.task.result_history.push(truncate(result, RESULT_CONTEXT_LAST));
+    // `build_prompt` reads the last two; the rest is only there so a session
+    // that re-plans many times does not accumulate the whole match in memory.
+    const RESULT_HISTORY_KEEP: usize = 8;
+    let excess = state.task.result_history.len().saturating_sub(RESULT_HISTORY_KEEP);
+    if excess > 0 {
+        state.task.result_history.drain(..excess);
+    }
     let output = strip_status_line(result);
     let code = exit_code(result);
     // The reconnaissance echo travels with every run: the script reports the
@@ -114,6 +124,7 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
             // is not the task's result: treat it as a failed run and re-plan.
             crate::log::event("task_answer_meta", serde_json::json!({"exit": code}));
             state.task.stage = TaskStage::Planning;
+            state.task.no_answer_rounds = state.task.no_answer_rounds.saturating_add(1);
             return;
         }
         if is_failure_answer(&answer) {
@@ -127,6 +138,7 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
                 serde_json::json!({"exit": code, "answer": truncate(&answer, 60)}),
             );
             state.task.stage = TaskStage::Planning;
+            state.task.no_answer_rounds = state.task.no_answer_rounds.saturating_add(1);
             return;
         }
         // An explicit ANSWER marker is trusted even when the exit code is
@@ -141,13 +153,37 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
         // therefore the one worth reusing: it is `cmd_history`'s last entry,
         // because a session sends one command and waits for its verdict.
         state.task.sop_cmd = state.task.cmd_history.last().cloned();
+        state.task.no_answer_rounds = 0;
         state.task.stage = TaskStage::HaveAnswer { answer };
     } else {
         // No answer found: ask the LLM again with the failure context
         // (result_history carries it into the next prompt).
+        //
+        // THE COMMAND DID NOT FAIL. `task_cmd_failed` is the historical name
+        // and it has cost this analysis two batches: the field is printed as
+        // `{"exit":0,"timeout":false}` in every issue — the sandbox ran the
+        // script to completion and the script simply never printed an
+        // `ANSWER:` line — and that reads exactly like a broken sandbox. The
+        // new `reason` says which of the three it was, and the new `head`
+        // carries the first line of what the script DID print, because
+        // `cmd_result` recorded only a character count and the mechanism was
+        // therefore unreadable from the log (issues #111-#115, 8-13 each).
+        state.task.no_answer_rounds = state.task.no_answer_rounds.saturating_add(1);
         crate::log::event(
             "task_cmd_failed",
-            serde_json::json!({"exit": code, "timeout": result.starts_with("[TIMEOUT]")}),
+            serde_json::json!({
+                "exit": code,
+                "timeout": result.starts_with("[TIMEOUT]"),
+                "reason": if result.starts_with("[TIMEOUT]") {
+                    "timeout"
+                } else if code.map_or(false, |code| code != 0) {
+                    "exit_nonzero"
+                } else {
+                    "no_answer_marker"
+                },
+                "streak": state.task.no_answer_rounds,
+                "head": crate::log::headline(strip_status_line(result), 160),
+            }),
         );
         state.task.stage = TaskStage::Planning;
     }
@@ -379,7 +415,24 @@ pub fn plan_pioneer(
     }
 }
 
-pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
+/// How much of the most recent sandbox output is fed back to the model.
+///
+/// It was 600 characters — for the last TWO runs alike — while the runs
+/// themselves were 2.4k-5.5k characters (`cmd_result.chars` across issues
+/// #111-#115). A reconnaissance script that prints a banner, a `find` listing
+/// and then the task file therefore had its task file cut off, so the model
+/// could not compute an answer from what it had already read and re-ran the
+/// reconnaissance instead. Issue #115 is the shape of that loop: 14 commands,
+/// 13 of them with no `ANSWER:` line, six sessions, **zero submissions**, every
+/// one of them ending `reason=timeout, rejections=0, wrongAnswers=0`.
+///
+/// The previous run keeps a smaller window than the last one because it is
+/// context, not material: what the model needs to answer from is what it just
+/// read.
+const RESULT_CONTEXT_LAST: usize = 3000;
+const RESULT_CONTEXT_PREVIOUS: usize = 1200;
+
+pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     let mut prompt = String::new();
     prompt.push_str("你在一个隔离沙盒中执行任务，沙盒可运行基础 shell 与 python3（无外网）。\n");
     prompt.push_str(
@@ -429,11 +482,39 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
             ));
         }
     }
+    // THE RECONNAISSANCE IS ALREADY DONE. Saying so is the difference between
+    // a retry that answers and a retry that runs `find` again: with the output
+    // above cut short, the model's only honest reading of "上次执行输出" is
+    // that the read failed, so it reads again, forever. The streak makes the
+    // cost of another exploration round explicit, and past the first round the
+    // instruction stops being a preference and becomes the round's whole job.
+    if state.task.no_answer_rounds > 0 {
+        let left = state.task.timeout_round.saturating_sub(turn.round_no);
+        prompt.push_str(&format!(
+            "\n⚠ 你上一次（以及之前连续 {} 次）的脚本**没有打印 `ANSWER:` 行**，因此本轮没有任何答案可以提交。任务剩余 {} 回合，再花一轮侦察就会超时得 0 分。\n\
+             侦察阶段已经结束：任务文件的真实路径和内容就在下面「上次执行输出」里（脚本自己 cat 出来的）。\n\
+             **本轮不要再用 find / ls / cat / grep 去找文件或重读任务文件**，直接用你已经读到的内容计算，并在脚本最后一行打印 `ANSWER: <值>`。\n",
+            state.task.no_answer_rounds, left,
+        ));
+        if state.task.no_answer_rounds >= 2 {
+            prompt.push_str(
+                "你已经连续两轮以上没有给出答案，再侦察一次这个任务必然超时。**本轮必须打印 ANSWER 行**：即使对某个字段没有十足把握，也要按任务文件里读到的数据给出最可能的取值——空手而归和写错都同样得 0 分，但写错还有通过率。\n",
+            );
+        }
+    }
     if !state.task.result_history.is_empty() {
         prompt.push_str("\n上次执行输出（请修正错误）：\n");
         let start = state.task.result_history.len().saturating_sub(2);
-        for result in &state.task.result_history[start..] {
-            prompt.push_str(&truncate(result, 600));
+        for (offset, result) in state.task.result_history[start..].iter().enumerate() {
+            // Only the final entry is the material the answer has to come out
+            // of; anything before it is context for the retry.
+            let is_last = start + offset + 1 == state.task.result_history.len();
+            let cap = if is_last {
+                RESULT_CONTEXT_LAST
+            } else {
+                RESULT_CONTEXT_PREVIOUS
+            };
+            prompt.push_str(&truncate(result, cap));
             prompt.push('\n');
         }
         // The monotonic count: `wrong_answers` restarts whenever the judger
@@ -937,6 +1018,32 @@ pub fn is_failure_answer(answer: &str) -> bool {
     if is_sentinel(trimmed) {
         return true;
     }
+    // A COMPOUND placeholder is still a placeholder (issue #111). Session 1
+    // printed `ANSWER: TOKEN_PENDING_MANUAL_REVIEW` and the whole-value test
+    // above only ever matched a bare token, so the model's own "not ready yet"
+    // marker went to the judger three rounds running — errorCode 2 each time —
+    // and into `best_answer`, which is what the deadline guard submits.
+    if is_placeholder_compound(trimmed) {
+        return true;
+    }
+    // A SENTENCE is not a value (issues #112 and #114). #112's session 1
+    // answered `，形式：` and #114's session 6 answered `0写成"0"，否则算错` —
+    // both four to eleven characters of the task file's own prose, lifted
+    // because the model's script echoed a line of the instructions through the
+    // `ANSWER:` marker. Neither is a number, an identifier or a name, and both
+    // scored zero three times over.
+    //
+    // Only a BARE scalar can be prose. An answer that arrived as a JSON
+    // STRING is a value whatever it says — `"南京市，江苏省"` is a city, and the
+    // quote-trim above exists so that `"N/A"` still reads as the sentinel it
+    // is — so the rule is applied to the trimmed text only when the answer as
+    // it arrived was not a quoted value.
+    let quoted = serde_json::from_str::<serde_json::Value>(answer.trim())
+        .map(|value| !value.is_object() && !value.is_array())
+        .unwrap_or(false);
+    if !quoted && is_prose_fragment(trimmed) {
+        return true;
+    }
     // A sentinel WRAPPED IN JSON is still a sentinel. Issue #28's sessions
     // submitted `{"result": "unknown"}` and `{"status": "pending"}` — the
     // model's error path dressed as an answer — and both reached the judger,
@@ -955,6 +1062,83 @@ pub fn is_failure_answer(answer: &str) -> bool {
         }
     }
     false
+}
+
+/// Words that only ever appear inside a PLACEHOLDER — never in a result on
+/// their own. Read by [`is_placeholder_compound`] alone: a single word from
+/// this list is not a sentinel (`manual`, `status` and `value` are all
+/// perfectly good answers to some task), but a whole answer assembled out of
+/// them is a shape rather than a value.
+const PLACEHOLDER_WORDS: [&str; 20] = [
+    "token",
+    "manual",
+    "review",
+    "value",
+    "answer",
+    "result",
+    "status",
+    "flag",
+    "auto",
+    "placeholder",
+    "field",
+    "content",
+    "string",
+    "text",
+    "body",
+    "retry",
+    "waiting",
+    "empty",
+    "blank",
+    "fill",
+];
+
+/// Is the answer a placeholder assembled out of placeholder words — the shape
+/// `TOKEN_PENDING_MANUAL_REVIEW` takes?
+///
+/// The rule is deliberately narrow in three directions at once, because the
+/// existing whole-value test is what keeps a real result alive and this must
+/// not undo it: the answer must be a single unspaced token of at most 64
+/// characters, it must split on a separator into at least two parts, and
+/// **every** part must be a sentinel or a placeholder word. "Every", not
+/// "any", is what leaves `failed_to_extract.log` (it has `to` and `log`),
+/// `error_count=7` (it has `count=7`) and any real `snake_case` identifier
+/// (`world_heritage_count`, `task_1_alpha`) alone.
+fn is_placeholder_compound(text: &str) -> bool {
+    if text.chars().count() > 64 || text.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let parts: Vec<String> = text
+        .split(|c: char| c == '_' || c == '-' || c == '.' || c == '/')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_lowercase())
+        .collect();
+    parts.len() >= 2
+        && parts
+            .iter()
+            .all(|part| is_sentinel(part) || PLACEHOLDER_WORDS.contains(&part.as_str()))
+}
+
+/// Sentence punctuation from the task file's own prose.
+///
+/// A VALUE never carries it. Everything these tasks ask for — a count, an era,
+/// a city name, a token — is a number, an identifier or a short name, and a
+/// scalar wearing a comma or a full stop is a sentence the model copied out of
+/// the instructions. The brackets that legitimately appear inside Chinese
+/// titles (`《》`), and the colon that separates a field name from its value,
+/// are deliberately NOT in this set.
+const PROSE_PUNCTUATION: [char; 10] = ['，', '。', '；', '！', '？', '、', '“', '”', '‘', '’'];
+
+/// Is the answer a fragment of prose rather than a value?
+///
+/// Gated on "not JSON at all", so a quoted Chinese string
+/// (`"南京市，江苏省"`) and any JSON object or array are untouched: the only
+/// thing this can reject is a bare scalar, which is exactly what `，形式：`
+/// (issue #112) and `0写成"0"，否则算错` (issue #114) were.
+fn is_prose_fragment(text: &str) -> bool {
+    if serde_json::from_str::<serde_json::Value>(text).is_ok() {
+        return false;
+    }
+    text.chars().any(|c| PROSE_PUNCTUATION.contains(&c))
 }
 
 /// Is this whole string one of the not-an-answer tokens? Compared case
@@ -1016,6 +1200,13 @@ fn is_sentinel(text: &str) -> bool {
         "提取失败",
     ];
     let lower = text.trim().to_lowercase();
+    // An EMPTY value is not a value either. `{"token": ""}` is issue #115's
+    // one and only answer across six sessions: the script reached the sandbox,
+    // parsed the task file, and printed the right field name with nothing in
+    // it. 任务书 ch.6 counts correct fields, and an empty one is not correct.
+    if lower.is_empty() {
+        return true;
+    }
     SENTINELS.iter().any(|sentinel| lower == *sentinel)
 }
 

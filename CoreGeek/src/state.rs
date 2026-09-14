@@ -164,6 +164,17 @@ pub struct TaskSession {
     /// next planning round, so a session that took the fast path runs
     /// `explore` → `answer` and never re-enters the exploration.
     pub sop_pending_answer: Option<String>,
+    /// Consecutive sandbox runs that returned without an `ANSWER:` line.
+    ///
+    /// The population issues #113-#115 are made of: sessions that spent their
+    /// whole `timeoutRounds` budget sending reconnaissance scripts and ended
+    /// `reason=timeout, rejections=0, wrongAnswers=0` — no submission, no
+    /// rejection, nothing to retry against, because no answer ever existed.
+    /// Issue #115 alone ran 14 commands across 6 sessions with 13 of them
+    /// answer-less. This counter is what lets `build_prompt` say "you have
+    /// already done the reconnaissance" with a number in it instead of hoping
+    /// the model notices on its own.
+    pub no_answer_rounds: i32,
 }
 
 /// The answer schema a sandbox script read out of the task file and echoed on
@@ -711,9 +722,24 @@ impl BotState {
             }
             if cmd_new {
                 self.task.cmd_consumed_request_round = cmd_key;
+                // The character count alone could not answer the only question
+                // this record exists for. Issues #111-#115 each carry 11-17
+                // `cmd_result` lines that say a script returned 2.4k-5.5k
+                // characters and not one of them says WHAT it returned, so
+                // "the model never printed an `ANSWER:` line" — the mechanism
+                // behind 13 `task_cmd_failed` in #115 and every session in the
+                // batch ending at zero submissions — was invisible. `answer`
+                // is the verdict and `head` is the evidence for it.
+                let output = crate::brain::task::strip_status_line(&turn.last_cmd_result);
                 crate::log::event(
                     "cmd_result",
-                    serde_json::json!({"session": self.task.session_id, "requestRound": cmd_key, "chars": turn.last_cmd_result.len()}),
+                    serde_json::json!({
+                        "session": self.task.session_id,
+                        "requestRound": cmd_key,
+                        "chars": turn.last_cmd_result.len(),
+                        "answer": crate::brain::task::extract_answer(output).is_some(),
+                        "head": crate::log::headline(output, 160),
+                    }),
                 );
                 crate::brain::task::on_cmd_result(self, &turn.last_cmd_result);
             }

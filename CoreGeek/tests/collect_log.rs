@@ -142,16 +142,18 @@ fn every_event_the_collector_reads_is_an_event_we_actually_emit() {
 }
 
 #[test]
-fn the_collector_still_carries_all_thirteen_sections() {
+fn the_collector_still_carries_every_section() {
     // §7.3 names six tables printed as thirteen sections, and the issue is read
     // as "all of them, or an explanation". A section quietly dropped from the
     // script is a table quietly dropped from every future report.
     let text = collector();
     for marker in [
+        "表 0 · 分数归属",
         "表 1 · 造塔计划",
         "表 2a",
         "表 3a",
         "表 4a",
+        "表 4c · 每条沙盒命令",
         "表 5a · 封门",
         "表 6a · 夜间沉默",
     ] {
@@ -181,7 +183,7 @@ fn the_row_budget_lives_in_the_script_and_adds_up() {
     let table = caps(&text);
     assert_eq!(
         table.len(),
-        13,
+        16,
         "expected one budget per section, got {table:?}"
     );
     assert!(
@@ -198,14 +200,14 @@ fn the_row_budget_lives_in_the_script_and_adds_up() {
     }
     assert_eq!(
         text.matches("CAPS[\"").count(),
-        13,
+        16,
         "a section is spending a budget that is not in the CAPS table"
     );
 
     let total: usize = table.iter().map(|(_, cap)| cap).sum();
     assert!(
-        total <= 560,
-        "the caps add up to {total} lines, over the 560 the docs promise"
+        total <= 640,
+        "the caps add up to {total} lines, over the 640 the docs promise"
     );
 }
 

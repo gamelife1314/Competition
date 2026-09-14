@@ -16,7 +16,7 @@
 use serde_json::json;
 
 use coregeek::brain::decide_with;
-use coregeek::log::{changed, prune, xy, LogSigs};
+use coregeek::log::{changed, headline, prune, xy, LogSigs};
 use coregeek::model::Turn;
 use coregeek::protocol::{Pos, Request, RoleCommand};
 use coregeek::state::BotState;
@@ -267,4 +267,35 @@ fn a_quiet_round_leaves_the_gates_shut_and_a_moved_one_opens_them() {
         state.log_sigs.towers, towers,
         "and the towers, which did not move, stay shut"
     );
+}
+
+#[test]
+fn a_multiline_blob_becomes_one_line_of_its_own_text() {
+    // `cmd_result.head` and `task_cmd_failed.head` exist to answer the one
+    // question the character count could not: what did the sandbox actually
+    // return? Issues #111-#115 each carry 11-17 `cmd_result` lines saying a
+    // script returned 2.4k-5.5k characters with no way to tell a task file
+    // from a traceback from a repeated `find` listing, which is how 13
+    // `task_cmd_failed` in #115 stayed unreadable for a whole batch.
+    //
+    // The cap is only worth anything if the window covers text rather than
+    // escape sequences: `brief` keeps the newlines, and in a JSON string each
+    // one is two bytes spent restating the blob's line structure.
+    let blob = "#!/bin/bash\n\n\n   echo   hello \n\tcat task_1.md\n";
+    assert_eq!(
+        headline(blob, 200),
+        "#!/bin/bash echo hello cat task_1.md",
+        "whitespace runs collapse before the cap is applied, so the window \
+         holds the content and not the layout"
+    );
+
+    // A cap that bites still names the truncation, exactly as `brief` does.
+    let long = "a".repeat(500);
+    let cut = headline(&long, 40);
+    assert_eq!(cut.chars().count(), 41, "40 characters plus the ellipsis");
+    assert!(cut.ends_with('…'), "a shortened head must look shortened");
+
+    // An empty result is empty, not a line of nothing.
+    assert_eq!(headline("", 160), "");
+    assert_eq!(headline("   \n\t ", 160), "");
 }

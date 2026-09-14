@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""交付用的日志切片：把一场的 stdout 原始日志跑成「六张证据表」。
+"""交付用的日志切片：把一场的 stdout 原始日志跑成「证据表」。
 
     python tools/collect_log.py <日志文件>
     python tools/collect_log.py <日志文件> --day 5
@@ -22,7 +22,7 @@
     所以读到的一定是完整的一页，或一句诚实的截断声明。
   * **只读不写。** 不改日志、不在日志旁边留中间文件。原始日志自己留着（§1）。
   * **不认识的东西要说出来。** 解不开的压缩包、读不了的编码、解析不了的行，都计数并在
-    开头声明——十三张空表绝不能被读成「这场什么都没发生」。
+    开头声明——十六张空表绝不能被读成「这场什么都没发生」。
 
 输入格式：`.jsonl`、`.jsonl.gz`、`.zip`（Windows 上多半是压缩包）都行。BOM、CRLF、
 UTF-16、GBK 都能读，都是 Windows 上真的会遇到的东西。
@@ -43,7 +43,7 @@ from collections import Counter
 ARCHIVE_ERRORS = (OSError, EOFError, zlib.error, zipfile.BadZipFile)
 
 # 每张表的行数封顶。**这是预算的唯一出处**——WORKFLOW_REQUEST §7.3 的预算表和 §8 的
-# cap_lines_total 都是这个数，CoreGeek/tests/collect_log.rs 会核对总量不超过 560 行。
+# cap_lines_total 都是这个数，CoreGeek/tests/collect_log.rs 会核对总量不超过 640 行。
 # 加一节而忘了给预算，或者把某一节放大到超出总量，都会在那里失败。
 CAPS = {
     "tower_plan": 20,      # 聚合式，恒定
@@ -54,15 +54,18 @@ CAPS = {
     "sessions": 40,        # session 数
     "submits": 40,         # 提交次数
     "judger_errors": 40,   # 出错回合数
+    "cmd_results": 40,     # 沙盒命令数（一场 10-20 条，留足余量）
+    "cmd_reasons": 20,     # 聚合式，恒定
     "gate_rounds": 160,    # 每天最多 15 行，10 天 150 + 封门行
     "gate_nights": 20,     # 一天一行
     "gate_culprit": 20,    # 聚合式，恒定
     "night_reasons": 20,   # 聚合式，恒定
     "night_towers": 40,    # 塔数 × 原因数
+    "score_attr": 12,      # 一天一行，10 天 + 余量
 }
 CAP_TOTAL = sum(CAPS.values())
 
-# `--day N` 点名的逐回合明细。**不计入 560**：那十三张是每批都要贴的，这个是点了名才印的。
+# `--day N` 点名的逐回合明细。**不计入 640**：那十六张是每批都要贴的，这个是点了名才印的。
 DRILL_CAP = 160
 
 # 一天/一夜的回合数，用来把 round 换算成「第几天、当天第几回合」。
@@ -191,6 +194,17 @@ def tsv(values):
 def tostring(value):
     """jq `tostring`：紧凑 JSON，没有多余空格，中文不转义。"""
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def one_line(value):
+    """一格里的自由文本（脚本打印的开头）：把制表符和换行压成空格。
+
+    表是 TSV，一格里的 `\\t` 会把这一行劈成两行——`cmd_result.head` 是脚本文本的
+    前 160 字符，正是最可能带制表符的东西。空/缺席印空串（缺失当没发生）。
+    """
+    if value is None:
+        return ""
+    return " ".join(str(value).split())
 
 
 def day_of(round_no):
@@ -374,7 +388,51 @@ def coach_block(records):
             "回执里照实写 0，别猜。）")
 
 
+def score_rows(records):
+    """每天最后一个 `round` 记录里的分数归属，外加最后一行。
+
+    `任务书` 第六章把总分拆成三块：`score_1` 任务、`score_2` 击杀、`score_3` 生存
+    （`Σ 10×day×存活系数`，满 550）。回执里只有**总分**，于是"这 41 分是怎么来的"
+    一直靠 `coach_night` 的夜间掉血去倒推——倒推得出"基地哪天倒"，推不出三块各多少。
+
+    这三块其实**就在日志里**：`round.scoreAttr` 把当时的总分拆成
+    `kill`（score_2，累计）、`survival`（score_3，累计）、`residual`（余项，即 score_1
+    加归属误差）。每个 `round` 记录都带，而收集脚本一行都没印过。
+    """
+    rounds = pick(records, "round")
+    if not rounds:
+        return []
+    rows, seen = [], set()
+    for index, rec in enumerate(rounds):
+        block = data(rec)
+        round_no = block.get("round")
+        if not isinstance(round_no, int):
+            continue
+        # 每天的最后一个回合：一天一行，最后一行一定是当天的收官。
+        is_day_end = (index + 1 == len(rounds)) or (
+            isinstance(data(rounds[index + 1]).get("round"), int)
+            and day_of(data(rounds[index + 1]).get("round")) != day_of(round_no)
+        )
+        if not is_day_end or day_of(round_no) in seen:
+            continue
+        seen.add(day_of(round_no))
+        attr = block.get("scoreAttr") or {}
+        rows.append(tsv([
+            day_of(round_no), round_no, block.get("score"),
+            attr.get("kill"), attr.get("survival"), attr.get("residual"),
+            block.get("stationHp"), block.get("enemyStationHp"),
+        ]))
+    return rows
+
+
 def build_tables(records, day):
+    # ------------------------------------------------------------ 表 0 分数归属
+    section(
+        "表 0 · 分数归属（每天最后一个回合）　列：第几天 回合 总分 击杀分 survival residual 我方基地 对方基地"
+        "（`survival` = 任务书第六章的 score_3，满 550；`residual` = score_1 加归属误差）",
+        score_rows(records), CAPS["score_attr"],
+    )
+
     # ------------------------------------------------------------ 表 1 造塔计划
     section(
         "表 1 · 造塔计划 tower_plan　列：回合数 塔数 mayBuild upgradeReachable reserve guard 外层缺口",
@@ -453,6 +511,28 @@ def build_tables(records, day):
               ",".join(jstr(e) for e in data(r).get("errors") or []),
               " | ".join(str(x) for x in data(r).get("errorDescs") or [])])
          for r in pick(records, "round") if data(r).get("errors")], CAPS["judger_errors"],
+    )
+
+    # 表 4c/4d 是 v15 §10 请求七要的两张：2026-09-14(b) 那五场里，13 条
+    # `task_cmd_failed` 只有 `{"exit":0,"timeout":false}` 两个字段，被读成"沙盒坏了"
+    # ——实际是脚本跑完了但没打印 `ANSWER:` 行；而 `cmd_result` 只有字符数，没有一行
+    # 说得清脚本到底返回了什么。现在两个字段都有了，这两张表把它们摊开。
+    #
+    # `有答案` 为空 = 那条日志是加这个字段之前跑的；**不是 false**。
+    section(
+        "表 4c · 每条沙盒命令　列：回合 session 字符数 有答案 结果开头"
+        "（`有答案` 空 = 该日志早于 v15，没有这一格）",
+        [tsv([data(r).get("requestRound"), data(r).get("session"),
+              data(r).get("chars"), data(r).get("answer"),
+              one_line(data(r).get("head"))])
+         for r in pick(records, "cmd_result")], CAPS["cmd_results"],
+    )
+    section(
+        "表 4d · 没有答案的原因　列：次数 原因"
+        "（`no_answer_marker` = 沙盒跑完了、脚本没打印 ANSWER 行，不是沙盒故障；"
+        "`timeout` = 脚本超过 15 秒；`exit_nonzero` = 脚本自己退出码非 0）",
+        counted([jstr(data(r).get("reason")) for r in pick(records, "task_cmd_failed")],
+                lambda t: sorted(t)), CAPS["cmd_reasons"],
     )
 
     # ---------------------------------------------------------------- 表 5 封门

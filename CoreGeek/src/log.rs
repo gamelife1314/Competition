@@ -192,3 +192,17 @@ pub fn brief(text: &str, max_chars: usize) -> String {
         text.chars().take(max_chars).collect::<String>() + "…"
     }
 }
+
+/// The first `max_chars` characters of a multi-line blob, on one line.
+///
+/// [`brief`] keeps the newlines, which in a JSON string are `\n` escapes —
+/// two bytes each, so a captured script or a sandbox transcript spends a third
+/// of its budget restating its own line structure without carrying any more of
+/// the text. Runs of whitespace collapse to one space first, so the window
+/// covers as much of the content as the cap allows. This is the shape a log
+/// record wants when the question is "what did it actually say", which is what
+/// `cmd_result.head` and `task_cmd_failed.head` are for.
+pub fn headline(text: &str, max_chars: usize) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    brief(&collapsed, max_chars)
+}
