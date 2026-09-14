@@ -20,6 +20,11 @@
 //!
 //! ASSUMPTION (see 需求分析 Q5): trajectories are intercepted by ROBOTS only;
 //! walls and buildings do not block bullet/rail paths.
+//!
+//! RULE (任务书 4.5): the Bomb and the DizzyWeapon act on ROBOTS of both teams
+//! and on nothing else — "仅对双方机器人有效，对敌方建筑、角色无效". Both impact
+//! pickers read `turn.robots` alone; the opponent's roles live in `turn.enemy`
+//! and are not candidates, not victims and not splash.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -74,6 +79,18 @@ pub struct Weights {
     /// committed fixed priorities. Default OFF so the dial proves itself in
     /// A/B before it owns behaviour (Improve.kimi.md §7, P1-1 row).
     pub clear_gap_drive: i64,
+    /// Wall-breach tactic (P1): what an enemy WALL is worth once
+    /// [`wall_breach_with`] has opened the gate. `0` switches the tactic off
+    /// and restores the committed ordering exactly. The default sits above
+    /// `tower_value` — a hole in the opponent's line is worth more than
+    /// silencing one of their guns — and below `role_value` / `operator_value`,
+    /// because the roles are what makes those guns fire.
+    ///
+    /// It is a price in the same ranking every other building is priced in, not
+    /// a flag (the gate above is what decides whether a breach is on the table
+    /// at all): an A/B run can move it, and a wall only outranks their station
+    /// while this stays above `station_value`.
+    pub wall_breach_value: i64,
 }
 
 impl Default for Weights {
@@ -92,6 +109,7 @@ impl Default for Weights {
             wall_value: 60,
             station_focus: 1,
             clear_gap_drive: 0,
+            wall_breach_value: 320,
         }
     }
 }
@@ -127,6 +145,7 @@ impl Weights {
         read("WALL_VALUE", &mut weights.wall_value);
         read("STATION_FOCUS", &mut weights.station_focus);
         read("CLEAR_GAP", &mut weights.clear_gap_drive);
+        read("WALL_BREACH", &mut weights.wall_breach_value);
         weights
     }
 }
@@ -730,12 +749,12 @@ fn enemy_unit_value_with(weights: &Weights, turn: &Turn, unit: &Unit) -> i64 {
 /// disable value × visibility window. `sim` carries the damage earlier towers
 /// in this same round already committed, so the probability is computed
 /// against what is actually left of the target.
-fn enemy_unit_score(turn: &Turn, tower: &Unit, unit: &Unit, cells: &[Pos], sim: &Sim) -> i64 {
-    enemy_unit_score_with(weights(), turn, tower, unit, cells, sim)
-}
-
-/// As `enemy_unit_score`, against an explicit dial — this is the knob an A/B
-/// run turns to trade "disable their guns" against "kill their station".
+///
+/// The dial is explicit rather than read from the environment because the
+/// caller sometimes hands in a DERIVED one: while a breach is on the table
+/// (`wall_breach_with`) walls are scored at `wall_breach_value` through this
+/// same ranking. The base dial is still the knob an A/B run turns to trade
+/// "disable their guns" against "kill their station".
 pub fn enemy_unit_score_with(
     weights: &Weights,
     turn: &Turn,
@@ -870,6 +889,97 @@ pub fn station_focus(turn: &Turn, tower: &Unit, sim: &Sim) -> bool {
     station_focus_with(weights(), turn, tower, sim)
 }
 
+/// Robot attack range (任务书 4.7.2: small/middle/large/BOSS all shoot 3 cells).
+const ROBOT_ATTACK_RANGE: i32 = 3;
+
+/// Our station is not being hit this round: no robot hunting us stands inside
+/// its own attack range of the station footprint, so nothing on the board can
+/// be chewing on the base right now. A robot nine cells out is a different
+/// problem — and `spare_firepower` already covers it — this is only the
+/// question the breach gate asks: is the base the thing under the knife?
+pub fn station_safe(turn: &Turn) -> bool {
+    let Some(station) = turn.station() else {
+        return false;
+    };
+    let footprint = station_footprint(station.pos);
+    !turn.robots.iter().any(|robot| {
+        robot.health > 0
+            && robot.target_team == turn.team_type
+            && footprint_distance(robot.pos, &footprint) <= ROBOT_ATTACK_RANGE
+    })
+}
+
+/// Their station is already hurt. The protocol carries CURRENT health only, so
+/// "damaged" comes off the level table (`station_max_hp`) — the same trick
+/// [`station_focus_with`] uses, and `sim` is consulted so damage an earlier
+/// tower committed this same round counts.
+pub fn enemy_station_damaged(turn: &Turn, sim: &Sim) -> bool {
+    match turn.enemy_station().filter(|station| station.alive()) {
+        Some(station) => sim.building_hp(station) < station_max_hp(station.level),
+        None => false,
+    }
+}
+
+/// Wall-breach tactic (P1): should this tower spend a spare volley opening a
+/// hole in the opponent's wall line?
+///
+/// At night the robots attack BOTH bases, and in our own matches their base
+/// fell to robots more often than to our guns. A wall is the only thing that
+/// stops that wave — 任务书 4.7.3 "机器人会攻击阻挡其移动的单位", and 2.2 "建筑被
+/// 拆除后，对应区域变为可穿越空地" — so one demolished wall cell turns the ring
+/// the robots have been chewing on all night into a door. 任务书 ch.7 decides
+/// the half by which base falls first, and that is worth far more than the
+/// same volley chipping their station or one of their guns.
+///
+/// Gated on evidence rather than appetite:
+/// * `spare_firepower` — issue #7's "有余力时" still owns the ordering, and a
+///   robot hunting us that no ready tower reaches is exactly the case this
+///   must never fire in (the caller checks it too; repeated here so the gate
+///   cannot be lost when this is reached from somewhere else);
+/// * a robot is marching on THEM — a hole nobody walks through is just a
+///   repaired wall waiting to happen;
+/// * their station already damaged, or ours is not being hit this round — the
+///   one night the volley belongs at home is the night our base is the one
+///   coming apart;
+/// * an enemy wall inside this tower's reach whose remaining HP this volley
+///   covers. The dial raises what a wall is WORTH; it does not turn a scratch
+///   into a breach, so a full-HP ring leaves the committed order untouched.
+///
+/// `station_killable` is checked ahead of this in `choose_enemy_targets_with`
+/// and is deliberately NOT part of the gate: a station that dies this round
+/// ends the half, which stays the highest rule on the board. The coach's 收火
+/// (`Policy::station_pressure`) is not part of it either — 收火 pulls the
+/// campaign off their STATION while still firing at their other buildings, and
+/// the `station_safe` evidence above is the stronger version of the same worry.
+pub fn wall_breach_with(weights: &Weights, turn: &Turn, tower: &Unit, sim: &Sim) -> bool {
+    if weights.wall_breach_value <= 0 {
+        return false;
+    }
+    if !spare_firepower(turn) {
+        return false;
+    }
+    if !turn
+        .robots
+        .iter()
+        .any(|robot| robot.health > 0 && robot.target_team != turn.team_type)
+    {
+        return false;
+    }
+    if !enemy_station_damaged(turn, sim) && !station_safe(turn) {
+        return false;
+    }
+    let damage = tower_volley_damage(tower);
+    turn.enemy_walls().iter().any(|wall| {
+        let hp = sim.building_hp(wall);
+        hp > 0 && hp <= damage && wall.footprint().iter().any(|cell| in_range(tower, *cell))
+    })
+}
+
+/// As [`wall_breach_with`], against the active dial.
+pub fn wall_breach(turn: &Turn, tower: &Unit, sim: &Sim) -> bool {
+    wall_breach_with(weights(), turn, tower, sim)
+}
+
 /// Estimated total HP of tonight's robot wave (P1-1). Measured anchors from
 /// the issues: D1 = 70 smalls (issue #14), D2 = 90+ mixed (#8). Linear count
 /// model `50 + 20 × day` at a 45 HP blended average (smalls dominate; the
@@ -953,6 +1063,12 @@ fn station_targets(
 /// one taking hits, the guns come home instead of plinking their base.
 /// `station_killable` is NOT gated — a station that dies this round ends the
 /// half, and that is a rule, not a preference.
+///
+/// The wall-breach tactic (P1) sits between those two: it needs a spare volley
+/// and a wall this volley can actually open (see `wall_breach_with`), and when
+/// it holds it demotes the P2-2 pressure branch for this tower — a hole their
+/// ring cannot un-ring is worth more than another round of station damage that
+/// does not finish it. `station_killable` still outranks it, unchanged.
 fn choose_enemy_targets_with(
     policy: &crate::brain::coach::Policy,
     turn: &Turn,
@@ -963,14 +1079,32 @@ fn choose_enemy_targets_with(
     if station_killable(turn, sim) {
         return station_targets(turn, tower, projectiles, sim);
     }
+    // Wall-breach tactic (P1). Checked BEFORE the sustained-pressure branch
+    // below and only before that one: `station_killable` above is a rule of the
+    // game and keeps its absolute priority. When a spare volley can actually
+    // open a hole in their ring, chipping a station this round cannot kill is
+    // the worse use of it — the wave behind that hole decides the half.
+    let breach = wall_breach_with(weights(), turn, tower, sim);
     // Sustained station pressure (P2-2): the wave is already covered — the
     // caller's `spare_firepower` gate owns that ordering — and a volley into
     // the enemy station is permanent progress toward the win condition, which
     // outranks plinking operators. pk577297: 1490 damage in 43 rounds, half
     // won while the opponent cleared robots on the wrong side of the map.
-    if policy.station_pressure && station_focus(turn, tower, sim) {
+    if !breach && policy.station_pressure && station_focus(turn, tower, sim) {
         return station_targets(turn, tower, projectiles, sim);
     }
+    // Breaching is spent through the ordinary ranking rather than around it: a
+    // wall is worth `wall_breach_value` instead of `wall_value` for this
+    // volley, so reachability, the gatling cone, the visibility window and the
+    // cross-tower damage reservation all keep working on it unchanged.
+    let ranking = if breach {
+        Weights {
+            wall_value: weights().wall_breach_value,
+            ..*weights()
+        }
+    } else {
+        *weights()
+    };
     let mut ranked: Vec<(i64, i64, Vec<Pos>)> = Vec::new(); // (score, id, reachable cells)
     for unit in turn.enemy.iter().filter(|unit| unit.alive()) {
         if sim.building_hp(unit) <= 0 {
@@ -990,7 +1124,10 @@ fn choose_enemy_targets_with(
             .into_iter()
             .filter(|cell| in_range(tower, *cell))
             .collect();
-        let score = enemy_unit_score(turn, tower, unit, &cells, sim);
+        // `enemy_unit_value_with` never returns our own units — the loop walks
+        // `turn.enemy` — so our own wall line is not a candidate here even when
+        // a friendly wall is the closest thing in range.
+        let score = enemy_unit_score_with(&ranking, turn, tower, unit, &cells, sim);
         if score > 0 {
             ranked.push((score, unit.id, cells));
         }
@@ -1010,6 +1147,24 @@ fn choose_enemy_targets_with(
         }
         if !turn.enemy.iter().any(|unit| unit.id == unit_id) {
             continue;
+        }
+        // Breach commit: a wall owns ONE cell, so the "unspent projectiles move
+        // down the ranking" spill below would hand the rest of the volley to
+        // the runner-up and leave the wall standing at half damage — a scratch,
+        // not a breach (`a_wall_is_not_worth_a_volley_that_barely_scratches_it`
+        // is the same judgement). When it was the breach gate that put a wall at
+        // the top of this ranking, the whole volley goes into that cell;
+        // `pad_targets` repeats it out to `projectiles`. Outside breach mode a
+        // wall still spills like any other building.
+        if breach
+            && turn
+                .enemy
+                .iter()
+                .any(|unit| unit.id == unit_id && unit.kind == UnitKind::Wall)
+        {
+            targets.push(cells[0]);
+            sim.damage_building(unit_id, tower_volley_damage(tower));
+            break;
         }
         let mut committed = 0i64;
         for cell in &cells {

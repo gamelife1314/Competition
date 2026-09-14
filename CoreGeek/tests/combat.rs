@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use coregeek::brain::combat::{choose_attack, init_sim};
+use coregeek::brain::combat::{bomb_impact, choose_attack, dizzy_impact, init_sim};
 use coregeek::model::Turn;
 use coregeek::protocol::{Pos, Request, RoleCommand};
 use coregeek::state::BotState;
@@ -3451,4 +3451,91 @@ fn a_sellable_vein_beats_the_nearer_stone() {
         &std::collections::HashSet::new(),
     );
     assert_eq!(pick, Some((Pos { x: 5, y: 6 }, "stone".to_string())));
+}
+
+// ---------------------------------------------------------------------------
+// 任务书 4.5: the Bomb and the DizzyWeapon act on ROBOTS of both teams and on
+// nothing else — "眩晕法宝、范围炸弹仅对双方机器人有效，对敌方建筑、角色无效".
+// ---------------------------------------------------------------------------
+
+/// One of the opponent's roles. They arrive in `teamEnemy.roles` — a different
+/// list from `robot.roles` — which is the whole reason the two items below
+/// cannot touch them.
+fn enemy_role(id: i64, role: &str, x: i32, y: i32) -> Value {
+    json!({
+        "id": id, "pos": {"x": x, "y": y}, "roleType": role,
+        "health": if role == "worker" { 220 } else { 200 },
+        "attackPower": 0, "attackRange": 0,
+        "level": 1, "backPackCapability": 0, "backpack": []
+    })
+}
+
+/// `world` with the opponent's roster filled in.
+fn world_with_enemy(our_roles: Vec<Value>, enemy_roles: Vec<Value>, robots: Vec<Value>) -> Value {
+    let mut payload = world(our_roles, robots);
+    payload["teamEnemy"]["roles"] = json!(enemy_roles);
+    payload
+}
+
+#[test]
+fn an_enemy_only_cluster_is_never_a_bomb_or_dizzy_target() {
+    // A 2x2 block of their workers and pioneers is the juiciest-looking 3x3 on
+    // the board, and with no robot anywhere it attracts nothing: `turn.enemy`
+    // is not a victim list.
+    let turn = turn_from(world_with_enemy(
+        vec![station(10, 24, 1)],
+        vec![
+            enemy_role(20010, "worker", 20, 20),
+            enemy_role(20011, "worker", 21, 20),
+            enemy_role(20012, "pioneer", 20, 21),
+            enemy_role(20013, "pioneer", 21, 21),
+        ],
+        vec![],
+    ));
+    assert_eq!(turn.enemy.len(), 4, "their roles really are on the board");
+    assert_eq!(bomb_impact(&turn), None);
+    assert_eq!(dizzy_impact(&turn), None);
+}
+
+#[test]
+fn a_bomb_or_dizzy_impact_is_decided_by_the_robots_alone() {
+    // Two robots in one 3x3, close enough to the base that both items clear
+    // their thresholds. Their roles then stand right beside that cluster — on
+    // one side in `west`, on the other in `east`. Moving them, or deleting them
+    // entirely, must not move the chosen impact by a single cell.
+    let robots = vec![
+        robot(30001, 14, 22, 40, "challenger"),
+        robot(30002, 15, 22, 40, "challenger"),
+    ];
+    let ours = || vec![station(10, 24, 1)];
+    let west = vec![
+        enemy_role(20010, "worker", 13, 22),
+        enemy_role(20011, "pioneer", 13, 21),
+        enemy_role(20012, "worker", 12, 22),
+    ];
+    let east = vec![
+        enemy_role(20010, "worker", 16, 22),
+        enemy_role(20011, "pioneer", 17, 22),
+        enemy_role(20012, "worker", 17, 21),
+    ];
+
+    let bare = turn_from(world_with_enemy(ours(), vec![], robots.clone()));
+    let with_west = turn_from(world_with_enemy(ours(), west, robots.clone()));
+    let with_east = turn_from(world_with_enemy(ours(), east, robots));
+    assert_eq!(with_west.enemy.len(), 3, "their roles really are on the board");
+
+    assert_eq!(bomb_impact(&with_west), bomb_impact(&bare));
+    assert_eq!(bomb_impact(&with_east), bomb_impact(&bare));
+    assert_eq!(dizzy_impact(&with_west), dizzy_impact(&bare));
+    assert_eq!(dizzy_impact(&with_east), dizzy_impact(&bare));
+
+    // Both items do land on the robot cluster, and never on one of their roles.
+    let bomb = bomb_impact(&with_west).expect("the robots are a real cluster");
+    let dizzy = dizzy_impact(&with_west).expect("the cluster clears the dizzy threshold");
+    assert_eq!(bomb, Pos { x: 14, y: 22 });
+    assert_eq!(dizzy, Pos { x: 14, y: 22 });
+    assert!(
+        with_west.enemy.iter().all(|unit| unit.pos != bomb && unit.pos != dizzy),
+        "an enemy role cell must never be picked as an impact"
+    );
 }
