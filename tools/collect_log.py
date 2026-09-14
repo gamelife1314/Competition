@@ -64,6 +64,7 @@ CAPS = {
     "score_attr": 12,      # 一天一行，10 天 + 余量
     "score_split": 20,     # 一天一行，10 天 + 余量（v17 §14）
     "enemy_build": 12,     # 一天一行，10 天 + 余量
+    "dawn_clear": 12,      # 一天一行，10 天 + 余量（v19 §17）
 }
 CAP_TOTAL = sum(CAPS.values())
 
@@ -512,6 +513,22 @@ def build_tables(records, day):
         score_split_rows(records), CAPS["score_split"],
     )
 
+    # --------------------------------------------------- 表 10 天亮清除账（v19 §17）
+    # 任务书 4.7.3 把残余机器人在天亮自动清除，4.7.2 的积分却只算「击杀数」。把清除
+    # 当击杀，`scoreAttr.kill` 每早多一晚的残余，`residual = 总分 - kill - survival`
+    # 就整块变负——表 8 那五场的 -106…-409 连续五批被读成"任务线在丢 400 分"，而
+    # 任务书 ch.6 的 score_1 = 奖励 × 通过率 不可能为负。这一批已经分开（不再计分），
+    # 但判题器认不认这部分分，只有同一回合的 `scoreDelta` 和 `clearedScore` 并排才看
+    # 得见：`scoreDelta` ≈ 0 就是不给，≈ `clearedScore` 就是给。
+    section(
+        "表 10 · 天亮清除账　列：第几天 回合 清除数 清除的分数 该回合 scoreDelta 当时总分"
+        "（`scoreDelta` ≈ 0 = 判题器不给天亮清除的机器人算分；≈ `清除的分数` = 算分）",
+        [tsv([data(r).get("day"), data(r).get("round"), data(r).get("cleared"),
+              data(r).get("clearedScore"), data(r).get("scoreDelta"),
+              data(r).get("score")])
+         for r in pick(records, "dawn_clear")], CAPS["dawn_clear"],
+    )
+
     # ------------------------------------------------------------ 表 1 造塔计划
     section(
         "表 1 · 造塔计划 tower_plan　列：回合数 塔数 mayBuild upgradeReachable reserve guard 外层缺口",
@@ -574,9 +591,14 @@ def build_tables(records, day):
     # 是——只印后者会在一场第四次重试上印 0，读起来像"第一次提交"。
     # 末列 `rejectionFeedback` = 本次重试的 prompt 里带了几条判题器原话（§10 请求六之三）：
     # 它是"P0-1 的反馈到底有没有进 prompt"唯一能证伪的一格。
+    # 末列 `shape` 是 v19 §17 请求十二要的（`as-is`/`wrapped`/`unwrapped`/`rekeyed`）：
+    # `rewritten` 分不出方向——首次包装和拒后拆包都会把它置真——而这一批改的正是
+    # "首次提交就包装"，没有这一列就验收不了。老日志没有这个键就留空，**不要填
+    # `as-is`**：「原样交」和「这条日志早于 v19」的结论正好相反。
     section(
-        "表 4a · 每次提交　列：回合 session 字符数 换过外形 被改写 判错几次 拒绝几次 带回错因",
+        "表 4a · 每次提交　列：回合 session 字符数 外形 换过外形 被改写 判错几次 拒绝几次 带回错因",
         [tsv([data(r).get("round"), data(r).get("session"), data(r).get("chars"),
+              data(r).get("shape"),
               data(r).get("flipped"), data(r).get("rewritten"),
               data(r).get("wrongSoFar"), data(r).get("rejections"),
               data(r).get("rejectionFeedback")])

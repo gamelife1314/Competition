@@ -1133,9 +1133,28 @@ fn a_rejected_answer_is_retried_in_the_other_shape() {
     assert_eq!(submittable_answer_shaped(&two, "城市与数量", object, false), object);
     assert_eq!(submittable_answer_shaped(&two, "城市与数量", object, true), object);
 
-    // A bare scalar has no wrapper to flip either — the retry changes nothing,
-    // which is correct: only the value can be wrong there.
-    assert_eq!(submittable_answer_shaped(&fields, "取 token", "fc1e78eb2a5a", true), "fc1e78eb2a5a");
+    // A bare scalar that is NOT JSON at all is the one case where the retry
+    // must change something, and the earlier reading of this line ("only the
+    // value can be wrong there") is what issues #131-#135 disproved. Five
+    // matches, every session, first submission verbatim from the sandbox:
+    // `fc1e78eb2a5a`, submitted bare, answered `答案不是合法 JSON` (表 4b,
+    // round 23 in all five). The value was never wrong — a token with no JSON
+    // wrapper is not an answer in any schema — and resubmitting it identical
+    // burned the session's whole 10-15 round budget (表 3b: every session
+    // `timeout`, `success:false`). With one known field the wrapper is the only
+    // legal shape, so it goes out on the retry AND on the first attempt.
+    assert_eq!(
+        submittable_answer_shaped(&fields, "取 token", "fc1e78eb2a5a", true),
+        r#"{"token":"fc1e78eb2a5a"}"#
+    );
+    assert_eq!(
+        submittable_answer_shaped(&fields, "取 token", "fc1e78eb2a5a", false),
+        r#"{"token":"fc1e78eb2a5a"}"#,
+        "a non-JSON scalar has no legal bare form, so the first attempt wraps too"
+    );
+    // The narrow exit still holds: a scalar that ALREADY parses as JSON keeps
+    // the model's own shape on the first attempt.
+    assert_eq!(submittable_answer_shaped(&fields, "取 token", "15", false), "15");
 }
 
 // ---------------------------------------------------------------------------

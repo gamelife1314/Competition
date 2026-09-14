@@ -303,9 +303,21 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         .filter(|wall| wall.health < crate::brain::combat::wall_max_hp(wall.level))
         .count() as i64;
     let fixers = stock_of(turn, "WallFixer");
+    // The `walls.len() >= RING_WALLS_FOR_UPGRADE` gate that used to stand here
+    // is why the first `WallFixer` of every match in issues #131-#135 was bought
+    // on day 2 (表 2a: round 147, 148, 149, 151, 154 — and one of the five never
+    // bought one at all) while `ourWallLost` on night 1 alone ran 2465-6410 and
+    // the base behind the ring fell on night 2 or 3 in four of them. A ring that
+    // exists is a ring the night can breach; six standing cells was a proxy for
+    // "the ring is real" that only became true half a day after the ring started
+    // taking damage. A `WallFixer` mends a wall, and with no wall on the board it
+    // is 10 gold for nothing — that is the whole test. The quantity is unchanged
+    // (2 kits before the first complete ring, 4 after) and so are the priorities,
+    // so the 25-gold third-tower reserve and the 100-gold weapon voucher are
+    // exactly as protected as they were; a 2-kit day-1 stock is 20 gold.
     let want_fixers = if damaged_walls > 0 {
         damaged_walls.min(6)
-    } else if readiness && walls.len() >= RING_WALLS_FOR_UPGRADE {
+    } else if readiness && !walls.is_empty() {
         // P1-4 续航包：2–4 kits a day. A ring that has been closed before is
         // the ring the night tears open (issue #21: 17→7) — and the kits are
         // the only wall HP available during the night itself.

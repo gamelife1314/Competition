@@ -459,6 +459,22 @@ pub fn plan_pioneer(
                     "chars": chars,
                     "rewritten": payload != answer,
                     "flipped": flip,
+                    // Which direction the rewrite took, so 表 4a can say whether
+                    // the first submission of a session went out wrapped
+                    // (issues #131-#135: every session's first payload was a
+                    // bare non-JSON scalar and every one of them came back
+                    // `答案不是合法 JSON`). `rewritten` alone cannot: the
+                    // first-attempt wrap and the post-rejection unwrap both set
+                    // it.
+                    "shape": if payload == answer {
+                        "as-is"
+                    } else if payload.starts_with('{') && !answer.starts_with('{') {
+                        "wrapped"
+                    } else if !payload.starts_with('{') && answer.starts_with('{') {
+                        "unwrapped"
+                    } else {
+                        "rekeyed"
+                    },
                     "wrongSoFar": state.task.wrong_answers,
                     "rejections": state.task.rejections,
                     // WORKFLOW_REQUEST §10 请求六之三: how many of the judger's
@@ -1007,6 +1023,33 @@ pub fn submittable_answer_for_keys(
     if fields.len() >= 2 {
         return answer.to_string();
     }
+    // A value that is not JSON AT ALL cannot satisfy any schema, and its verdict
+    // is always a syntax rejection rather than a shape preference: 表 4b of
+    // issues #131-#135 carries `答案不是合法 JSON` against the first submission
+    // of **every** session in five straight matches (round 23 in all five), and
+    // each of those sessions then had one submission left before its deadline.
+    // The old rule wrapped a scalar only after a rejection, and only when it
+    // already parsed as JSON — so a bare `fc1e78eb2a5a` was resubmitted
+    // byte-identical forever (the `from_str` in the flip arm below fails, the
+    // object arm below fails, and both fall through to `answer.to_string()`).
+    //
+    // With exactly one known field the wrapper is the ONLY legal shape, so there
+    // is no working shape to preserve and the wrap happens on the first attempt
+    // too. The exit is deliberately narrow: a value that already parses as JSON
+    // keeps the old behaviour byte for byte (the model's own shape goes out
+    // first, the retry tries the other one), which is what
+    // `the_first_attempt_is_never_rewritten_into_a_new_shape` and
+    // `a_rejected_scalar_is_wrapped_under_the_declared_field` pin.
+    if fields.len() == 1 && serde_json::from_str::<serde_json::Value>(answer).is_err() {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            fields[0].clone(),
+            serde_json::Value::String(answer.trim().to_string()),
+        );
+        if let Ok(text) = serde_json::to_string(&serde_json::Value::Object(map)) {
+            return text;
+        }
+    }
     // The inverse direction (issues #121-#125). The object arm below can only
     // ever DROP a wrapper; a scalar therefore had exactly one shape to offer and
     // the retry spent its rounds resubmitting it. A declared or echoed
@@ -1051,8 +1094,20 @@ pub fn submittable_answer_for_keys(
 /// already have. `None` when the answer cannot supply one: a multi-key object
 /// says nothing about which of its values belongs under the judger's key, and
 /// guessing there would replace a wrong answer with a different wrong answer.
+///
+/// An answer that is not JSON at all supplies the whole of itself. That arm used
+/// to `?` out at the parse, so on the very boards the judger had just explained
+/// itself on — `键值比对不通过: $/token: 缺少键` (表 4b, issues #123 and #133)
+/// beside a sandbox that printed the token as a bare `TOKEN: fc1e78eb2a5a` — the
+/// named key was known, the value was known, and the re-key still did not happen:
+/// the retry resubmitted the bare string and the session ran out of rounds. The
+/// judger's own spelling of the key outranks every guess about shape, so a bare
+/// scalar becomes that key's value.
 fn value_for_named_key(answer: &str, key: &str) -> Option<serde_json::Value> {
-    let value = serde_json::from_str::<serde_json::Value>(answer).ok()?;
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(answer) else {
+        let trimmed = answer.trim();
+        return (!trimmed.is_empty()).then(|| serde_json::Value::String(trimmed.to_string()));
+    };
     match value {
         serde_json::Value::Object(map) => {
             if map.len() != 1 || map.contains_key(key) {

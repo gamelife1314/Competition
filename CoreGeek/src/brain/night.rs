@@ -457,8 +457,17 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                     plan.push(tower.id, RoleCommand::attack(controller.id, targets));
                 } else if !combat::spare_firepower(turn) {
                     // Robots hunting us are outside every ready tower's reach:
-                    // hold the opportunistic shot (issue #7's "有余力时").
+                    // hold the opportunistic shot (issue #7's "有余力时") — and
+                    // spend the round on the wall instead, for the same reason
+                    // the reload window is mason time below. There is no shot to
+                    // trade here: the trigger already came up empty for this
+                    // tower this round, and this is the second-largest silence
+                    // bucket in the batch (表 6a: 42/41/30/27/18 rounds a match).
                     idle_reason = "no_target_reserved_for_robots";
+                    if let Some(cmd) = cooldown_repair(turn, controller) {
+                        idle_reason = "mending";
+                        plan.push(controller.id, cmd);
+                    }
                 } else {
                     idle_reason = "no_target_in_range";
                 }
@@ -579,6 +588,29 @@ fn spare_night(
     if shelter(turn, role, claimed, plan) {
         return;
     }
+    // THE SPARE'S MASON ROUND. The paired controller only gets a mend on a
+    // reload round (`cooldown_repair`), and issues #131-#135 measured the ring
+    // losing 2465-15135 HP a night with the base behind it falling on night 1-3.
+    // A spare standing on the inner band — which is where `shelter` just put it,
+    // and the band is adjacent to the ring — is the second pair of hands the
+    // night never used: `repair_target(.., 3)` below is false for every wall
+    // under attack (see `combat::night_mend_target`). Deliberately placed AFTER
+    // the shelter move, so the no-night-mining rule still owns the walk home,
+    // and BEFORE the items, because a wall restored to full is worth more than
+    // a Bomb that may not land.
+    if let Some(wall_pos) = combat::night_mend_target(turn, role) {
+        crate::log::event(
+            "wall_mend",
+            serde_json::json!({
+                "round": turn.round_no,
+                "role": role.id,
+                "target": [wall_pos.x, wall_pos.y],
+                "duty": "spare",
+            }),
+        );
+        plan.push(role.id, RoleCommand::use_item_at("WallFixer", wall_pos));
+        return;
+    }
     // Burn summon orders (harassment works at night too).
     const ORDERS: [&str; 4] = [
         "BossRobotSummonOrder",
@@ -615,12 +647,12 @@ fn spare_night(
             return;
         }
     }
-    // Patch damaged walls when no robot is breathing down our neck. Only walls
-    // adjacent to the role are ever targeted, so this is safe from inside.
-    if let Some(wall_pos) = combat::repair_target(turn, role, 3) {
-        plan.push(role.id, RoleCommand::use_item_at("WallFixer", wall_pos));
-        return;
-    }
+    // (The wall patch used to sit here as `combat::repair_target(turn, role, 3)`.
+    // It can never fire: its `safe_radius` is measured from the WALL, so it is
+    // false for every wall with a robot within two cells — i.e. every wall the
+    // night is losing — and it is a strict subset of the `night_mend_target`
+    // call above, which has already declined by the time control reaches here.
+    // Mending moved up, before the items.)
     // Bomb: worth it against clusters (>= 2 robots) or big targets.
     if role.count_item("Bomb") > 0 {
         if let Some(impact) = combat::bomb_impact(turn) {
@@ -689,8 +721,14 @@ fn night_medicine(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
 /// Mend the weakest wall this operator is standing beside, if the gun it mans
 /// cannot fire this round anyway.
 ///
-/// See the call site for why the cooldown window is the one place a paired
-/// controller may spend a round on the wall. The predicates, in order:
+/// See the call site for why a round the gun cannot fire is a round the wall
+/// gets. There are two such windows and both call this: the reload
+/// (`tower.cooldown != 0`), and a ready gun whose trigger came up empty because
+/// every robot hunting us is outside every tower's reach
+/// (`no_target_reserved_for_robots` — 表 6a's second-largest silence bucket in
+/// issues #131-#135, 18-42 rounds a match). Neither trades a shot for a mend.
+///
+/// The predicates live in [`combat::night_mend_target`]:
 ///
 ///   * it carries a `WallFixer` — the item is the whole errand, and a role
 ///     without one has nothing to mend with;
@@ -704,29 +742,14 @@ fn night_medicine(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
 ///
 /// Bounded to one mend per round, which is what one action per role allows.
 fn cooldown_repair(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
-    if role.count_item("WallFixer") == 0 {
-        return None;
-    }
-    let meleed = turn
-        .robots
-        .iter()
-        .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= 1);
-    if meleed {
-        return None;
-    }
-    let target = turn
-        .walls()
-        .into_iter()
-        .filter(|wall| chebyshev(role.pos, wall.pos) == 1)
-        .filter(|wall| wall.health < combat::wall_max_hp(wall.level))
-        .min_by_key(|wall| (wall.health, wall.pos.x, wall.pos.y))?
-        .pos;
+    let target = combat::night_mend_target(turn, role)?;
     crate::log::event(
         "wall_mend",
         serde_json::json!({
             "round": turn.round_no,
             "role": role.id,
             "target": [target.x, target.y],
+            "duty": "cooldown",
         }),
     );
     Some(RoleCommand::use_item_at("WallFixer", target))

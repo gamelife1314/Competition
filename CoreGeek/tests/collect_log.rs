@@ -175,7 +175,8 @@ fn the_row_budget_lives_in_the_script_and_adds_up() {
     // judgement, because the driver is not the one who pays when the issue body
     // is a file dump. A cap that truncates silently would be worse than no cap,
     // so the script also has to declare the real length — and the caps have to
-    // stay inside the 560 lines §7.3 and §8 promise.
+    // stay inside the lines §7.3 and §8 promise (700 since v18; v19's 表 10 adds
+    // twelve more rows to a 664-line total, so the promise does not move).
     let text = collector();
     assert!(
         text.contains("本表共"),
@@ -185,7 +186,7 @@ fn the_row_budget_lives_in_the_script_and_adds_up() {
     let table = caps(&text);
     assert_eq!(
         table.len(),
-        18,
+        19,
         "expected one budget per section, got {table:?}"
     );
     assert!(
@@ -202,14 +203,14 @@ fn the_row_budget_lives_in_the_script_and_adds_up() {
     }
     assert_eq!(
         text.matches("CAPS[\"").count(),
-        18,
+        19,
         "a section is spending a budget that is not in the CAPS table"
     );
 
     let total: usize = table.iter().map(|(_, cap)| cap).sum();
     assert!(
-        total <= 680,
-        "the caps add up to {total} lines, over the 680 the docs promise"
+        total <= 700,
+        "the caps add up to {total} lines, over the 700 the docs promise"
     );
 }
 

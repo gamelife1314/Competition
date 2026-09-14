@@ -1289,6 +1289,12 @@ pub fn wall_max_hp(level: i32) -> i64 {
 
 /// A damaged wall adjacent to `role` worth repairing with a WallFixer, and
 /// safe to approach (no robot within `safe_radius`).
+///
+/// DAY ONLY. `safe_radius` is measured from the WALL, and a wall under attack
+/// is by definition one with robots beside it — so at night this predicate is
+/// false for exactly the walls the night is about to lose. [`night_mend_target`]
+/// is the night's version: it measures the danger against the OPERATOR, which is
+/// the thing that can actually be killed.
 pub fn repair_target(turn: &Turn, role: &Unit, safe_radius: i32) -> Option<Pos> {
     if role.count_item("WallFixer") == 0 {
         return None;
@@ -1311,4 +1317,43 @@ pub fn repair_target(turn: &Turn, role: &Unit, safe_radius: i32) -> Option<Pos> 
                 .map(|wall| wall.health)
                 .unwrap_or(i64::MAX)
         })
+}
+
+/// The wall a NIGHT mender should patch this round, or `None`.
+///
+/// Why the night needs its own rule rather than [`repair_target`]: issues
+/// #131-#135 each lost the base on night 2 or 3 (`ourWallLost` 2465-15135 a
+/// night) while the ring was never restored — the `safe_radius = 3` call the
+/// spare duty made requires no robot within two cells of the WALL, and a wall
+/// the wave is chewing on has robots beside it by construction. Every mend the
+/// night did perform came from `cooldown_repair`, which needs a paired
+/// controller standing beside a wall on a reload round AND a `WallFixer` in its
+/// pack — and 表 2a of those five matches shows the first kit bought on day 2 at
+/// round 147-154, i.e. after the night that mattered. Net: with no kit on the
+/// board before night 2 and the day rule refusing every wall under fire, **no
+/// wall HP could be restored on night 1 in any of the five.**
+///
+/// A `WallFixer` restores its target to FULL for 10 gold (`wall_max_hp` 1000 /
+/// 1500 / 2000) — the cheapest HP on the board by a wide margin. So the safety
+/// test is the one that can still be satisfied while the wall is under fire: no
+/// live robot ADJACENT to the operator (it is not being meleed), the same
+/// predicate `cooldown_repair` already uses for a paired controller. A wall
+/// being chewed from two or three cells out is exactly the wall worth mending.
+pub fn night_mend_target(turn: &Turn, role: &Unit) -> Option<Pos> {
+    if role.count_item("WallFixer") == 0 {
+        return None;
+    }
+    let meleed = turn
+        .robots
+        .iter()
+        .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= 1);
+    if meleed {
+        return None;
+    }
+    turn.walls()
+        .into_iter()
+        .filter(|wall| chebyshev(role.pos, wall.pos) == 1)
+        .filter(|wall| wall.health < wall_max_hp(wall.level))
+        .min_by_key(|wall| (wall.health, wall.pos.x, wall.pos.y))
+        .map(|wall| wall.pos)
 }

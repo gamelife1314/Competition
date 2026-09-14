@@ -286,3 +286,65 @@ fn a_multibyte_line_never_panics_the_harvest() {
         Some(r#"{"token":"abc123"}"#)
     );
 }
+
+#[test]
+fn a_bare_value_that_is_not_json_is_wrapped_on_the_first_attempt_too() {
+    // Issues #131-#135, all five matches, every session: 表 4a's first row is a
+    // 7-12 character payload and 表 4b answers it `答案不是合法 JSON`. The value
+    // in it was a token the sandbox had already printed correctly
+    // (`[OK] 全部通过 (6/6) TOKEN: fc1e78eb2a5a`); what was wrong was that a
+    // bare string is not an answer in ANY schema. The old rule wrapped a scalar
+    // only after a rejection AND only when it already parsed as JSON, so this
+    // payload was resubmitted byte-identical until the session's 10-15 round
+    // budget ran out (表 3b: every session `timeout`, `success:false`).
+    let fields = fields(&["token"]);
+    assert_eq!(
+        submittable_answer_for_keys(&fields, "", "fc1e78eb2a5a", false, &[]),
+        r#"{"token":"fc1e78eb2a5a"}"#
+    );
+    assert_eq!(
+        submittable_answer_for_keys(&fields, "", "fc1e78eb2a5a", true, &[]),
+        r#"{"token":"fc1e78eb2a5a"}"#,
+        "and the retry cannot do better, because there is no legal bare form"
+    );
+
+    // The narrow exit, unchanged: a value that already IS JSON keeps the
+    // model's own shape on the first attempt.
+    assert_eq!(submittable_answer_for_keys(&fields, "", "15", false, &[]), "15");
+    // And with no field named at all there is no wrapper to invent.
+    assert_eq!(
+        submittable_answer_for_keys(&[], "", "fc1e78eb2a5a", false, &[]),
+        "fc1e78eb2a5a"
+    );
+}
+
+#[test]
+fn a_named_key_re_keys_a_value_that_is_not_json_either() {
+    // 表 4b of issue #133 carries `键值比对不通过: $/token: 缺少键` and #123 the
+    // same, while 表 4c shows the sandbox had already printed the token as a bare
+    // `TOKEN: fc1e78eb2a5a`. The re-key that exists for exactly that verdict
+    // parsed the answer as JSON first and gave up when it could not — so the one
+    // submission where the key was known AND the value was known resubmitted the
+    // bare string instead. The judger's spelling of the key is the strongest
+    // statement about shape on the board; a non-JSON value becomes its value.
+    assert_eq!(
+        submittable_answer_for_keys(&[], "", "fc1e78eb2a5a", false, &fields(&["token"])),
+        r#"{"token":"fc1e78eb2a5a"}"#
+    );
+    // Still narrow: an empty value supplies nothing, and a multi-key object
+    // still says nothing about which of its values belongs under the key.
+    assert_eq!(
+        submittable_answer_for_keys(&[], "", "   ", false, &fields(&["token"])),
+        "   "
+    );
+    assert_eq!(
+        submittable_answer_for_keys(
+            &[],
+            "",
+            r#"{"city":"南京","count":5}"#,
+            false,
+            &fields(&["token"])
+        ),
+        r#"{"city":"南京","count":5}"#
+    );
+}

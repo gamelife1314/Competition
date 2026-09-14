@@ -252,12 +252,49 @@ fn log_round(
     // so the residual — task score (`score1`) plus estimate error — separates
     // the three objectives and shows WHICH one a change actually moved. See
     // [`survival_score`] for why the survival term is a sum and not a term.
-    let killed: i64 = state
+    // DAWN IS NOT A KILL (issues #131-#135). 任务书 4.7.3: "黑夜结束后，在第二天
+    // 早上的第一个回合，残余机器人自动清除" — the wave that survives the night is
+    // removed by the rules, not shot. Counting that removal as a kill inflated
+    // `cum_kill_score` by one night's survivors every single morning, and
+    // `residual` is `total - kill - survival`, so the phantom landed entirely in
+    // the one column the analysis workflow reads as "score_1 plus estimate
+    // error". 表 8 of those five matches shows the result: a residual of -106 to
+    // -409, read for five batches as "the task line is losing us 400 points" —
+    // impossible, since 任务书 ch.6 gives `score_1 = 奖励 × 通过率` and neither
+    // factor is ever negative. The `scoreAttr` split has to be honest before any
+    // task fix can be judged by it.
+    //
+    // The dawn round is the first day round: robots only ever appear at the first
+    // night round, so `turn.robots` is empty there and every robot that was alive
+    // last round was cleared. `dawn_clear` records the displaced count beside the
+    // score delta for the same round, so the next batch can check the two against
+    // each other and settle whether the judger scores them.
+    let vanished: Vec<i64> = state
         .prev_robot_hp
         .iter()
         .filter(|(id, hp)| **hp > 0 && !robot_hp.contains_key(id))
-        .map(|(id, _)| state.prev_robot_kind.get(id).copied().unwrap_or(0))
-        .sum();
+        .map(|(id, _)| *id)
+        .collect();
+    let score_of = |id: &i64| state.prev_robot_kind.get(id).copied().unwrap_or(0);
+    let dawn_clear = turn.is_day && turn.in_day_round <= 1;
+    let killed: i64 = if dawn_clear {
+        0
+    } else {
+        vanished.iter().map(score_of).sum()
+    };
+    if dawn_clear && !vanished.is_empty() {
+        crate::log::event(
+            "dawn_clear",
+            json!({
+                "round": turn.round_no,
+                "day": turn.day,
+                "cleared": vanished.len(),
+                "clearedScore": vanished.iter().map(score_of).sum::<i64>(),
+                "scoreDelta": score_delta,
+                "score": turn.total_score,
+            }),
+        );
+    }
     state.cum_kill_score = state.cum_kill_score.saturating_add(killed);
     // `score3` freezes on the day the base falls, so the day it happened has to
     // be latched the first time we see the station gone: every round after it
