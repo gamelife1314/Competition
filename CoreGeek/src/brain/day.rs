@@ -103,6 +103,20 @@ fn stone_batch(turn: &Turn, gaps: usize) -> i64 {
 /// budget so fortification cannot permanently starve the economy.
 const D1_WALL_CAP: i64 = 20;
 const LATER_WALL_CAP: i64 = 6;
+
+/// First day the second wall layer may be paid for (P2-1). Day 1 belongs to the
+/// first ring: a stone spent on ring 3 that day is a hole in the ring that is
+/// actually holding the night.
+const SECOND_LAYER_MIN_DAY: i64 = 2;
+/// Ring-3 cells the day may ask for at most. The outer layer is bought with
+/// surplus — four cells is one mine trip, and the six-cell maintenance budget
+/// still leaves room for the breach repair the ring itself may need.
+const SECOND_LAYER_BATCH: usize = 4;
+/// Cells kept clear around the gate before the second layer may stand. The gate
+/// is how everything inside reaches the ore, the vendor and the shop; an outer
+/// wall built across its mouth would seal the base's own doorway into a pocket,
+/// and `open_door` only ever cuts through the radius-2 ring.
+const SECOND_LAYER_GATE_CLEARANCE: i32 = 2;
 /// Day-rounds after dusk during which a stone carrier may still walk out to
 /// close the last hole in the ring. Long enough for a round trip from any
 /// tower post, short enough that the gun is manned again well before night.
@@ -172,7 +186,13 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // morning is filtered out of `wall_gaps` while it is still light, so this
     // does not read a deliberate door as a hole. From then on `wall_daily_cap`
     // treats holes as breach repair (see `BotState::ring_ever_complete`).
-    if wall_gaps.is_empty() && !turn.walls().is_empty() {
+    //
+    // Measured on the PRIMARY ring alone. The second layer (P2-1) is a later,
+    // partial addition which sits in `wall_gaps` too; letting it answer this
+    // question would mean the ring's own breach-repair budget never latched,
+    // and a ring the night tore open would be repaired on the six-cell
+    // maintenance budget that cannot re-close it (issue #21).
+    if primary_wall_gaps(turn, state).is_empty() && !turn.walls().is_empty() {
         state.ring_ever_complete = true;
     }
     let wall_cap = wall_daily_cap(turn.day, state.ring_ever_complete);
@@ -209,6 +229,12 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     if guard {
         build_reserve = build_reserve.max(WEAPON_BUILD_COST);
     }
+    // P2-2 宝藏线的献祭金：祭坛坐标、献祭物品、开启日、4 次上限全都实现了，却一次
+    // 也跑不起来——因为购物单会把金币全部花在升级券上，开拓者走到商店时钱包是空
+    // 的，只能站在柜台前等，等到开启日过去。这里把"下一件献祭物的钱"从购物单里
+    // 扣住（有上限、且只扣钱包里真有的钱，见 treasure::gold_reserve）。
+    let treasure_reserve = treasure::gold_reserve(turn, state);
+    build_reserve = build_reserve.max(treasure_reserve);
     let budget = economy::budget(turn, state, build_reserve);
 
     // Buyer assignment: a dedicated WORKER so voucher purchases are never
@@ -253,6 +279,14 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             "gaps": tower_gaps.len(),
             "reserve": build_reserve,
             "guard": guard,
+            // P2-1: how many of `wallGaps` are the second layer. Without the
+            // split, a day that spends its wall budget on ring 3 reads exactly
+            // like a day that failed to close ring 2.
+            "secondLayer": wall_gaps
+                .iter()
+                .filter(|site| wall_layer(turn, **site) == 3)
+                .count(),
+            "treasureReserve": treasure_reserve,
             "wallGaps": wall_gaps.len(),
             "stoneDemand": stone_demand,
             "teamStone": economy::team_ores(turn, STONE),
@@ -657,7 +691,12 @@ fn worker_day(
             state.walled_cells_today.insert(site);
             crate::log::event(
                 "wall_build",
-                serde_json::json!({"role": role.id, "target": site, "stone": role.count_item(STONE)}),
+                serde_json::json!({
+                    "role": role.id,
+                    "target": site,
+                    "layer": wall_layer(turn, site),
+                    "stone": role.count_item(STONE),
+                }),
             );
             plan.push(role.id, RoleCommand::build(site, "wall"));
             return;
@@ -675,7 +714,12 @@ fn worker_day(
                         state.walled_cells_today.insert(*site);
                         crate::log::event(
                             "wall_build",
-                            serde_json::json!({"role": role.id, "target": *site, "stone": role.count_item(STONE)}),
+                            serde_json::json!({
+                                "role": role.id,
+                                "target": *site,
+                                "layer": wall_layer(turn, *site),
+                                "stone": role.count_item(STONE),
+                            }),
                         );
                     }
                     plan.push(role.id, cmd);
@@ -2074,10 +2118,90 @@ pub fn gate_open_record(
     }))
 }
 
+/// Every wall cell the day wants filled: the primary ring, and — once that
+/// ring is complete — the second layer on the damaged arc (P2-1).
+///
+/// The order matters and is deliberate. While a single cell of the primary ring
+/// is open the second layer is not offered at all: the ring is what stands
+/// between the robots and the station, and an outer arc bought with the stone
+/// that would have closed it is worse than no outer arc.
+pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
+    let ring = primary_wall_gaps(turn, state);
+    if !ring.is_empty() {
+        return ring;
+    }
+    second_layer_gaps(turn, state)
+}
+
+/// The second wall layer: ring-3 cells on the arc that is actually taking
+/// damage, and nowhere else (P2-1).
+///
+/// Three limits keep it from becoming the full-map second ring the analysis
+/// rules out. It exists only on the sectors [`BotState::threatened_sectors`]
+/// ranks highest — at most three of the eight — so the arc is open at both ends
+/// and can never trap a role the way a second ring would; only
+/// [`SECOND_LAYER_BATCH`] cells of it are asked for per day, so the stone and
+/// the walking are bounded and cannot starve the economy; and it is offered
+/// only once the first ring is complete *and* the third gun stands, because up
+/// to that point every stone belongs to a defence that is not finished yet.
+///
+/// With no threat evidence — `threatened_sectors` empty — nothing is built.
+/// That is the point: the outer layer is paid for only where the robots
+/// demonstrably come through, never speculatively around the map.
+fn second_layer_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
+    if turn.day < SECOND_LAYER_MIN_DAY || turn.towers().len() < 3 {
+        return Vec::new();
+    }
+    let sectors = state.threatened_sectors();
+    if sectors.is_empty() {
+        return Vec::new();
+    }
+    let Some(station) = turn.station() else {
+        return Vec::new();
+    };
+    let footprint = station_footprint(station.pos);
+    let center = station.pos;
+    let gate = wall_gate(turn);
+    let existing: HashSet<Pos> = turn.walls().iter().map(|wall| wall.pos).collect();
+    let occupied: HashSet<Pos> = turn.ours.iter().flat_map(|unit| unit.footprint()).collect();
+    let mut cells: Vec<(usize, Pos)> = ring_cells(&footprint, 3)
+        .into_iter()
+        .filter(|pos| turn.is_land(*pos))
+        .filter(|pos| !existing.contains(pos) && !occupied.contains(pos))
+        .filter(|pos| {
+            !state
+                .blacklisted_builds
+                .contains(&(*pos, "wall".to_string()))
+        })
+        .filter(|pos| {
+            gate.map_or(true, |gate| chebyshev(*pos, gate) > SECOND_LAYER_GATE_CLEARANCE)
+        })
+        .filter_map(|pos| {
+            let sector = crate::state::arc_sector(center, pos);
+            let rank = sectors.iter().position(|ranked| *ranked == sector)?;
+            Some((rank, pos))
+        })
+        .collect();
+    cells.sort_by_key(|(rank, pos)| (*rank, pos.x, pos.y));
+    cells.truncate(SECOND_LAYER_BATCH);
+    cells.into_iter().map(|(_, pos)| pos).collect()
+}
+
+/// Which wall layer a cell belongs to: 2 is the ring that holds the night, 3 is
+/// the second layer on the damaged arc. Written into `wall_build` so the two
+/// are told apart in the log — a wall count that does not say which layer it
+/// came from cannot answer whether P2-1 built anything.
+fn wall_layer(turn: &Turn, site: Pos) -> i64 {
+    match turn.station() {
+        Some(station) => footprint_distance(site, &station.footprint()) as i64,
+        None => 0,
+    }
+}
+
 /// Desired D1 wall cells: one radius-2 shell around the station. One gate cell
 /// remains omitted while any controller is outside; after the dusk retreat
 /// checkpoint `update_wall_gate` explicitly admits that final seal cell.
-pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
+pub fn primary_wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
     let Some(station) = turn.station() else {
         return Vec::new();
     };

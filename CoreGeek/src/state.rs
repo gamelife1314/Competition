@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::brain::coach::Coach;
 use crate::brain::news;
-use crate::model::Turn;
+use crate::model::{chebyshev, Turn};
 use crate::protocol::Pos;
 
 /// One remembered command we issued last round, used to interpret
@@ -44,9 +44,17 @@ pub enum TaskStage {
     },
 }
 
-/// Rejected answers after which a task is abandoned rather than retried. A
-/// session that has been judged wrong three times has consumed its own
-/// evidence; the pioneer goes back to the wall line and the guns.
+/// Rejected answers after which a task is abandoned rather than retried.
+///
+/// The ceiling has not moved; what it counts has (P1-1). It used to count
+/// rejections, so the four informative verdicts issue #10's opponent retried
+/// against — each naming a different missing key — ended our session at the
+/// third while the judger still had something new to say. It now counts
+/// consecutive rejections that carried **no new text** (`TaskSession::
+/// wrong_answers`), which is the only case where a fourth rewrite is provably
+/// not the one: the judger has already said this exact thing. A session with no
+/// rejection text at all is back to the plain three-strike ceiling, because
+/// there is nothing to compare and the old rule is the only evidence available.
 pub const MAX_WRONG_ANSWERS: i32 = 3;
 
 #[derive(Debug, Clone, Default)]
@@ -66,7 +74,19 @@ pub struct TaskSession {
     pub best_answer: String,
     pub cmd_history: Vec<String>,
     pub result_history: Vec<String>,
+    /// Consecutive rejections that carried no new information (P1-1). Reset to
+    /// zero the moment the judger says something it has not said before, and
+    /// incremented when it repeats itself — see [`MAX_WRONG_ANSWERS`].
     pub wrong_answers: i32,
+    /// Every rejected submission this session, repeat verdicts included.
+    ///
+    /// `wrong_answers` is now a *give-up* counter and can go back to zero, so
+    /// nothing that means "how many answers has this session burned" may read
+    /// it: the shape flip in `task::plan_pioneer` alternates the submitted
+    /// payload after any rejection, and the retry prompt states how many
+    /// submissions have been judged wrong. Both want this count, which only
+    /// ever grows.
+    pub rejections: i32,
     /// Request rounds provide the second half of the response dedupe key.
     pub llm_request_round: Option<i64>,
     pub llm_consumed_request_round: Option<i64>,
@@ -108,6 +128,16 @@ pub struct TaskSession {
     /// description-derived `expected_fields` is only a fallback guess — the
     /// schema lives inside the sandbox and this is the channel that reads it.
     pub discovered_fields: Vec<String>,
+    /// The output schema the sandbox task file declared, echoed back on a
+    /// `SCHEMA: <json>` line (P1-2).
+    ///
+    /// `FIELDS:` names the fields; this says which of them are mandatory and
+    /// is the only signal strong enough to reject an answer for missing a
+    /// SINGLE field — `expected_fields` guesses from the task text, and a
+    /// one-field guess that is wrong rejects a correct answer. Absent line,
+    /// absent schema: everything downstream degrades to the `FIELDS:` and
+    /// description behaviour unchanged.
+    pub discovered_schema: Option<DiscoveredSchema>,
     /// Consecutive `[JUDGER_ERROR]` verdicts that name `executeCmd` as
     /// unavailable. That error is the judger telling us the task's execution
     /// window is shut — issue #17's two sessions fired four and one command
@@ -129,6 +159,38 @@ pub struct TaskSession {
     /// SOP fast path. A rejection is charged against exactly this entry
     /// (P1-3) — never against templates that did not run.
     pub sop_used_template: Option<String>,
+    /// Stage 2 of a two-stage SOP (P1-3): the cached answer script queued
+    /// behind the reconnaissance command the pair ran first. Consumed on the
+    /// next planning round, so a session that took the fast path runs
+    /// `explore` → `answer` and never re-enters the exploration.
+    pub sop_pending_answer: Option<String>,
+}
+
+/// The answer schema a sandbox script read out of the task file and echoed on
+/// a `SCHEMA:` line (P1-2).
+///
+/// A `FIELDS:` line is a bare list; this is the schema itself. Where the two
+/// disagree the schema wins, and it is the only source that may reject an
+/// answer for missing a single field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveredSchema {
+    /// Every field the answer may carry — the extras check reads this.
+    pub fields: Vec<String>,
+    /// The subset the answer must carry — the missing-field check reads this.
+    /// Empty means "every field is required".
+    pub required: Vec<String>,
+}
+
+/// A cached SOP bound to a live task, with both stages resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SopMatch {
+    /// The cache key of the entry that matched (`SopEntry::template`). A later
+    /// rejection is charged against exactly this entry.
+    pub template: String,
+    /// Stage 1 — reconnaissance. Runs first; `answer` is queued behind it.
+    pub explore: Option<String>,
+    /// Stage 2 — the script that produced an answer last time.
+    pub answer: String,
 }
 
 /// A cached, parameterised script for one task fingerprint. The body keeps
@@ -139,7 +201,23 @@ pub struct TaskSession {
 pub struct SopEntry {
     pub task_type: String,
     pub keywords: Vec<String>,
+    /// Stage 2 of the pair: the script that produced an answer. It is also the
+    /// entry's cache key — every strike, eviction and `last_rejected` comparison
+    /// is made against this string.
     pub template: String,
+    /// Stage 1 of the pair (P1-3): the reconnaissance command the cached
+    /// session ran BEFORE the one that answered.
+    ///
+    /// A task of a kind we have never seen is explored in full — the sandbox
+    /// has to be searched, the task file found and the output schema read
+    /// before any answer exists. Once a session has done that work, the words
+    /// it did it with are as reusable as the answer script: replaying the
+    /// reconnaissance first (one cached command, no LLM round trip) and then
+    /// the answer gives the second task of that kind a 2–3 round session
+    /// instead of a repeat of the whole exploration. `None` when the session
+    /// answered with its first command — there is no separate exploration to
+    /// replay then, and the answer script alone is the whole pair.
+    pub explore: Option<String>,
     /// Consecutive rejections charged against answers this template produced
     /// (P1-3). One strike keeps the entry — reuse with feedback, because a
     /// single rejection can be the task's input differing, not the script's
@@ -163,16 +241,42 @@ impl SopEntry {
     /// running it with the previous task's values would answer a different
     /// question confidently.
     pub fn bind(&self, description: &str) -> Option<String> {
-        if !self.template.contains("{{") {
-            return Some(self.template.clone());
-        }
-        let mut script = self.template.clone();
-        for name in placeholders(&self.template) {
-            let value = param_value(description, &name)?;
-            script = script.replace(&format!("{{{{{name}}}}}"), &value);
-        }
-        Some(script)
+        bind_template(&self.template, description)
     }
+
+    /// Bind BOTH stages of the pair to a new task (P1-3).
+    ///
+    /// `None` when the answer script cannot be bound — the pair is then
+    /// unusable and the LLM takes the task, exactly as before. An `explore`
+    /// stage that cannot be bound is dropped rather than failing the pair: it
+    /// is an optimisation, and answering from the cached answer script alone is
+    /// still the fast path. A template WITHOUT placeholders binds verbatim, so
+    /// a pair cached from a task whose inputs never varied still replays.
+    pub fn bind_pair(&self, description: &str) -> Option<SopMatch> {
+        let answer = self.bind(description)?;
+        Some(SopMatch {
+            template: self.template.clone(),
+            explore: self
+                .explore
+                .as_ref()
+                .and_then(|template| bind_template(template, description)),
+            answer,
+        })
+    }
+}
+
+/// Bind one template to `description`: verbatim when it has no placeholders,
+/// otherwise only when every placeholder resolves.
+fn bind_template(template: &str, description: &str) -> Option<String> {
+    if !template.contains("{{") {
+        return Some(template.to_string());
+    }
+    let mut script = template.to_string();
+    for name in placeholders(template) {
+        let value = param_value(description, &name)?;
+        script = script.replace(&format!("{{{{{name}}}}}"), &value);
+    }
+    Some(script)
 }
 
 /// `{{name}}` occurrences in a script template, in order and deduped.
@@ -240,6 +344,21 @@ pub enum TreasurePhase {
         round: i64,
     },
     HavePlan,
+    /// A `summonTreasure` has gone out and its verdict has not come back yet
+    /// (P2-2).
+    ///
+    /// Without this the phase stayed `HavePlan` after the summon, so the very
+    /// next round the pioneer was still standing beside the altar with the
+    /// items still in its pack and the day still open — and the planner fired
+    /// the summon again, and again, once per round. `summon_attempts` counted
+    /// those repeats rather than real summons, so the "4 attempts" cap was
+    /// reached in four rounds of one gamble, and a verdict of 2 ("not open
+    /// yet", which pushes the day and retries in place) never got its retry.
+    /// The line looked alive in the log and could not survive its own first
+    /// summon.
+    Summoned {
+        round: i64,
+    },
     Done,
 }
 
@@ -303,6 +422,18 @@ pub struct BotState {
     pub blacklisted_builds: HashSet<(Pos, String)>,
 
     pub task: TaskSession,
+    /// Gold the accepted task points advertised, banked when a session was
+    /// confirmed successful (P2-4). An upper bound on task income — the judger
+    /// pays `奖励 × 通过率` and does not tell us the pass rate — but the only
+    /// figure our own log can carry, and the one the attribution dashboard
+    /// needs to separate "the task line earned something" from "it did not".
+    pub task_gold_earned: i64,
+    /// Threat points per compass sector around our station (P2-1). Fed by
+    /// `absorb_threat` and read by `threatened_sectors`, which is what decides
+    /// where — and whether — the second wall layer is built.
+    pub threat_sectors: [i64; 9],
+    /// Last HP seen per wall cell, so the next drop can be charged to a sector.
+    pub wall_hp_seen: HashMap<Pos, i64>,
     /// Task point -> last round we will not accept it on.
     ///
     /// Abandoning a session is only half a fix: the pioneer is standing in the
@@ -452,6 +583,10 @@ impl BotState {
         // Action failure feedback.
         self.absorb_failures(turn);
 
+        // Where the base is actually being hurt (P2-1). Runs before planning
+        // so the day's wall blueprint reads this round's damage.
+        self.absorb_threat(turn);
+
         // Task / treasure feedback channels.
         self.absorb_llm_and_cmd(turn);
         self.absorb_task_events(turn);
@@ -585,20 +720,46 @@ impl BotState {
 
             let just_submitted = matches!(self.task.stage, TaskStage::WaitingSubmit { .. });
             if just_submitted && turn.error_codes.iter().any(|code| *code == 2) {
-                self.absorb_rejection_feedback(turn);
+                // INFORMATION-DRIVEN RETRY (P1-1). The judger's rejection text
+                // is the only authority on WHY an answer was wrong, and the
+                // opponent's successful path (issue #10) was four retries
+                // against exactly that text. A rejection that names something
+                // new is progress: the counter restarts and the session keeps
+                // the rest of its timeout to act on it. A rejection that
+                // repeats a complaint already in hand is the judger saying the
+                // same thing twice — the one piece of evidence that a further
+                // rewrite is not the one — and it is what the ceiling now
+                // counts. With no text at all there is nothing to compare and
+                // the plain three-strike ceiling stands, unchanged.
+                let informed = self.absorb_rejection_feedback(turn);
                 self.task.post_submit_error = true;
-                self.task.wrong_answers = self.task.wrong_answers.saturating_add(1);
+                self.task.rejections = self.task.rejections.saturating_add(1);
+                if informed {
+                    self.task.wrong_answers = 0;
+                    crate::log::event(
+                        "task_retry_informed",
+                        serde_json::json!({
+                            "session": self.task.session_id,
+                            "round": turn.round_no,
+                            "feedback": self.task.rejection_feedback.len(),
+                            "rejections": self.task.rejections,
+                        }),
+                    );
+                } else {
+                    self.task.wrong_answers = self.task.wrong_answers.saturating_add(1);
+                }
                 self.task.stage = TaskStage::Planning;
                 self.task.submitted_round = None;
                 self.task.phase_missing_rounds = 0;
                 self.task.point_closed_round = None;
                 self.charge_sop_rejection();
-                // Fast abandon. The opponent's edge in issue #15 was that it
-                // dropped a failing task immediately and "把开拓者投入防御",
-                // while all five of our sessions burned their entire timeout.
-                // Three rejected answers is enough evidence that the fourth
-                // attempt is not the one; the pioneer is worth more on the wall
-                // line than on a task that has already failed three times.
+                // Fast abandon, unchanged in kind. The opponent's edge in issue
+                // #15 was that it dropped a failing task immediately and
+                // "把开拓者投入防御", while all five of our sessions burned
+                // their entire timeout. `MAX_WRONG_ANSWERS` consecutive
+                // rejections that taught us nothing is that evidence; the same
+                // count of *informed* rejections is not, and the timeout still
+                // bounds the session either way.
                 if self.task.wrong_answers >= MAX_WRONG_ANSWERS {
                     self.finish_task(false, "wrong_answers");
                 }
@@ -625,7 +786,11 @@ impl BotState {
     /// parallel and same-order (WORKFLOW_REQUEST §7.3 表 4b), so the pair is
     /// read by index; a rejection the judger described with an empty string
     /// teaches nothing and is skipped, which is exactly today's behaviour.
-    fn absorb_rejection_feedback(&mut self, turn: &Turn) {
+    ///
+    /// Returns whether this round's verdict said anything the session had not
+    /// already been told — the input to the information-driven retry (P1-1).
+    fn absorb_rejection_feedback(&mut self, turn: &Turn) -> bool {
+        let mut learned = false;
         for (index, code) in turn.error_codes.iter().enumerate() {
             if *code != 2 {
                 continue;
@@ -638,7 +803,9 @@ impl BotState {
                 continue;
             }
             self.task.rejection_feedback.push(text.to_string());
+            learned = true;
         }
+        learned
     }
 
     fn absorb_task_events(&mut self, turn: &Turn) {
@@ -702,10 +869,124 @@ impl BotState {
                 }),
             );
             if confirmed {
+                self.bank_task_reward(turn);
                 self.clear_sop_strikes();
                 self.finish_task(true, "confirmed_success");
             }
         }
+    }
+
+    /// Bank what the task point advertised (P2-4).
+    ///
+    /// 任务书 ch.6 pays `任务奖励 × 通过率` and the judger never tells us the
+    /// pass rate, so the point's own `goldReward` is the upper bound of the
+    /// session's income and the only figure our log can honestly carry. Without
+    /// it the round record attributes the running total to `score2`/`score3`
+    /// and lumps task gold in with everything else, so "did the task line earn
+    /// anything this match" — the question every task fix is judged by — had no
+    /// answer in the log at all.
+    fn bank_task_reward(&mut self, turn: &Turn) {
+        let Some(point) = self.task.point else {
+            return;
+        };
+        let Some(reward) = turn
+            .player_tasks
+            .iter()
+            .find(|task| task.pos == point)
+            .map(|task| task.gold_reward)
+        else {
+            return;
+        };
+        if reward <= 0 {
+            return;
+        }
+        self.task_gold_earned = self.task_gold_earned.saturating_add(reward);
+        crate::log::event(
+            "task_reward",
+            serde_json::json!({
+                "session": self.task.session_id,
+                "round": turn.round_no,
+                "point": point,
+                "goldReward": reward,
+                "taskGoldEarned": self.task_gold_earned,
+            }),
+        );
+    }
+
+    /// Threat statistics per compass sector around our station (P2-1).
+    ///
+    /// Two inputs, deliberately weighted apart. A robot seen within
+    /// [`THREAT_SECTOR_RADIUS`] of the base is one point — it might walk past.
+    /// A wall that LOST HP outranks it by two orders of magnitude, because that
+    /// is the only evidence that a sector is not merely approached but
+    /// *breached*: the arc that actually takes damage is the arc the outer
+    /// layer is worth building on, and the analysis is explicit that it is
+    /// worth building on nowhere else.
+    fn absorb_threat(&mut self, turn: &Turn) {
+        let Some(station) = turn.station() else {
+            return;
+        };
+        let center = station.pos;
+        for robot in turn.robots.iter().filter(|robot| robot.health > 0) {
+            if chebyshev(robot.pos, center) > THREAT_SECTOR_RADIUS {
+                continue;
+            }
+            let sector = arc_sector(center, robot.pos);
+            if sector == CENTRE_SECTOR {
+                continue;
+            }
+            self.threat_sectors[sector] = self.threat_sectors[sector].saturating_add(1);
+        }
+        for wall in turn.walls() {
+            let Some(previous) = self.wall_hp_seen.insert(wall.pos, wall.health) else {
+                continue; // first sighting of this cell: no damage to attribute
+            };
+            if wall.health >= previous {
+                continue; // repaired, or untouched
+            }
+            let sector = arc_sector(center, wall.pos);
+            if sector == CENTRE_SECTOR {
+                continue;
+            }
+            self.threat_sectors[sector] = self.threat_sectors[sector]
+                .saturating_add(WALL_DAMAGE_WEIGHT)
+                .saturating_add(previous - wall.health);
+            crate::log::event(
+                "wall_damage",
+                serde_json::json!({
+                    "round": turn.round_no,
+                    "wall": wall.pos,
+                    "lost": previous - wall.health,
+                    "sector": sector,
+                }),
+            );
+        }
+    }
+
+    /// Sectors of the base that are actually taking damage, most-hit first
+    /// (P2-1). Empty means "no evidence yet" — and then no outer layer is
+    /// built, which is the point: the second wall is only ever paid for on the
+    /// arc the robots demonstrably come through.
+    ///
+    /// Capped at [`MAX_THREAT_SECTORS`] of the eight, so the arc can never grow
+    /// into the closed second ring the analysis rules out — an open arc cannot
+    /// trap a role the way a second ring would.
+    pub fn threatened_sectors(&self) -> Vec<usize> {
+        let peak = self.threat_sectors.iter().copied().max().unwrap_or(0);
+        if peak <= 0 {
+            return Vec::new();
+        }
+        // Top quartile of the peak: a sector the robots merely pass through
+        // does not qualify beside one they have breached.
+        let floor = (peak / 4).max(1);
+        let mut ranked: Vec<(i64, usize)> = (0..9)
+            .filter(|sector| *sector != CENTRE_SECTOR)
+            .map(|sector| (self.threat_sectors[sector], sector))
+            .filter(|(count, _)| *count >= floor)
+            .collect();
+        ranked.sort_by_key(|(count, sector)| (std::cmp::Reverse(*count), *sector));
+        ranked.truncate(MAX_THREAT_SECTORS);
+        ranked.into_iter().map(|(_, sector)| sector).collect()
     }
 
     /// A session that timed out without ever running a command never had a
@@ -750,6 +1031,12 @@ impl BotState {
                     "success": success,
                     "reason": reason,
                     "wrongAnswers": self.task.wrong_answers,
+                    // Both counters: `wrongAnswers` is the give-up count and
+                    // resets on new information (P1-1), so on its own it can no
+                    // longer answer "how many answers did this session burn" —
+                    // which is the first thing the analysis asks of a session
+                    // that ended at zero.
+                    "rejections": self.task.rejections,
                     "cmdRounds": self.task.cmd_history.len(),
                     "bestAnswer": crate::log::brief(&self.task.best_answer, 120),
                 }),
@@ -782,10 +1069,25 @@ impl BotState {
         if keywords.is_empty() {
             return None;
         }
+        // Stage 1 is whatever the session ran BEFORE the command that
+        // answered (P1-3). `cmd_history` is in send order and holds one entry
+        // per command the sandbox actually ran, so the command immediately
+        // before the answering one is the reconnaissance that made it
+        // possible — the `find`/`cat` round that read the task file and printed
+        // the schema. A session that answered with its first command has none,
+        // and the pair is then just the answer script.
+        let explore = self
+            .task
+            .cmd_history
+            .iter()
+            .rposition(|command| *command == script)
+            .filter(|index| *index > 0)
+            .map(|index| self.task.cmd_history[index - 1].clone());
         Some(SopEntry {
             task_type: self.task.task_type.clone(),
             keywords,
             template: script,
+            explore,
             ..Default::default()
         })
     }
@@ -820,7 +1122,7 @@ impl BotState {
     /// the wrong one produces a confidently wrong answer, which costs the
     /// whole task reward. When the fingerprint or a parameter binding is
     /// missing the caller falls back to a fresh LLM call.
-    pub fn find_sop(&self, task_type: &str, description: &str) -> Option<String> {
+    pub fn find_sop(&self, task_type: &str, description: &str) -> Option<SopMatch> {
         let keywords = keywords_of(description);
         if keywords.is_empty() {
             return None;
@@ -842,13 +1144,15 @@ impl BotState {
             })
             .max_by_key(|(_, overlap)| *overlap)
             .and_then(|(entry, overlap)| {
-                let script = entry.bind(description);
+                let pair = entry.bind_pair(description)?;
                 // Reuse with feedback, not blind replay (P1-3): a template
                 // carrying a strike may run again only when binding produced
                 // DIFFERENT bytes — new parameters, new task input. Replaying
                 // the exact script the judger already rejected is the same
                 // wrong answer with extra steps, so the LLM takes this one.
-                if entry.rejections > 0 && entry.last_rejected.as_ref() == script.as_ref() {
+                if entry.rejections > 0
+                    && entry.last_rejected.as_deref() == Some(pair.answer.as_str())
+                {
                     crate::log::event(
                         "sop_replay_skipped",
                         serde_json::json!({"taskType": task_type, "overlap": overlap}),
@@ -860,10 +1164,14 @@ impl BotState {
                     serde_json::json!({
                         "taskType": task_type,
                         "overlap": overlap,
-                        "bound": script.is_some(),
+                        "bound": true,
+                        // P1-3: whether this reuse is the compressed two-stage
+                        // path or the single-script one is the whole question
+                        // "did the pair actually save the exploration".
+                        "staged": pair.explore.is_some(),
                     }),
                 );
-                script
+                Some(pair)
             })
     }
 
@@ -948,7 +1256,11 @@ impl BotState {
                 // retries are expensive (15g per item). One in-place retry
                 // with the day pushed forward, then re-ask the LLM; hard cap
                 // at 4 total summons so we never loop forever.
-                self.treasure.summon_attempts = self.treasure.summon_attempts.saturating_add(1);
+                //
+                // The attempt is NOT counted again here (P2-2): the summon was
+                // already counted when it went out (`treasure::plan_pioneer`),
+                // and counting the verdict too made the cap mean "two gambles"
+                // while the log read "four".
                 if self.treasure.summon_attempts >= 4 {
                     self.treasure.phase = Done;
                 } else if self.treasure.summon_attempts >= 2 {
@@ -991,6 +1303,36 @@ impl BotState {
     pub fn consume_summon_order(&mut self) {
         self.summon_orders_today = self.summon_orders_today.saturating_add(1);
     }
+}
+
+/// The dead-centre bucket of [`arc_sector`]: a unit standing on the station
+/// itself has no direction, and folding it into one would credit a sector for
+/// nothing.
+pub const CENTRE_SECTOR: usize = 4;
+
+/// Most sectors the second wall layer may ever cover (P2-1). Three of eight is
+/// a 135° arc at the widest — open at both ends, so it can never enclose a
+/// role the way a full second ring would.
+pub const MAX_THREAT_SECTORS: usize = 3;
+
+/// Radius within which a live robot counts as pressing on the base (P2-1).
+const THREAT_SECTOR_RADIUS: i32 = 12;
+
+/// Threat points charged for one wall cell losing HP (P2-1). Weighted far above
+/// a mere sighting: damage taken is evidence, proximity is a guess.
+const WALL_DAMAGE_WEIGHT: i64 = 25;
+
+/// Direction bucket of `pos` around `center` on the 3×3 compass:
+/// `(sign(dy)+1) * 3 + (sign(dx)+1)`, so 0 is the south-west corner, 4 is
+/// [`CENTRE_SECTOR`] and 8 is the north-east corner.
+///
+/// Integer signs rather than an angle: the map is a grid, the question is
+/// "which side of the base", and a sector boundary that lands on a float
+/// rounding rule would make the two layers of P2-1 disagree about a cell.
+pub fn arc_sector(center: Pos, pos: Pos) -> usize {
+    let dx = (pos.x - center.x).signum() + 1;
+    let dy = (pos.y - center.y).signum() + 1;
+    (dy * 3 + dx) as usize
 }
 
 /// Cheap keyword extraction for SOP matching over Chinese/ASCII task text.

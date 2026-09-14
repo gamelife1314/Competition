@@ -7,7 +7,7 @@
 use crate::brain::Plan;
 use crate::model::{Turn, Unit};
 use crate::protocol::RoleCommand;
-use crate::state::{BotState, TaskStage};
+use crate::state::{BotState, DiscoveredSchema, TaskStage};
 
 /// Consecutive "`executeCmd` is not available" verdicts that end a session.
 const MAX_WINDOW_ERRORS: i32 = 2;
@@ -91,6 +91,23 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
             state.task.discovered_fields = fields;
         }
     }
+    // The schema itself, when the script read one out of the task file and
+    // echoed it (P1-2). Preferred over the FIELDS list: it says which fields
+    // are MANDATORY, which is the difference between a retry that adds a
+    // missing key and a retry that guesses.
+    if let Some(schema) = extract_schema(output) {
+        if state.task.discovered_schema.as_ref() != Some(&schema) {
+            crate::log::event(
+                "task_schema",
+                serde_json::json!({
+                    "session": state.task.session_id,
+                    "fields": schema.fields,
+                    "required": schema.required,
+                }),
+            );
+            state.task.discovered_schema = Some(schema);
+        }
+    }
     if let Some(answer) = extract_answer(output) {
         if is_meta_answer(&answer) {
             // A meta-description of the parsing step ({"status":"parsed",...})
@@ -170,26 +187,33 @@ pub fn plan_pioneer(
             None
         }
         TaskStage::Planning => {
-            // SOP fast path: a cached script whose fingerprint matches this
-            // task AND whose parameters bind to this description runs first.
+            // STAGE 2 OF A TWO-STAGE SOP (P1-3). A pair that carried an
+            // exploration script when it was cached queued its answer behind
+            // it; this is that answer, taken the round the exploration has
+            // finished. Checked before the fast path so a fresh `find_sop`
+            // cannot restart the exploration the pair just completed.
+            if let Some(answer) = state.task.sop_pending_answer.take() {
+                state.task.stage = TaskStage::HavePlan { cmd: answer };
+                return plan_pioneer(turn, state, pioneer, plan);
+            }
+            // SOP fast path: a cached pair whose fingerprint matches this task
+            // AND whose parameters bind to this description runs first.
             if state.task.cmd_history.is_empty() {
-                if let Some(script) = state.find_sop(&state.task.task_type, &state.task.description)
-                {
+                if let Some(pair) = state.find_sop(&state.task.task_type, &state.task.description) {
                     // A later rejection is charged against exactly the entry
                     // that ran (P1-3), so remember which template produced
                     // these bytes.
-                    let task_type = state.task.task_type.clone();
-                    let description = state.task.description.clone();
-                    state.task.sop_used_template = state
-                        .sop_cache
-                        .iter()
-                        .rev()
-                        .find(|entry| {
-                            entry.task_type == task_type
-                                && entry.bind(&description).as_deref() == Some(script.as_str())
-                        })
-                        .map(|entry| entry.template.clone());
-                    state.task.stage = TaskStage::HavePlan { cmd: script };
+                    state.task.sop_used_template = Some(pair.template);
+                    state.task.stage = match pair.explore {
+                        // Stage 1 first, answer queued behind it: the second
+                        // task of a kind costs 2–3 rounds instead of a replay
+                        // of the whole exploration.
+                        Some(explore) => {
+                            state.task.sop_pending_answer = Some(pair.answer);
+                            TaskStage::HavePlan { cmd: explore }
+                        }
+                        None => TaskStage::HavePlan { cmd: pair.answer },
+                    };
                     return plan_pioneer(turn, state, pioneer, plan);
                 }
             }
@@ -274,9 +298,9 @@ pub fn plan_pioneer(
             // answer with a better one. The red line stands: meta answers,
             // sentinels and exploratory output never reach this arm
             // (`on_cmd_result` and `partial_answer` filter them upstream).
-            let fields = schema_fields(state);
-            let gaps = schema_gaps(&fields, &answer);
-            let extras = schema_extras(&fields, &answer);
+            let (fields, required, authoritative) = schema_view(state);
+            let gaps = schema_gaps_with(authoritative, &required, &answer);
+            let extras = schema_extras_with(authoritative, &fields, &answer);
             if !gaps.is_empty() || !extras.is_empty() {
                 crate::log::event(
                     "task_answer_schema",
@@ -285,6 +309,11 @@ pub fn plan_pioneer(
                         "missing": gaps,
                         "extra": extras,
                         "roundsLeft": rounds_left,
+                        // Which source the verdict came from. Only a declared
+                        // schema may reject a single-field answer (P1-2), so a
+                        // `task_answer_schema` record without this cannot be
+                        // told from a description guess.
+                        "source": if authoritative { "schema" } else { "guess" },
                     }),
                 );
                 state.task.schema_gaps = gaps;
@@ -302,7 +331,11 @@ pub fn plan_pioneer(
             // a retry after any rejection submits the OTHER one — same value,
             // other wrapper — instead of the identical bytes with a new number
             // in them, which is what the three-strike abandon used to be.
-            let flip = state.task.wrong_answers > 0;
+            // Any rejection flips the shape, so this reads the monotonic count:
+            // `wrong_answers` restarts on new information (P1-1), and a flip
+            // that un-happens because the judger explained itself would submit
+            // the shape it already rejected.
+            let flip = state.task.rejections > 0;
             let payload =
                 submittable_answer_shaped(&fields, &state.task.description, &answer, flip);
             let (logged, chars) = answer_for_log(&payload);
@@ -316,6 +349,15 @@ pub fn plan_pioneer(
                     "rewritten": payload != answer,
                     "flipped": flip,
                     "wrongSoFar": state.task.wrong_answers,
+                    "rejections": state.task.rejections,
+                    // WORKFLOW_REQUEST §10 请求六之三: how many of the judger's
+                    // own rejection lines this retry's prompt carried. The
+                    // feedback is appended at the END of the prompt and
+                    // `prompt_sent.head` only keeps the first 300 characters,
+                    // so without this field the log can prove the judger
+                    // rejected an answer but never that the reason reached the
+                    // retry — which is the whole premise of P0-1 and P1-1.
+                    "rejectionFeedback": state.task.rejection_feedback.len(),
                 }),
             );
             state.task.submitted_round = Some(turn.round_no);
@@ -351,7 +393,7 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
     prompt.push_str(
         "1. 给出可直接执行的命令或脚本（放在 ```bash 或 ```python 代码块中），完成全部子任务。\n",
     );
-    prompt.push_str("2. 执行顺序固定为【侦察→作答】两段：先用 find/ls 定位并 cat 任务文件与相关文档（如 API_DOCS.md），确认接口地址、认证方式、输入数据、以及任务【要求输出的字段名】；再计算答案。侦察结论必须用一行 `FIELDS: 字段1,字段2` 打印出来（字段名以任务文件原文为准；单值答案打印 `FIELDS: value`）。即使本轮还算不出答案，也要先把已确认的字段通过 FIELDS 行打印出来——下一轮会带着它继续。\n");
+    prompt.push_str("2. 执行顺序固定为【侦察→作答】两段：先用 find/ls 定位并 cat 任务文件与相关文档（如 API_DOCS.md），确认接口地址、认证方式、输入数据、以及任务【要求输出的字段名】；再计算答案。侦察结论必须用一行 `FIELDS: 字段1,字段2` 打印出来（字段名以任务文件原文为准；单值答案打印 `FIELDS: value`）。即使本轮还算不出答案，也要先把已确认的字段通过 FIELDS 行打印出来——下一轮会带着它继续。若任务文件里写明了输出结构（JSON Schema，或「输出字段：名字+类型」这类格式），再打印一行 `SCHEMA: <原文 JSON>`——把文件里那段结构原样贴成一行 JSON（例如 `SCHEMA: {\"token\":\"string\",\"count\":\"integer\"}`，或 `SCHEMA: {\"properties\":{...},\"required\":[...]}`）。判分只按这个结构逐字段比对，所以这一行比任何推断都权威。\n");
     prompt.push_str("3. 脚本最后一行必须打印 `ANSWER: <最终答案>`，多字段答案用 JSON 表示，且 JSON 的字段名必须与 FIELDS 行完全一致。\n");
     prompt.push_str("4. 脚本要可复用：把可变参数（如城市名、文件名、数量）写成 `{{参数名}}` 占位符，参数名必须与任务描述里出现的字段名完全一致（例如描述里的“城市名”就用 `{{城市名}}`），脚本中不要写死具体取值；同一类任务下次会复用这段脚本并按新描述自动填参。\n");
     prompt.push_str("5. 尽量在一个脚本内完成全部步骤（find 找文件 → cat 读取 → 计算 → 打印 FIELDS 与 ANSWER），不要分多轮试探；只有带 `ANSWER:` 标记的输出才会被当作答案提交。\n");
@@ -369,6 +411,24 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
             state.task.discovered_fields.join("、")
         ));
     }
+    // The declared schema, when a script has read one out of the task file
+    // (P1-2). It outranks the FIELDS list above: it names which fields are
+    // MANDATORY, which is the difference between a retry that adds the missing
+    // key and one that guesses at it.
+    if let Some(schema) = &state.task.discovered_schema {
+        if !schema.fields.is_empty() {
+            let required = if schema.required.is_empty() {
+                schema.fields.clone()
+            } else {
+                schema.required.clone()
+            };
+            prompt.push_str(&format!(
+                "\n任务文件声明的输出结构：字段 {}；其中必填 {}。ANSWER 的 JSON 必须恰好包含这些字段（必填的一个都不能少），不要增删。\n",
+                schema.fields.join("、"),
+                required.join("、")
+            ));
+        }
+    }
     if !state.task.result_history.is_empty() {
         prompt.push_str("\n上次执行输出（请修正错误）：\n");
         let start = state.task.result_history.len().saturating_sub(2);
@@ -376,10 +436,13 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
             prompt.push_str(&truncate(result, 600));
             prompt.push('\n');
         }
-        if state.task.wrong_answers > 0 {
+        // The monotonic count: `wrong_answers` restarts whenever the judger
+        // explained itself (P1-1), and "judged wrong 0 times" in front of a
+        // session that has submitted four times reads as a first attempt.
+        if state.task.rejections > 0 {
             prompt.push_str(&format!(
                 "\n注意：之前提交的答案被判错 {} 次，上次答案：{}。请重新分析题目要求的字段与格式。\n",
-                state.task.wrong_answers, state.task.best_answer
+                state.task.rejections, state.task.best_answer
             ));
         }
     }
@@ -555,14 +618,148 @@ pub fn extract_fields(output: &str) -> Option<Vec<String>> {
     None
 }
 
-/// The schema the answer is checked against: the sandbox-echoed FIELDS when
-/// a script has reported them, else the fields guessed from the task text.
-fn schema_fields(state: &BotState) -> Vec<String> {
-    if state.task.discovered_fields.is_empty() {
+/// Parse the schema echo: a `SCHEMA:` line carrying the output schema a script
+/// read out of the sandbox task file (P1-2). Three shapes are accepted, widest
+/// first — a JSON-Schema object (`{"properties":{…},"required":[…]}`), a flat
+/// field→type map (`{"token":"string"}`), and a bare array of names. The last
+/// SCHEMA line wins, as with `FIELDS:`.
+///
+/// No line, no schema: every caller then degrades to the `FIELDS:` list and the
+/// description heuristic exactly as before, which is the no-regression case the
+/// analysis asks for.
+pub fn extract_schema(output: &str) -> Option<DiscoveredSchema> {
+    let trimmed = output.trim_end_matches("[TRUNCATED]").trim();
+    for line in trimmed.lines().rev() {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("SCHEMA:")
+            .or_else(|| line.strip_prefix("SCHEMA："))
+            .or_else(|| line.strip_prefix("schema:"))
+            .or_else(|| line.strip_prefix("schema："))
+            .or_else(|| line.strip_prefix("输出schema:"))
+            .or_else(|| line.strip_prefix("输出schema："));
+        let Some(rest) = rest else {
+            continue;
+        };
+        let json = rest.trim();
+        if json.is_empty() {
+            continue;
+        }
+        return parse_schema(json);
+    }
+    None
+}
+
+/// Keys that describe a schema rather than name a field, so a flat map carrying
+/// one of them is not read as an output field.
+const SCHEMA_KEYWORDS: [&str; 7] = [
+    "type",
+    "properties",
+    "required",
+    "title",
+    "description",
+    "items",
+    "additionalProperties",
+];
+
+/// Turn the JSON on a `SCHEMA:` line into the field list the gate checks
+/// against. `None` when it parses to nothing usable — an unparseable or empty
+/// echo teaches nothing and must not silently blank a schema already known.
+pub fn parse_schema(json: &str) -> Option<DiscoveredSchema> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let (mut fields, mut required): (Vec<String>, Vec<String>) = match &value {
+        serde_json::Value::Array(items) => (
+            items.iter().filter_map(|item| item.as_str()).map(name_of).collect(),
+            Vec::new(),
+        ),
+        serde_json::Value::Object(map) => {
+            match map.get("properties").and_then(|value| value.as_object()) {
+                Some(properties) => {
+                    let fields: Vec<String> = properties.keys().map(name_of).collect();
+                    let required = map
+                        .get("required")
+                        .and_then(|value| value.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|item| item.as_str())
+                                .map(name_of)
+                                .filter(|name| fields.contains(name))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (fields, required)
+                }
+                // A flat `{field: type}` map — the shape a task file's own
+                // "输出格式" block takes when it is not written as JSON Schema.
+                None => (
+                    map.keys()
+                        .filter(|key| !SCHEMA_KEYWORDS.contains(&key.as_str()))
+                        .map(name_of)
+                        .collect(),
+                    Vec::new(),
+                ),
+            }
+        }
+        _ => return None,
+    };
+    // A JSON object has no order to preserve (serde_json backs it with a
+    // `BTreeMap`, and the sort makes the fact explicit rather than incidental),
+    // so the object forms are put in name order. Only the array form carries an
+    // order the task file chose, and it keeps it.
+    if value.is_object() {
+        fields.sort();
+    }
+    let mut seen: Vec<String> = Vec::new();
+    fields.retain(|field| {
+        if field.is_empty() || seen.contains(field) {
+            return false;
+        }
+        seen.push(field.clone());
+        true
+    });
+    if fields.is_empty() || fields.len() > 16 {
+        return None;
+    }
+    // An empty `required` means "every named field is required", which is the
+    // only reading that cannot reject a correct answer: the schema named the
+    // field, and the answer omitted it.
+    if required.is_empty() {
+        required = fields.clone();
+    }
+    Some(DiscoveredSchema { fields, required })
+}
+
+fn name_of(name: impl AsRef<str>) -> String {
+    name.as_ref().trim().to_string()
+}
+
+/// The schema the answer is checked against (P1-2), strongest source first:
+/// the `SCHEMA:` echo, then the `FIELDS:` echo, then the fields guessed from
+/// the task text — as three parts: every field the answer may carry, the subset it
+/// must carry, and whether the source is authoritative enough to check a
+/// SINGLE field against.
+///
+/// Only a `SCHEMA:` line earns that last flag. `FIELDS:` is a list the script
+/// printed and `expected_fields` is a guess from prose; rejecting a correct
+/// one-field answer because a guess was wrong costs the whole task reward, so
+/// neither may. A declared schema is the task speaking for itself.
+fn schema_view(state: &BotState) -> (Vec<String>, Vec<String>, bool) {
+    if let Some(schema) = &state.task.discovered_schema {
+        if !schema.fields.is_empty() {
+            let required = if schema.required.is_empty() {
+                schema.fields.clone()
+            } else {
+                schema.required.clone()
+            };
+            return (schema.fields.clone(), required, true);
+        }
+    }
+    let fields = if state.task.discovered_fields.is_empty() {
         expected_fields(&state.task.description)
     } else {
         state.task.discovered_fields.clone()
-    }
+    };
+    (fields.clone(), fields, false)
 }
 
 /// The answer as the judger should receive it, given the schema a script has
@@ -982,7 +1179,15 @@ pub fn expected_fields(description: &str) -> Vec<String> {
 /// against (fewer than two fields), because a false positive here would
 /// reject a correct answer.
 pub fn schema_gaps(fields: &[String], answer: &str) -> Vec<String> {
-    if fields.len() < 2 {
+    schema_gaps_with(false, fields, answer)
+}
+
+/// [`schema_gaps`] with the two-field floor lifted for a schema the task file
+/// itself declared (P1-2). A `SCHEMA:` line naming one required field is the
+/// task speaking, so an answer missing it IS incomplete; a one-field guess from
+/// prose is not, and stays ignored exactly as before.
+pub fn schema_gaps_with(authoritative: bool, fields: &[String], answer: &str) -> Vec<String> {
+    if fields.is_empty() || (!authoritative && fields.len() < 2) {
         return Vec::new();
     }
     let keys = json_keys(answer);
@@ -1016,7 +1221,17 @@ pub fn answer_schema_gaps(description: &str, answer: &str) -> Vec<String> {
 /// only when the answer is actually a JSON object — a bare scalar has no keys
 /// to be extra.
 pub fn schema_extras(fields: &[String], answer: &str) -> Vec<String> {
-    if fields.len() < 2 {
+    schema_extras_with(false, fields, answer)
+}
+
+/// [`schema_extras`] with the two-field floor lifted for a declared schema
+/// (P1-2) — see [`schema_gaps_with`].
+pub fn schema_extras_with(
+    authoritative: bool,
+    fields: &[String],
+    answer: &str,
+) -> Vec<String> {
+    if fields.is_empty() || (!authoritative && fields.len() < 2) {
         return Vec::new();
     }
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(answer)

@@ -2015,7 +2015,7 @@ fn a_template_carrying_a_strike_is_reused_only_with_new_bytes() {
     );
     let rebound = state.find_sop("自进化类1", "任务：统计城市名：上海 的人口");
     assert_eq!(
-        rebound.as_deref(),
+        rebound.map(|pair| pair.answer).as_deref(),
         Some("python3 report.py --city 上海"),
         "new parameters are a new attempt"
     );
@@ -2031,6 +2031,7 @@ fn a_confirmed_success_clears_the_templates_strikes() {
         task_type: "自进化类1".into(),
         keywords: vec!["count".into(), "files".into()],
         template: "ls | wc -l".into(),
+        explore: None,
         rejections: 1,
         last_rejected: Some("ls | wc -l".into()),
     });

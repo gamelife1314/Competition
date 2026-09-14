@@ -11,7 +11,7 @@ use coregeek::brain::treasure::{holds_altar, plan_pioneer};
 use coregeek::brain::Plan;
 use coregeek::model::Turn;
 use coregeek::protocol::Request;
-use coregeek::state::{BotState, TreasurePhase, TreasurePlan};
+use coregeek::state::{BotState, TreasurePhase, TreasurePlan, TreasureState};
 
 fn turn_from(payload: Value) -> Turn {
     let req: Request = serde_json::from_value(payload).expect("payload parses");
@@ -170,4 +170,247 @@ fn day_plan_never_drags_the_waiting_pioneer_off_the_altar() {
         .expect("opening day summons, it does not hold");
     assert_eq!(cmd.action, "summonTreasure");
     let _ = &mut state;
+}
+
+// ---------------------------------------------------------------------------
+// P2-2: reviving the treasure line — the gold reserve, and a summon that is
+// issued once and waited for.
+// ---------------------------------------------------------------------------
+
+use coregeek::brain::treasure::{gold_reserve, TREASURE_RESERVE_CAP};
+use coregeek::protocol::Pos;
+
+/// `world` with a second shop item on the list.
+fn with_shop_items(payload: &mut Value, items: &[(&str, i64)]) {
+    payload["weaponShopList"] = json!(items
+        .iter()
+        .map(|(name, price)| json!({"name": name, "price": price}))
+        .collect::<Vec<_>>());
+}
+
+#[test]
+fn the_sacrifice_gold_is_reserved_out_of_the_shopping_list() {
+    // The whole reason the treasure line never ran: `intent_list` spent every
+    // coin on vouchers, so the pioneer reached the shop with an empty purse and
+    // stood at the counter while the opening day went past. While the plan is
+    // live and the items are missing, the gold they cost is reserved.
+    let mut payload = world(140, (28, 21));
+    with_shop_items(&mut payload, &[("StarSand", 15), ("FlameBreath", 15)]);
+    with_gold(&mut payload, 60);
+    let turn = turn_from(payload.clone());
+
+    let mut state = BotState::default();
+    state.current_day = 2;
+    state.treasure.phase = TreasurePhase::HavePlan;
+    state.treasure.plan = Some(TreasurePlan {
+        pos: Pos { x: 30, y: 5 },
+        items: vec!["StarSand".into(), "FlameBreath".into()],
+        open_day: 3,
+    });
+    assert_eq!(
+        gold_reserve(&turn, &state),
+        30,
+        "two 15-gold items are two items' worth of gold"
+    );
+
+    // Holding one of them already halves the reserve.
+    payload["teamOur"]["roles"][1]["backpack"] = json!(["StarSand"]);
+    let turn = turn_from(payload.clone());
+    assert_eq!(gold_reserve(&turn, &state), 15);
+
+    // Both in the pack: the errand needs no reservation at all.
+    payload["teamOur"]["roles"][1]["backpack"] = json!(["StarSand", "FlameBreath"]);
+    let turn = turn_from(payload.clone());
+    assert_eq!(gold_reserve(&turn, &state), 0);
+}
+
+#[test]
+fn the_reserve_can_never_freeze_the_whole_purse() {
+    let mut payload = world(140, (28, 21));
+    with_shop_items(&mut payload, &[("StarSand", 15)]);
+    let mut state = BotState::default();
+    state.current_day = 2;
+    state.treasure.phase = TreasurePhase::HavePlan;
+    // A six-item sacrifice is 90 gold at 15 apiece: more than the cap allows
+    // the line to hold.
+    state.treasure.plan = Some(TreasurePlan {
+        pos: Pos { x: 30, y: 5 },
+        items: vec!["StarSand".into(); 6],
+        open_day: 3,
+    });
+
+    with_gold(&mut payload, 200);
+    let turn = turn_from(payload.clone());
+    assert_eq!(
+        gold_reserve(&turn, &state),
+        TREASURE_RESERVE_CAP,
+        "the reserve is capped so the defence keeps the rest"
+    );
+
+    // Gold that is not in the purse cannot be reserved: a reserve larger than
+    // the purse is not a reserve, it is a spending freeze.
+    with_gold(&mut payload, 20);
+    let turn = turn_from(payload.clone());
+    assert_eq!(
+        gold_reserve(&turn, &state),
+        0,
+        "20 gold does not cover 45 + the medicine floor"
+    );
+
+    // And a reserve that would eat the night's medicine money is not taken.
+    with_gold(&mut payload, 50);
+    let turn = turn_from(payload.clone());
+    assert_eq!(gold_reserve(&turn, &state), 0);
+
+    // Past the opening day the altar will not open and the gold goes home.
+    with_gold(&mut payload, 200);
+    let mut expired = BotState::default();
+    expired.treasure.phase = TreasurePhase::HavePlan;
+    expired.treasure.plan = Some(TreasurePlan {
+        pos: Pos { x: 30, y: 5 },
+        items: vec!["StarSand".into()],
+        open_day: 2,
+    });
+    let later = turn_from(world(210, (28, 21))); // day 3
+    assert_eq!(gold_reserve(&later, &expired), 0);
+}
+
+#[test]
+fn the_day_planner_hands_the_reserve_to_the_build_budget() {
+    // End to end: the reserve reaches `economy::budget` as part of the day's
+    // reserve, which is what stops the shopping list spending it.
+    use coregeek::brain::economy;
+
+    let mut payload = world(140, (28, 21));
+    with_shop_items(&mut payload, &[("StarSand", 15)]);
+    with_gold(&mut payload, 60);
+    let turn = turn_from(payload.clone());
+    let mut plan_state = BotState::default();
+    plan_state.current_day = 2;
+    plan_state.treasure = TreasureState {
+        phase: TreasurePhase::HavePlan,
+        plan: Some(TreasurePlan {
+            pos: Pos { x: 30, y: 5 },
+            items: vec!["StarSand".into()],
+            open_day: 3,
+        }),
+        ..Default::default()
+    };
+    let reserved = gold_reserve(&turn, &plan_state);
+    assert_eq!(reserved, 15);
+
+    // The budget the planner builds sees the floor: with 60 gold and a 15-gold
+    // reserve, a 50-gold voucher is not affordable.
+    let budget = economy::budget(&turn, &BotState::default(), 15);
+    assert!(
+        budget.shopping.iter().all(|need| need.name != "WeaponUpgradeVoucher1"),
+        "the reserved gold was spent on a voucher"
+    );
+}
+
+#[test]
+fn a_summon_is_issued_once_and_its_verdict_waited_for() {
+    // (Round 270 is day 3 of a 130-round day.)
+    // The state machine that made the treasure line unable to survive its own
+    // first summon: `HavePlan` stayed set after the summon, so the next round
+    // the pioneer — still beside the altar, items still in the pack, day still
+    // open — fired the same summon again. `summon_attempts` counted those
+    // repeats, so the four-summon cap was reached in four rounds of ONE gamble
+    // and a result of 2 ("not open yet", which pushes the day and retries in
+    // place) never got its retry.
+    let mut payload = world(270, (29, 6)); // opening day
+    payload["teamOur"]["roles"][1]["backpack"] = json!(["StarSand"]);
+    with_gold(&mut payload, 100);
+    let turn = turn_from(payload);
+    let pioneer = turn.pioneer().unwrap().clone();
+
+    let mut state = waiting_state(3);
+    let mut claimed = HashSet::new();
+    let mut plan = Plan::default();
+    let cmd = plan_pioneer(&turn, &mut state, &pioneer, &mut claimed, &mut plan)
+        .expect("opening day summons");
+    assert_eq!(cmd.action, "summonTreasure");
+    assert_eq!(state.treasure.summon_attempts, 1);
+
+    // The next round: the verdict has not come back, so nothing is re-issued
+    // and the pioneer holds its cell.
+    let follow_up = turn_from(world(271, (29, 6)));
+    let mut plan = Plan::default();
+    let cmd = plan_pioneer(&follow_up, &mut state, &pioneer, &mut claimed, &mut plan);
+    assert!(cmd.is_none(), "a summon in flight is not re-issued: {cmd:?}");
+    assert_eq!(state.treasure.summon_attempts, 1, "and not counted twice");
+    assert!(holds_altar(&follow_up, &state, &pioneer));
+}
+
+#[test]
+fn a_not_open_yet_verdict_gets_its_in_place_retry() {
+    // Result code 2: push the opening day out and retry in place, then re-ask
+    // the LLM, then stop at four REAL summons. The cap counts gambles taken,
+    // not verdicts received — a legal summon consumes the sacrifice items
+    // whatever the outcome, so the two are the same number only if the verdict
+    // is not counted as well.
+    let mut state = waiting_state(3);
+    state.treasure.summon_attempts = 1; // the summon already went out
+    state.treasure.phase = TreasurePhase::Summoned { round: 270 };
+
+    let outcome = |state: &mut BotState, round_no: i64, code: i64| {
+        let mut payload = world(round_no, (29, 6));
+        payload["lastSummonTreasureResult"] = json!(code);
+        let turn = turn_from(payload);
+        state.observe(&turn);
+    };
+
+    outcome(&mut state, 271, 2);
+    assert_eq!(state.treasure.summon_attempts, 1, "the verdict is not a summon");
+    assert!(
+        matches!(state.treasure.phase, TreasurePhase::HavePlan),
+        "one in-place retry: {:?}",
+        state.treasure.phase
+    );
+    assert_eq!(
+        state.treasure.plan.as_ref().map(|plan| plan.open_day),
+        Some(4),
+        "the opening day is pushed out by one"
+    );
+
+    // Four real gambles is the hard cap, and the fifth never happens.
+    state.treasure.phase = TreasurePhase::Summoned { round: 272 };
+    state.treasure.summon_attempts = 4;
+    outcome(&mut state, 273, 2);
+    assert!(
+        matches!(state.treasure.phase, TreasurePhase::Done),
+        "the 4-attempt cap still ends the line: {:?}",
+        state.treasure.phase
+    );
+}
+
+#[test]
+fn a_wrong_item_verdict_still_re_asks_with_feedback() {
+    let mut state = waiting_state(3);
+    state.treasure.phase = TreasurePhase::Summoned { round: 270 };
+    let mut payload = world(271, (29, 6));
+    payload["lastSummonTreasureResult"] = json!(3);
+    let turn = turn_from(payload);
+    state.observe(&turn);
+    assert!(matches!(state.treasure.phase, TreasurePhase::Idle));
+    assert!(state.treasure.plan.is_none());
+    assert_eq!(state.treasure.summon_attempts, 0, "code 3 is a verdict, not a summon");
+}
+
+#[test]
+fn a_lost_verdict_resumes_instead_of_freezing_the_line() {
+    // A task running through the night can swallow the summon channel. The
+    // line must not stay `Summoned` for the rest of the match.
+    let mut state = waiting_state(3);
+    state.treasure.phase = TreasurePhase::Summoned { round: 270 };
+    let turn = turn_from(world(275, (29, 6))); // four rounds later
+    let pioneer = turn.pioneer().unwrap().clone();
+    let mut claimed = HashSet::new();
+    let mut plan = Plan::default();
+    plan_pioneer(&turn, &mut state, &pioneer, &mut claimed, &mut plan);
+    assert!(
+        matches!(state.treasure.phase, TreasurePhase::HavePlan),
+        "the line resumed: {:?}",
+        state.treasure.phase
+    );
 }

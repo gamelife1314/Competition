@@ -51,6 +51,19 @@ const READINESS_URGENT: i64 = 10;
 /// third gun costs, so small purchases cannot spend the purse below it.
 pub const FALLBACK_LEAD: i64 = 20;
 
+/// Enemy station HP at or below which the base counts as "low" (P2-3).
+///
+/// A base is 1500 HP at level 1, so this is the last 40%: the point at which a
+/// boss wave is not harassment but a finisher, because the score2 amplifier and
+/// the win condition are the same thing — the enemy station going down.
+pub const ENEMY_STATION_LOW_HP: i64 = 600;
+
+/// Two enemy towers this close together are a cluster (P2-3).
+///
+/// A BOSS wave is area damage against a base; against towers packed inside one
+/// blast radius it is the only order that pays for itself twice.
+pub const ENEMY_TOWER_CLUSTER: i32 = 3;
+
 /// Rounds before `DUSK_ROUND - FALLBACK_LEAD` at which the build reserve starts
 /// guarding the 25 gold the third tower costs (P0-4). The guard exists so the
 /// gold is still there when the window opens — consumables and wall vouchers
@@ -359,14 +372,37 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     let harass = state.coach.policy().harass;
     // Harassment: boss wave on the enemy, but only once our own defense
     // stands (all three towers) and we are rich.
-    if harass != Harass::Off && gold >= 500 && turn.towers().len() >= 3 && !state.harass_done_today {
+    //
+    // P2-3 压制窗口: the same order, armed by a stronger reason. A boss wave is
+    // worth buying when the enemy base is nearly down (the win condition) or
+    // when their towers sit inside one blast radius, and in that window it
+    // outranks every other HARASS order on the list — the thin-ring finisher at
+    // 8 and this one's own ordinary 9. It does not jump the consumables and the
+    // wall repairs above it (2–4): the night's medicine is still the night's.
+    // Two things are deliberately unchanged: the 500-gold gate — `gold` is
+    // already net of the build reserve below, so this can never divert a coin
+    // our own defence is holding — and the three-tower precondition, because a
+    // summons we cannot defend behind is a wave paid for twice. The one thing
+    // the window does relax is `harass_done_today`: a small order fired at dawn
+    // must not use up the day's one chance at the boss wave the evening's
+    // window just opened.
+    let suppression = boss_suppression_window(turn);
+    if harass != Harass::Off
+        && gold >= 500
+        && turn.towers().len() >= 3
+        && (suppression || !state.harass_done_today)
+    {
         needs.push(Need {
             name: "BossRobotSummonOrder".into(),
             num: 1,
-            priority: 9,
+            priority: if suppression { 7 } else { 9 },
             latest_round: 0,
             value: 0,
-            reason: "harass",
+            reason: if suppression {
+                "boss_suppression"
+            } else {
+                "harass"
+            },
         });
     }
 
@@ -407,6 +443,39 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         || state.coach.policy().gap_funding;
     clear_gap_order_with(gap_funding, turn, &mut needs);
     needs
+}
+
+/// Is the enemy in a state a boss wave can finish (P2-3)?
+///
+/// Two triggers, both read from the protocol rather than guessed: their base is
+/// below [`ENEMY_STATION_LOW_HP`], or two of their towers stand within
+/// [`ENEMY_TOWER_CLUSTER`] of each other. Either one means the wave is aimed at
+/// something that cannot absorb it.
+///
+/// A station we cannot see is NOT a low station — `enemy_station()` returning
+/// `None` means out of vision, not destroyed — so the HP test fails closed and
+/// only the tower test can fire on a hidden base. The towers are globally
+/// visible (接口文档 1.4), which is why they carry the trigger.
+pub fn boss_suppression_window(turn: &Turn) -> bool {
+    if turn
+        .enemy_station()
+        .map(|station| station.health <= ENEMY_STATION_LOW_HP)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let towers: Vec<Pos> = turn
+        .enemy
+        .iter()
+        .filter(|unit| unit.kind.is_tower() && unit.alive())
+        .map(|tower| tower.pos)
+        .collect();
+    towers.iter().enumerate().any(|(index, tower)| {
+        towers
+            .iter()
+            .skip(index + 1)
+            .any(|other| chebyshev(*tower, *other) <= ENEMY_TOWER_CLUSTER)
+    })
 }
 
 /// P1-1: when tonight's estimated wave out-HPs our guns (`firepower_gap` >

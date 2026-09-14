@@ -377,12 +377,12 @@ def coach_block(records):
 def build_tables(records, day):
     # ------------------------------------------------------------ 表 1 造塔计划
     section(
-        "表 1 · 造塔计划 tower_plan　列：回合数 塔数 mayBuild upgradeReachable reserve guard",
+        "表 1 · 造塔计划 tower_plan　列：回合数 塔数 mayBuild upgradeReachable reserve guard 外层缺口",
         counted(
             [
                 tsv([data(r).get("towers"), data(r).get("mayBuild"),
                      data(r).get("upgradeReachable"), data(r).get("reserve"),
-                     data(r).get("guard")])
+                     data(r).get("guard"), data(r).get("secondLayer")])
                 for r in pick(records, "tower_plan")
             ],
             post=by_number_in(2),   # `sort -k2 -n`：加好计数之后再按第二列（塔数）升序
@@ -420,18 +420,29 @@ def build_tables(records, day):
                  for r in pick(records, "task_ended")],
                 lambda t: sorted(t)), CAPS["endings"],
     )
+    # P1-1：`wrongAnswers` 现在是"放弃计数器"，判题器说出新错因就会被清零——所以它
+    # 单独一列会在一场提交了四次、被拒四次的 session 上印 0。`rejections` 是单调的
+    # 那个（本次 session 一共烧掉几个答案），两列一起才对得上"几次"问的是哪一个。
     section(
-        "表 3b · 逐 session　列：session 原因 成功 判错次数 回合数",
+        "表 3b · 逐 session　列：session 原因 成功 拒绝次数 判错次数 回合数",
         [tsv([data(r).get("session"), data(r).get("reason"), data(r).get("success"),
-              data(r).get("wrongAnswers"), data(r).get("cmdRounds")])
+              data(r).get("rejections"), data(r).get("wrongAnswers"),
+              data(r).get("cmdRounds")])
          for r in pick(records, "task_ended")], CAPS["sessions"],
     )
 
     # ---------------------------------------------------------- 表 4 判题器裁定
+    # 末两列是同一件事的两个问题：`rejections` = 这个 session 一共烧掉几个答案（单调），
+    # `wrongSoFar` = 当前的放弃计数（判题器说新东西就归零）。P1-1 之前两者恒等，之后不
+    # 是——只印后者会在一场第四次重试上印 0，读起来像"第一次提交"。
+    # 末列 `rejectionFeedback` = 本次重试的 prompt 里带了几条判题器原话（§10 请求六之三）：
+    # 它是"P0-1 的反馈到底有没有进 prompt"唯一能证伪的一格。
     section(
-        "表 4a · 每次提交　列：回合 session 字符数 换过外形 被改写 当时已错几次",
+        "表 4a · 每次提交　列：回合 session 字符数 换过外形 被改写 判错几次 拒绝几次 带回错因",
         [tsv([data(r).get("round"), data(r).get("session"), data(r).get("chars"),
-              data(r).get("flipped"), data(r).get("rewritten"), data(r).get("wrongSoFar")])
+              data(r).get("flipped"), data(r).get("rewritten"),
+              data(r).get("wrongSoFar"), data(r).get("rejections"),
+              data(r).get("rejectionFeedback")])
          for r in pick(records, "task_answer_submit")], CAPS["submits"],
     )
     # `errors` 缺席 = 这回合没出错（压缩规则 1：空数组不落盘），所以这一节天然只印

@@ -234,3 +234,176 @@ fn the_survival_objective_is_a_running_sum_not_one_days_term() {
     // in `residual`, which `abreport` presents as the task score.
     assert!(survival_score(10, None) - 10 * 10 == 450);
 }
+
+// ---------------------------------------------------------------------------
+// P2-4: the fourth attribution component — what the task line actually earned.
+// ---------------------------------------------------------------------------
+
+/// A `round` record carrying the running banked task gold.
+fn gold_line(day: i64, round: i64, score: i64, task_gold: i64) -> String {
+    line(
+        "round",
+        json!({
+            "round": round,
+            "day": day,
+            "score": score,
+            "scoreAttr": {"kill": 0, "survival": 0, "residual": 0},
+            "taskGoldEarned": task_gold,
+        }),
+    )
+}
+
+#[test]
+fn the_task_gold_column_carries_the_last_banked_total() {
+    // `taskGoldEarned` is a cumulative curve like `score`, so the day's value is
+    // the last round's — not the sum over the day's rounds, which would
+    // multiply the same reward by the number of rounds in the day.
+    let report = parse_battle(
+        "gold",
+        vec![
+            gold_line(1, 1, 10, 0),
+            gold_line(1, 130, 20, 0),
+            gold_line(2, 131, 60, 120),
+            gold_line(2, 260, 90, 120),
+            gold_line(3, 261, 95, 200),
+        ],
+    );
+    assert_eq!(report.days[0].task_gold, 0, "day 1 banked nothing");
+    assert_eq!(report.days[1].task_gold, 120);
+    assert_eq!(report.days[2].task_gold, 200);
+    assert_eq!(report.task_gold_earned, 200, "the match total banked");
+
+    let table = render(&[report]);
+    assert!(table.contains("gold"), "the column is labelled: {table}");
+    assert!(table.contains("200"), "{table}");
+}
+
+#[test]
+fn a_round_record_without_task_gold_does_not_reset_the_curve() {
+    // The field is only written once the log carries it; a capture from an
+    // older build (or a round whose record stayed quiet) must carry the last
+    // figure forward rather than snapping the curve back to zero.
+    let report = parse_battle(
+        "carry",
+        vec![
+            gold_line(2, 131, 60, 120),
+            line(
+                "round",
+                json!({
+                    "round": 132, "day": 2, "score": 61,
+                    "scoreAttr": {"kill": 0, "survival": 0, "residual": 0},
+                }),
+            ),
+        ],
+    );
+    assert_eq!(report.days[0].task_gold, 120);
+    assert_eq!(report.task_gold_earned, 120);
+}
+
+#[test]
+fn the_reports_split_informed_retries_from_repeated_giveups() {
+    // P1-1's whole claim is that the judger's rejection text reaches the retry
+    // and that the retry is given up on only when the judger repeats itself.
+    // The two counters are the falsifiable halves of that claim: if `inf` stays
+    // at zero while `rep` climbs, the feedback loop is not reaching the retry.
+    let report = parse_battle(
+        "retry",
+        vec![
+            line("task_retry_informed", json!({"session": 1, "round": 61, "feedback": 1})),
+            line("task_retry_informed", json!({"session": 1, "round": 78, "feedback": 2})),
+            line(
+                "task_ended",
+                json!({"session": 2, "success": false, "reason": "wrong_answers"}),
+            ),
+            line(
+                "task_ended",
+                json!({"session": 3, "success": false, "reason": "timeout"}),
+            ),
+            line("task_ended", json!({"session": 4, "success": true, "reason": "confirmed_success"})),
+        ],
+    );
+    assert_eq!(report.retries_informed, 2);
+    assert_eq!(
+        report.giveups_repeated, 1,
+        "only `wrong_answers` is a give-up on a repeated verdict"
+    );
+    assert_eq!(report.tasks_confirmed, 1);
+    assert_eq!(report.tasks_failed, 2);
+
+    let table = render(&[report]);
+    assert!(table.contains("inf"), "the split is labelled: {table}");
+    assert!(table.contains("rep"), "{table}");
+}
+
+#[test]
+fn the_report_says_which_sop_reuse_took_the_compressed_path() {
+    // P1-3: `sop` now reads `staged/total`. A pair that ran its exploration
+    // first is the compressed path; a single-script reuse is the old one, and
+    // only the ratio tells whether the two-stage pair is being taken at all.
+    let report = parse_battle(
+        "sop",
+        vec![
+            line("sop_reuse", json!({"taskType": "自进化类1", "staged": true})),
+            line("sop_reuse", json!({"taskType": "自进化类1", "staged": false})),
+            line("sop_reuse", json!({"taskType": "自进化类1"})),
+        ],
+    );
+    assert_eq!(report.sop_reuses, 3);
+    assert_eq!(
+        report.sop_staged_reuses, 1,
+        "an absent `staged` is the single-script path, not the pair"
+    );
+    assert!(render(&[report]).contains("1/3"), "staged/total");
+}
+
+#[test]
+fn both_bases_hp_are_carried_forward_to_the_end_of_the_capture() {
+    // Both are change-gated in the `round` record, so the day a base stops
+    // being mentioned is exactly the day it is most interesting. The report
+    // carries the last number seen rather than reading the gap as zero.
+    let report = parse_battle(
+        "hp",
+        vec![
+            round_line(1, 1, 10, 0, 10, 0, json!(1500), json!(1500), vec![], false),
+            // Day 2 writes our HP only; the enemy's is last seen at 1500.
+            line(
+                "round",
+                json!({
+                    "round": 131, "day": 2, "score": 40,
+                    "scoreAttr": {"kill": 0, "survival": 10, "residual": 0},
+                    "stationHp": 1100,
+                }),
+            ),
+        ],
+    );
+    assert_eq!(report.station_hp_last, Some(1100));
+    assert_eq!(
+        report.enemy_station_hp_last,
+        Some(1500),
+        "an unwritten enemy HP carries the last one seen"
+    );
+    assert_eq!(report.days[1].station_hp, Some(1100));
+    assert_eq!(report.days[1].enemy_station_hp, Some(1500));
+
+    let table = render(&[report]);
+    assert!(table.contains("hp"), "{table}");
+    assert!(table.contains("1100"), "{table}");
+}
+
+#[test]
+fn a_night_volley_carries_the_enemy_hp_the_round_record_left_out() {
+    // The night-side copy is the fallback: a round record that stayed quiet
+    // must not lose the number the volley block already reported.
+    let report = parse_battle(
+        "volley",
+        vec![line(
+            "round",
+            json!({
+                "round": 131, "day": 2, "score": 40,
+                "scoreAttr": {"kill": 0, "survival": 10, "residual": 0},
+                "volley": {"rejected": [], "noRobotDamage": false, "enemyStationHp": 900},
+            }),
+        )],
+    );
+    assert_eq!(report.enemy_station_hp_last, Some(900));
+}

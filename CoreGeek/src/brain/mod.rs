@@ -310,6 +310,13 @@ fn log_round(
             "survival": survival_score,
             "residual": residual,
         },
+        // P2-4 归因看板：三个 scoreAttr 分量之外，还缺的一格是"任务线到底挣了多少
+        // 钱"。判题器按 奖励×通过率 结算、从不告诉我们通过率，所以任务点自己的
+        // goldReward 是本日志能诚实携带的上界——但没有它，"任务修复有没有让任务线
+        // 开始挣钱"在对局日志里根本没有答案，而它正是每一次任务修复唯一要被检验
+        // 的东西。每回合写、与 `scoreAttr` 同级：这是一条累计曲线，只在变化时写
+        // 就只剩下变化点，读不出比例。
+        "taskGoldEarned": state.task_gold_earned,
         "robotCount": robot_hp.len(),
         "robotEvents": robot_events,
         "cmds": cmds,

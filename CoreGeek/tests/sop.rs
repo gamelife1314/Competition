@@ -801,14 +801,27 @@ fn the_submitted_payload_is_the_bare_value_the_judger_compares() {
     );
 }
 
-#[test]
-fn a_repeatedly_rejected_answer_abandons_the_task() {
-    use coregeek::state::MAX_WRONG_ANSWERS;
+/// A rejected submission: `round_no` with the judger's verdict text attached.
+fn rejection(round_no: i64, description: &str) -> Turn {
+    turn_from(json!({
+        "roundNo": round_no,
+        "mapInfo": {"width": 41, "height": 32, "zones": []},
+        "teamOur": {
+            "type": "challenger", "goldNum": 0, "totalScore": 0, "playerTasks": [],
+            "roles": [{
+                "id": 10011, "pos": {"x": 14, "y": 14}, "roleType": "pioneer",
+                "health": 200, "attackPower": 0, "attackRange": 0,
+                "backPackCapability": 40, "backpack": []
+            }]
+        },
+        "teamEnemy": {"roles": []},
+        "robot": {"roles": []},
+        "errors": [{"errorCode": 2, "description": description}],
+    }))
+}
 
-    // Issue #15: the opponent "直接放弃并把开拓者投入防御" while all five of our
-    // sessions burned their whole timeout on a task that had already been
-    // judged wrong. Three rejections is the evidence; the fourth attempt is not
-    // the one, and the pioneer is worth more on the wall line.
+/// A session waiting on the verdict of an answer it just submitted.
+fn session_awaiting_verdict() -> BotState {
     let mut state = BotState::default();
     state.task.active = true;
     state.task.session_id = 1;
@@ -816,44 +829,101 @@ fn a_repeatedly_rejected_answer_abandons_the_task() {
     state.task.timeout_round = 500;
     state.task.task_type = "自进化类1".into();
     state.task.description = "统计 /tmp/selfEvolutionTask 下的文件数量".into();
+    state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
+    state
+}
 
-    let rejected = |round_no: i64| {
-        turn_from(json!({
-            "roundNo": round_no,
-            "mapInfo": {"width": 41, "height": 32, "zones": []},
-            "teamOur": {
-                "type": "challenger", "goldNum": 0, "totalScore": 0, "playerTasks": [],
-                "roles": [{
-                    "id": 10011, "pos": {"x": 14, "y": 14}, "roleType": "pioneer",
-                    "health": 200, "attackPower": 0, "attackRange": 0,
-                    "backPackCapability": 40, "backpack": []
-                }]
-            },
-            "teamEnemy": {"roles": []},
-            "robot": {"roles": []},
-            "errors": [{"errorCode": 2, "description": "答案错误"}],
-        }))
-    };
+#[test]
+fn a_repeatedly_rejected_answer_abandons_the_task() {
+    use coregeek::state::MAX_WRONG_ANSWERS;
 
-    for round_no in 1..MAX_WRONG_ANSWERS as i64 {
-        // Each submission is judged wrong: the answer goes back to planning and
-        // the task survives, because one bad guess proves nothing.
+    // Issue #15: the opponent "直接放弃并把开拓者投入防御" while all five of our
+    // sessions burned their whole timeout on a task that had already been
+    // judged wrong. The ceiling has not moved (P1-1) — what it counts has. It
+    // now counts rejections that carried NO new text, because a repeated
+    // verdict is the one piece of evidence that a further rewrite is not the
+    // one: the judger has already said this exact thing.
+    let mut state = session_awaiting_verdict();
+
+    // The first rejection is informative — the session had never been told
+    // anything — so it restarts the counter instead of spending it. The three
+    // that follow only repeat the same complaint, and those are what end it.
+    for round_no in 1..=MAX_WRONG_ANSWERS as i64 {
         state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
-        state.observe(&rejected(round_no));
+        state.observe(&rejection(round_no, "答案错误"));
         assert!(
             state.task.active,
             "the task is still alive after {round_no} rejected answer(s)"
         );
-        assert_eq!(state.task.wrong_answers, round_no as i32);
+        assert_eq!(state.task.wrong_answers, (round_no - 1) as i32);
     }
 
     state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
-    state.observe(&rejected(MAX_WRONG_ANSWERS as i64 + 1));
+    state.observe(&rejection(MAX_WRONG_ANSWERS as i64 + 1, "答案错误"));
     assert!(
         !state.task.active,
-        "{MAX_WRONG_ANSWERS} rejected answers must end the task instead of \
-         burning the rest of the timeout"
+        "{MAX_WRONG_ANSWERS} rejections carrying no new information must end \
+         the task instead of burning the rest of the timeout"
     );
+    assert_eq!(
+        state.task.session_id, 0,
+        "the session was abandoned, not merely paused"
+    );
+}
+
+#[test]
+fn a_rejection_that_names_something_new_restarts_the_give_up_counter() {
+    use coregeek::state::MAX_WRONG_ANSWERS;
+
+    // Issue #10's opponent solved its task on the fourth retry by reading the
+    // judger's rejection text: `MissingNamedInput: city`, then the next key,
+    // then the next. Every one of those verdicts was NEW information, and under
+    // the old rule the third one abandoned a session the judger was still
+    // actively teaching. P1-1: a new complaint resets the counter, so the
+    // session survives well past MAX_WRONG_ANSWERS rejections as long as each
+    // one tells it something it did not know.
+    let mut state = session_awaiting_verdict();
+    for round_no in 1..=(MAX_WRONG_ANSWERS as i64 + 3) {
+        state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
+        let complaint = format!("键值比对不通过: $/field{round_no}: 缺少键");
+        state.observe(&rejection(round_no, &complaint));
+        assert!(
+            state.task.active,
+            "an informed rejection at round {round_no} must not end the session"
+        );
+        assert_eq!(
+            state.task.wrong_answers, 0,
+            "new information restarts the give-up counter"
+        );
+        assert_eq!(
+            state.task.rejections, round_no as i32,
+            "the monotonic rejection count still records every attempt"
+        );
+    }
+    assert_eq!(
+        state.task.rejection_feedback.len(),
+        (MAX_WRONG_ANSWERS + 3) as usize,
+        "every distinct complaint reached the retry prompt"
+    );
+}
+
+#[test]
+fn a_verdict_with_no_text_keeps_the_plain_three_strike_ceiling() {
+    use coregeek::state::MAX_WRONG_ANSWERS;
+
+    // The fallback the analysis asks to keep: with nothing to compare there is
+    // no such thing as "new information", so the old three-strike ceiling is
+    // the only evidence available and it stands unchanged.
+    let mut state = session_awaiting_verdict();
+    for round_no in 1..MAX_WRONG_ANSWERS as i64 {
+        state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
+        state.observe(&rejection(round_no, ""));
+        assert!(state.task.active, "still alive after {round_no} blank verdicts");
+        assert_eq!(state.task.wrong_answers, round_no as i32);
+    }
+    state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
+    state.observe(&rejection(MAX_WRONG_ANSWERS as i64, ""));
+    assert!(!state.task.active, "the ceiling still ends a blind session");
 }
 
 /// A world whose `lastCmdResult` is the judger refusing `executeCmd`.
@@ -1066,4 +1136,506 @@ fn a_rejected_answer_is_retried_in_the_other_shape() {
     // A bare scalar has no wrapper to flip either — the retry changes nothing,
     // which is correct: only the value can be wrong there.
     assert_eq!(submittable_answer_shaped(&fields, "取 token", "fc1e78eb2a5a", true), "fc1e78eb2a5a");
+}
+
+// ---------------------------------------------------------------------------
+// P1-2: the SCHEMA echo — the output schema read out of the sandbox task file.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_schema_echo_is_parsed_from_command_output() {
+    use coregeek::brain::task::extract_schema;
+    use coregeek::state::DiscoveredSchema;
+
+    // A JSON-Schema object: properties are the fields, `required` the subset
+    // the answer must carry.
+    assert_eq!(
+        extract_schema(
+            "[exitCode:0]\nSCHEMA: {\"type\":\"object\",\"properties\":{\"token\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"}},\"required\":[\"token\"]}"
+        ),
+        Some(DiscoveredSchema {
+            fields: vec!["count".into(), "token".into()],
+            required: vec!["token".into()],
+        })
+    );
+
+    // A flat field→type map, which is the shape a task file's own "输出格式"
+    // block takes when it is not written as JSON Schema. With no `required`
+    // key every named field is required — the only reading that cannot reject
+    // a correct answer.
+    assert_eq!(
+        extract_schema("SCHEMA: {\"token\":\"string\",\"count\":\"integer\"}"),
+        Some(DiscoveredSchema {
+            fields: vec!["count".into(), "token".into()],
+            required: vec!["count".into(), "token".into()],
+        })
+    );
+
+    // A bare array of names, the fullwidth colon, and the last line winning.
+    assert_eq!(
+        extract_schema("SCHEMA: [\"city\", \"temperature\"]\nSCHEMA：[\"only\"]"),
+        Some(DiscoveredSchema {
+            fields: vec!["only".into()],
+            required: vec!["only".into()],
+        })
+    );
+
+    // Junk teaches nothing and must not blank a schema already in hand.
+    assert_eq!(extract_schema("SCHEMA: not json"), None);
+    assert_eq!(extract_schema("SCHEMA: {}"), None);
+    assert_eq!(extract_schema("SCHEMA: []"), None);
+    // No line at all: the no-regression case.
+    assert_eq!(extract_schema("FIELDS: city, count\nANSWER: {}"), None);
+}
+
+#[test]
+fn a_declared_schema_outranks_the_fields_echo() {
+    use coregeek::brain::task::on_cmd_result;
+    use coregeek::state::{DiscoveredSchema, TaskStage};
+
+    // A script that prints both. `FIELDS` names four; the schema it read out of
+    // the task file names two and marks one required — the schema is the task
+    // speaking for itself and wins.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.stage = TaskStage::WaitingCmdResult { attempts: 0 };
+    state.task.cmd_history.push("python3 solve.py".into());
+    on_cmd_result(
+        &mut state,
+        "[exitCode:0]\nFIELDS: a, b, c, d\nSCHEMA: {\"properties\":{\"token\":{},\"count\":{}},\"required\":[\"token\"]}\nANSWER: {\"token\":\"x\"}",
+    );
+
+    assert_eq!(
+        state.task.discovered_schema,
+        Some(DiscoveredSchema {
+            fields: vec!["count".into(), "token".into()],
+            required: vec!["token".into()],
+        })
+    );
+    // The FIELDS echo is still recorded — it is a different channel and the
+    // schema may be replaced by a later run's better one.
+    assert_eq!(state.task.discovered_fields, vec!["a", "b", "c", "d"]);
+}
+
+#[test]
+fn a_declared_schema_rejects_a_single_missing_field() {
+    let turn = turn_from(task_world(6));
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 6;
+    state.task.timeout_round = 260;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "请阅读task_1.md，获取任务信息".into();
+    // ONE required field, and the answer does not carry it. The description
+    // names no fields at all, so nothing but the declared schema can catch
+    // this — and a one-field *guess* never may (it would reject a correct
+    // answer on a hunch), which is exactly why the schema has to be declared.
+    state.task.discovered_schema = Some(coregeek::state::DiscoveredSchema {
+        fields: vec!["count".into()],
+        required: vec!["count".into()],
+    });
+    state.task.stage = TaskStage::HaveAnswer {
+        answer: "{\"total\": 3}".into(),
+    };
+
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut plan = Plan::default();
+    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan)
+        .expect("submit-as-accumulating still banks the attempt");
+    assert_eq!(cmd.action, "submitAnswer");
+    assert_eq!(
+        state.task.schema_gaps,
+        vec!["count"],
+        "a declared schema may reject on one field"
+    );
+    assert!(
+        coregeek::brain::task::build_prompt(&state, &turn).contains("count"),
+        "and the retry prompt names it"
+    );
+
+    // The same answer with no declared schema: the single-field guess is too
+    // weak to act on, and nothing is recorded. This is the no-regression half.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 6;
+    state.task.timeout_round = 260;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "请阅读task_1.md，获取任务信息".into();
+    state.task.stage = TaskStage::HaveAnswer {
+        answer: "{\"total\": 3}".into(),
+    };
+    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    assert!(
+        state.task.schema_gaps.is_empty(),
+        "an undeclared single field is never checked"
+    );
+}
+
+#[test]
+fn a_declared_single_field_schema_drives_the_unwrap() {
+    use coregeek::brain::task::plan_pioneer;
+
+    // The schema says the answer IS one value, so the bot's own one-key wrapper
+    // comes off before submission (the issue #15 lesson, now driven by the
+    // schema rather than by the description heuristic).
+    let turn = turn_from(task_world(6));
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 6;
+    state.task.timeout_round = 260;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "请阅读task_1.md，获取任务信息".into();
+    state.task.discovered_schema = Some(coregeek::state::DiscoveredSchema {
+        fields: vec!["token".into()],
+        required: vec!["token".into()],
+    });
+    state.task.stage = TaskStage::HaveAnswer {
+        answer: "{\"token\":\"fc1e78eb2a5a\"}".into(),
+    };
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut plan = Plan::default();
+    let cmd = plan_pioneer(&turn, &mut state, pioneer, &mut plan).expect("submitted");
+    assert_eq!(cmd.taskAnswer.as_deref(), Some("fc1e78eb2a5a"));
+
+    // Two declared fields: the object is the answer's real shape. Untouched.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 6;
+    state.task.timeout_round = 260;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "请阅读task_1.md，获取任务信息".into();
+    state.task.discovered_schema = Some(coregeek::state::DiscoveredSchema {
+        fields: vec!["city".into(), "count".into()],
+        required: vec!["city".into(), "count".into()],
+    });
+    let object = "{\"city\":\"南京\",\"count\":5}";
+    state.task.stage = TaskStage::HaveAnswer {
+        answer: object.into(),
+    };
+    let mut plan = Plan::default();
+    let cmd = plan_pioneer(&turn, &mut state, pioneer, &mut plan).expect("submitted");
+    assert_eq!(cmd.taskAnswer.as_deref(), Some(object));
+}
+
+// ---------------------------------------------------------------------------
+// P1-3: the two-stage SOP — an explore template and an answer template.
+// ---------------------------------------------------------------------------
+
+use coregeek::state::keywords_of;
+
+/// A cached pair: `explore` reconnaissance in front of the answering script.
+fn sop_pair(task_type: &str, description: &str, explore: &str, answer: &str) -> SopEntry {
+    SopEntry {
+        task_type: task_type.into(),
+        keywords: keywords_of(description),
+        template: answer.into(),
+        explore: Some(explore.into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_cached_pair_runs_the_exploration_before_the_answer() {
+    let turn = turn_from(task_world(6));
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 6;
+    state.task.timeout_round = 260;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "任务：统计城市名：北京 的人口".into();
+    state.task.stage = TaskStage::Planning;
+    state.sop_cache.push(sop_pair(
+        "自进化类1",
+        "统计城市名：北京 的人口",
+        "find /tmp/selfEvolutionTask -maxdepth 4",
+        "python3 report.py --city {{城市名}}",
+    ));
+
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut plan = Plan::default();
+    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    assert_eq!(
+        plan.execute_cmd.as_deref(),
+        Some("find /tmp/selfEvolutionTask -maxdepth 4"),
+        "stage 1 is the reconnaissance, not the answer"
+    );
+    assert!(plan.prompt.is_none(), "no LLM call: the pair is cached");
+    assert_eq!(
+        state.task.sop_pending_answer.as_deref(),
+        Some("python3 report.py --city 北京"),
+        "stage 2 is bound and queued behind it"
+    );
+    assert_eq!(
+        state.task.sop_used_template.as_deref(),
+        Some("python3 report.py --city {{城市名}}"),
+        "a later rejection is charged to the entry that ran"
+    );
+
+    // The reconnaissance came back without an answer — which is what
+    // reconnaissance does. The queued answer goes out next, still with no LLM
+    // round trip: 2 rounds, not a replay of the whole exploration.
+    coregeek::brain::task::on_cmd_result(
+        &mut state,
+        "[exitCode:0]\nFIELDS: city, population\n(no answer yet)",
+    );
+    assert!(matches!(state.task.stage, TaskStage::Planning));
+    assert_eq!(state.task.discovered_fields, vec!["city", "population"]);
+
+    let mut plan = Plan::default();
+    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    assert_eq!(
+        plan.execute_cmd.as_deref(),
+        Some("python3 report.py --city 北京"),
+        "stage 2 answers"
+    );
+    assert!(plan.prompt.is_none(), "still no LLM round trip");
+    assert!(
+        state.task.sop_pending_answer.is_none(),
+        "the queued answer is consumed exactly once"
+    );
+}
+
+#[test]
+fn a_pair_without_an_exploration_still_runs_in_one_command() {
+    // The single-script SOP is unchanged: a pair whose session answered with
+    // its first command has no stage 1, and the answer goes out immediately.
+    let turn = turn_from(task_world(6));
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 6;
+    state.task.timeout_round = 260;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "任务：统计城市名：上海 的人口排名".into();
+    state.task.stage = TaskStage::Planning;
+    state.sop_cache.push(sop(
+        "自进化类1",
+        &["城市名", "人口", "统计", "排名"],
+        "echo {{城市名}}",
+    ));
+
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut plan = Plan::default();
+    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    assert_eq!(plan.execute_cmd.as_deref(), Some("echo 上海"));
+    assert!(state.task.sop_pending_answer.is_none());
+}
+
+#[test]
+fn a_session_that_explored_before_answering_caches_the_pair() {
+    // The cache is built from evidence, not from a guess about which command
+    // "looks like" reconnaissance: `cmd_history` is in send order, and the
+    // command immediately before the one that answered is the exploration that
+    // made it possible.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 6;
+    state.task.timeout_round = 260;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "统计城市名：北京 的人口".into();
+    state.task.cmd_history = vec![
+        "find /tmp/selfEvolutionTask -maxdepth 4".into(),
+        "python3 report.py --city 北京".into(),
+    ];
+    state.task.best_answer = "2200".into();
+    state.task.sop_cmd = Some("python3 report.py --city 北京".into());
+    state.cache_sop();
+
+    assert_eq!(state.sop_cache.len(), 1);
+    assert_eq!(
+        state.sop_cache[0].explore.as_deref(),
+        Some("find /tmp/selfEvolutionTask -maxdepth 4")
+    );
+    assert_eq!(state.sop_cache[0].template, "python3 report.py --city 北京");
+
+    // A session that answered with its FIRST command explored nothing separate:
+    // there is no stage 1 to replay, and inventing one would be a guess.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 2;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "统计城市名：北京 的人口".into();
+    state.task.cmd_history = vec!["python3 report.py --city 北京".into()];
+    state.task.best_answer = "2200".into();
+    state.task.sop_cmd = Some("python3 report.py --city 北京".into());
+    state.cache_sop();
+    assert_eq!(state.sop_cache[0].explore, None);
+}
+
+#[test]
+fn an_unbindable_exploration_still_lets_the_answer_run() {
+    // Stage 1 is an optimisation. If its parameters cannot be resolved from the
+    // new description, the answer script alone is still the fast path — failing
+    // the whole pair would throw away a perfectly good answer script.
+    let turn = turn_from(task_world(6));
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 6;
+    state.task.timeout_round = 260;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "任务：统计城市名：北京 的人口排名".into();
+    state.task.stage = TaskStage::Planning;
+    state.sop_cache.push(sop_pair(
+        "自进化类1",
+        "统计城市名：北京 的人口排名",
+        "cat /tmp/{{不存在的参数}}/task.md",
+        "echo {{城市名}}",
+    ));
+
+    let pioneer = turn.role_by_id(10011).unwrap();
+    let mut plan = Plan::default();
+    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
+    assert_eq!(
+        plan.execute_cmd.as_deref(),
+        Some("echo 北京"),
+        "the answer script alone is used when stage 1 cannot be bound"
+    );
+}
+
+#[test]
+fn a_rejected_pair_is_still_evicted_entry_by_entry() {
+    // P1-3 keeps the existing per-entry strike eviction: the pair is charged
+    // like any other SOP, and two consecutive strikes evict exactly that entry.
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 6;
+    state.task.timeout_round = 300;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "统计城市名：北京 的人口".into();
+    state.task.stage = TaskStage::WaitingSubmit { attempts: 0 };
+    state.task.sop_used_template = Some("python3 report.py --city {{城市名}}".into());
+    state.task.cmd_history = vec!["python3 report.py --city 北京".into()];
+    state.sop_cache.push(sop_pair(
+        "自进化类1",
+        "统计城市名：北京 的人口",
+        "find /tmp/selfEvolutionTask -maxdepth 4",
+        "python3 report.py --city {{城市名}}",
+    ));
+
+    let rejected = |round_no: i64| {
+        turn_from(json!({
+            "roundNo": round_no,
+            "mapInfo": {"width": 41, "height": 32, "zones": []},
+            "teamOur": {
+                "type": "challenger", "goldNum": 0, "totalScore": 0, "playerTasks": [],
+                "roles": [{
+                    "id": 10011, "pos": {"x": 14, "y": 14}, "roleType": "pioneer",
+                    "health": 200, "attackPower": 0, "attackRange": 0,
+                    "backPackCapability": 40, "backpack": []
+                }]
+            },
+            "teamEnemy": {"roles": []},
+            "robot": {"roles": []},
+            "errors": [{"errorCode": 2, "description": "键值比对不通过: $/token: 缺少键"}],
+        }))
+    };
+
+    state.observe(&rejected(7));
+    assert_eq!(state.sop_cache.len(), 1, "one strike keeps the entry");
+    assert_eq!(state.sop_cache[0].rejections, 1);
+    assert_eq!(state.sop_cache[0].explore.is_some(), true);
+
+    state.task.stage = TaskStage::WaitingSubmit { attempts: 0 };
+    state.task.sop_used_template = Some("python3 report.py --city {{城市名}}".into());
+    state.observe(&rejected(8));
+    assert!(
+        state.sop_cache.is_empty(),
+        "a second consecutive strike evicts the pair, exploration included"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-4: the task line's income, banked where the attribution can read it.
+// ---------------------------------------------------------------------------
+
+/// `task_world` whose task point has been closed by the judger (`isValid`
+/// false), which is how a confirmed session's closure is signalled.
+fn closed_point_world(round_no: i64, gold_reward: i64) -> Value {
+    let mut world = task_world(round_no);
+    world["teamOur"]["playerTasks"] = json!([{
+        "taskType": "自进化类1",
+        "taskPosition": {"x": 14, "y": 14},
+        "coldDownRounds": 0,
+        "scoreReward": 50,
+        "goldReward": gold_reward,
+        "isValid": false,
+        "timeoutRounds": 100,
+    }]);
+    world
+}
+
+/// A session that has submitted an answer and is waiting on the closure probe.
+fn session_awaiting_closure() -> BotState {
+    let mut state = BotState::default();
+    state.task.active = true;
+    state.task.session_id = 1;
+    state.task.accepted_round = 1;
+    state.task.submitted_round = Some(1);
+    state.task.timeout_round = 500;
+    state.task.task_type = "自进化类1".into();
+    state.task.description = "统计 /tmp/selfEvolutionTask 下的文件数量".into();
+    state.task.point = Some(Pos { x: 14, y: 14 });
+    state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
+    state
+}
+
+#[test]
+fn a_confirmed_task_banks_the_points_advertised_gold() {
+    // 任务书 ch.6 pays 奖励 × 通过率 and the judger never tells us the pass
+    // rate, so the point's own `goldReward` is the upper bound of the session's
+    // income and the only figure the log can honestly carry. Without it the
+    // round record lumps task gold in with everything else, and "did the task
+    // line earn anything this match" has no answer in the log at all.
+    let mut state = session_awaiting_closure();
+    assert_eq!(state.task_gold_earned, 0);
+
+    // Closure takes three independent signals over subsequent rounds: the point
+    // closed, `phaseTask` empty twice, no errors. The first round only starts
+    // the count.
+    state.observe(&turn_from(closed_point_world(2, 120)));
+    assert!(
+        state.task.active,
+        "one quiet round is not a confirmed session"
+    );
+    assert_eq!(state.task_gold_earned, 0, "nothing is banked before it is confirmed");
+
+    state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
+    state.observe(&turn_from(closed_point_world(3, 120)));
+    assert!(!state.task.active, "the session is confirmed and retired");
+    assert_eq!(
+        state.task_gold_earned, 120,
+        "the point's advertised reward is banked"
+    );
+}
+
+#[test]
+fn only_a_confirmation_banks_gold_never_a_rejection() {
+    // A rejected answer ends the session earlier and must leave the attribution
+    // untouched: the task line earned nothing, and a report that read a
+    // rejection as income would credit every fix twice.
+    let mut state = session_awaiting_closure();
+    let mut payload = closed_point_world(2, 120);
+    payload["errors"] = json!([{"errorCode": 2, "description": "键值比对不通过: $/token: 缺少键"}]);
+    state.observe(&turn_from(payload));
+    assert_eq!(state.task_gold_earned, 0);
+}
+
+#[test]
+fn a_point_with_no_advertised_reward_banks_nothing() {
+    // Older captures and stale points carry `goldReward` 0 — banking it would
+    // write a `task_reward` record that claims an income of nothing.
+    let mut state = session_awaiting_closure();
+    state.observe(&turn_from(closed_point_world(2, 0)));
+    state.task.stage = TaskStage::WaitingSubmit { attempts: 1 };
+    state.observe(&turn_from(closed_point_world(3, 0)));
+    assert_eq!(state.task_gold_earned, 0);
 }

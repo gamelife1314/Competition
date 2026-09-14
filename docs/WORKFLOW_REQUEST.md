@@ -440,13 +440,18 @@ Debian/Ubuntu `sudo apt-get install -y python3`；装完**重开终端**再跑�
 `upgradeReachable`（够不够升级基地）是两个不同的门，如果它们轮流为真却谁也没落地，
 卡点就不在钱上，而在"没人走到工地"。
 
-示例输出（第一列是回合数，后面依次是 塔数 / mayBuild / upgradeReachable / reserve / guard）：
+示例输出（第一列是回合数，后面依次是 塔数 / mayBuild / upgradeReachable / reserve / guard / 外层缺口）：
 
 ```text
-     18 2	true	false	25	false
-     34 2	false	true	25	false
-      6 2	false	false	25	true
+     18 2	true	false	25	false	0
+     34 2	false	true	25	false	0
+      6 3	false	false	25	true	4
 ```
+
+> 末列 `外层缺口`（`secondLayer`）是 v14 的 P2-1：本回合 `wallGaps` 里有几格是**第二层**
+> （环 3）而不是那圈挡夜的主环。它只在主环闭合、三塔到位、且某个扇区真的挨过打之后才非零，
+> 每天最多 4 格。**读法**：主环还差格时这一列恒为 0（外层墙是主环闭合之后才买的），
+> 所以 0 不等于"这条线没做"，`wall_build` 事件里的 `layer` 才是它到底动没动工。
 
 **逐回合的原始行不要贴进 issue**——它是 700 行，这一节的预算只有 20 行，脚本自己会截。
 留在本地，或者我点名要哪一天时再跑（`--day` 的 `N` 自己换）：
@@ -508,7 +513,13 @@ python tools/collect_log.py <你的日志文件> --day 5      # 把 5 换成我�
 超时结束时判题器按此前提交过的最好答案结算（任务书 `timeoutRounds` 条），所以
 `reason=timeout` **不等于** 0 分。
 
-示例输出：
+> **v14 起 3b 有两个"次数"列，别只看一个。** `拒绝次数`（`rejections`）是单调的：
+> 这个 session 一共烧掉几个答案。`判错次数`（`wrongAnswers`）是**放弃计数器**——判题器
+> 说出一个此前没说过的新错因（`MissingNamedInput: city` 之后又来一个 `$/token: 缺少键`），
+> 它就归零（P1-1）。所以 `拒绝次数=4 判错次数=0` 读作"被拒四次，但每次错因都是新的，
+> 重试是对的"，**不是**"第一次提交"。只印 `判错次数` 会让这种 session 看起来没被拒过。
+
+示例输出（3a 结局直方图）：
 
 ```text
       7 timeout	true
@@ -516,12 +527,12 @@ python tools/collect_log.py <你的日志文件> --day 5      # 把 5 换成我�
       2 wrong_answers	false
 ```
 
-示例输出：
+示例输出（3b 逐 session：session 原因 成功 拒绝次数 判错次数 回合数）：
 
 ```text
-1	timeout	true	1	37
-2	timeout	true	0	22
-3	wrong_answers	false	3	58
+1	timeout	true	3	0	37
+2	timeout	true	0	0	22
+3	wrong_answers	false	5	3	58
 ```
 
 ---
@@ -546,13 +557,18 @@ python tools/collect_log.py <你的日志文件> --day 5      # 把 5 换成我�
 > 说缺 `city`）。所以 4b 的两列要**一起**看：`errors` 是码，`errorDescs` 是原话，两个数组
 > **同序**（第 i 个码对应第 i 句原话）。
 
-示例输出（回合 / session / 字符数 / 换过外形 / 被改写 / 当时已错几次）：
+示例输出（回合 / session / 字符数 / 换过外形 / 被改写 / 判错几次 / 拒绝几次 / 带回错因）：
 
 ```text
-48	1	212	false	false	0
-61	1	208	true	false	1
-77	2	96	false	false	0
+48	1	212	false	false	0	0	0
+61	1	208	true	false	1	1	1
+77	2	96	false	false	0	2	2
 ```
+
+> 末两列按 §10 请求六之三补上：`带回错因` = 这次重试的 prompt 里带了几条判题器原话。
+> 它是"判题器的原话到底有没有进 prompt"唯一能证伪的一格——`0` 意味着这一轮的反馈环
+> 是断的，那么这一格的 `判错` 就不能算在"重试策略"头上。`判错`/`拒绝` 两列的区别见 3b
+> 上面那段（前者会归零，后者单调）。
 
 示例输出：
 
@@ -1014,6 +1030,49 @@ stuck: away 里根本走不回岗位的那几个——有塔可守的回不了�
 ```text
 {"event":"prompt_sent","data":{"head":"…300 字符…","tail":"…300 字符…"}}
 ```
+
+---
+
+## 11. v14：P1/P2 落地后，表里多了什么、读法变了什么
+
+> **这一节没有新任务。** §0 那三件事、§7.3 那一条命令，一个字都没变：
+> `python tools/collect_log.py <日志文件>`，输出原样贴进 issue。
+> 这一节只是把"新出现的列怎么读"写下来——上一批的教训是**把按设计发生的事读成新 bug**，
+> 比看不见更贵。
+
+### 11.1 请求六之三已落地，而且是三件里唯一需要动日志的那件
+
+`task_answer_submit` 现在带 `rejectionFeedback`（本次重试 prompt 携带的判题器原话条数），
+表 4a 末列已印它。**这一格为 0 就说明反馈环是断的**，那么同一行的"判错"不能算在重试策略头上。
+请求六之一（`holdForRing`）与六之二（`stuck` 含无塔角色）**仍未做**，不要从本批的表里
+推断它们已经生效。
+
+### 11.2 两个计数器：`rejections` 单调，`wrongAnswers` 会归零
+
+P1-1 之后，"判错几次"这个问题有两个答案，表 3b / 4a 两列都印（详见 §7.3 表 3 上面那段
+和表 4a 的例子）。**读法一句话**：`拒绝次数` 是"烧掉了几个答案"，`判错次数` 是"离放弃还有
+多远"。`拒绝次数=4 判错次数=0` 是**好消息**（判题器每次都在教新东西），不是"没被拒过"。
+`task_ended.reason=wrong_answers` 现在特指**判题器连续重复同一句话**导致的放弃——它变少了
+才是 P1-1 生效的证据，而它变成 0 的同时 `拒绝次数` 也没涨，那是反馈环断了（先看 11.1）。
+
+### 11.3 P2 的四条线各自在日志里留了什么
+
+按"能不能从这一批的表里看出它跑没跑"列出来，都是**已经写在 stdout JSONL 里**的字段：
+
+| 哪条线 | 事件 / 字段 | 读它回答什么 |
+|---|---|---|
+| 第二层墙（P2-1） | `tower_plan.secondLayer`（表 1 末列）、`wall_build.layer` | 外层墙本轮要了几格（`layer:3`）、底下那一圈还差几格（`layer:2`）。**`tower_plan.wallGaps` 现在含外层**，只看总数会把"按设计只买 4 格外层"读成"墙没建完" |
+| 宝藏线（P2-2） | `treasure_summon`、`treasure_wait_gold`、`tower_plan.treasureReserve` | 有没有真的献祭过、是否卡在钱上（`gold` vs `reserve`）、为献祭扣住了多少金币。三条都印 0 行 = 这条线一整场没启动 |
+| 压制窗口（P2-3） | `boss_suppression` | BOSS 令是**因为**对方基地低血/炮塔扎堆才买的（而不是"有钱就买"）。它出现说明窗口判定生效 |
+| 任务收入（P2-4） | `round.taskGoldEarned`、`task_reward` | 任务线累计挣到的**金币**（任务点自己标的 `goldReward`，是上界：判题器按 奖励×通过率 结算而从不说通过率）。它和 `scoreAttr` 三个分量并列，是"任务修复有没有让任务线开始挣钱"唯一看得见的一格 |
+
+### 11.4 一句话总结这一批的表怎么变了
+
+- 表 1：末列 `外层缺口`。
+- 表 3b：`判错次数` 前面多了 `拒绝次数`。
+- 表 4a：末两列 `拒绝次数`、`带回错因`。
+- 表 2、表 4b、表 5、表 6 不变。
+- **没有新增小节**，十三个小节的形状和行数上限（§7.3 / §8）都不变。
 
 ---
 

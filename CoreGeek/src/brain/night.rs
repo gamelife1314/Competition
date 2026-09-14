@@ -3,7 +3,9 @@
 
 use std::collections::HashSet;
 
-use crate::brain::{combat, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan};
+use crate::brain::{
+    combat, economy, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan,
+};
 use crate::model::{chebyshev, footprint_distance, Turn, Unit, UnitKind};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
@@ -495,6 +497,27 @@ fn spare_night(
         if role.count_item(order) > 0 && state.summon_orders_today < 10 {
             state.consume_summon_order();
             state.harass_done_today = true;
+            // P2-3 压制窗口: the boss order is first in ORDERS, so a spare that
+            // carries one already fires it ahead of the smaller waves. What
+            // this records is WHY it was worth buying today — a wave aimed at
+            // a base that is nearly down or at towers inside one blast radius
+            // is the shot the window opened for, and the round it lands is the
+            // only place that can be confirmed from the log.
+            if order == "BossRobotSummonOrder" && economy::boss_suppression_window(turn) {
+                crate::log::event(
+                    "boss_suppression",
+                    serde_json::json!({
+                        "round": turn.round_no,
+                        "role": role.id,
+                        "enemyStationHp": turn.enemy_station().map(|station| station.health),
+                        "enemyTowers": turn
+                            .enemy
+                            .iter()
+                            .filter(|unit| unit.kind.is_tower() && unit.alive())
+                            .count(),
+                    }),
+                );
+            }
             plan.push(role.id, RoleCommand::use_item(order));
             return;
         }
