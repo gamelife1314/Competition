@@ -1319,76 +1319,70 @@ fn task_description_persists_when_phase_task_clears() {
 }
 
 #[test]
-fn economy_holds_gold_reserve_for_main_weapon_upgrade() {
+fn the_third_weapon_is_gated_by_the_purse_and_the_three_tower_cap() {
+    // P0-2 (docs/FAILURE-ANALYSIS-2026-09-14.md §2.2): the two-tower rule that
+    // held the whole purse for WeaponUpgradeVoucher1 made the third gun wait on
+    // a 100-gold purchase that a frozen income never delivered — five matches
+    // fought with two guns, and a first night that was always out-gunned. The
+    // gun is now gated by the purse and by the three-tower cap, and nothing
+    // else; the upgrade keeps its own priority through `intent_list`.
     let state = BotState::default();
-    let no_tower = turn_from(day_world_at(
-        5,
-        vec![station(10, 20, 1)],
-        25,
-        vec![],
-        vec![],
-    ));
+    let towers = |gold: i64, count: usize, level: i64| {
+        let mut roles = vec![station(10, 20, 1)];
+        if count >= 1 {
+            roles.push(gatling(10020, 10, 10, level));
+        }
+        if count >= 2 {
+            roles.push(railgun(10030, 12, 10, level));
+        }
+        if count >= 3 {
+            roles.push(rocket(10040, 10, 12, level));
+        }
+        turn_from(day_world_at(5, roles, gold, vec![], vec![]))
+    };
+
     assert!(
-        coregeek::brain::economy::may_build_weapon(&no_tower, &state),
+        coregeek::brain::economy::may_build_weapon(&towers(25, 0, 1), &state),
         "first weapon builds with 25g"
     );
-
-    let one_tower = turn_from(day_world_at(
-        5,
-        vec![station(10, 20, 1), gatling(10020, 10, 10, 1)],
-        25,
-        vec![],
-        vec![],
-    ));
     assert!(
-        coregeek::brain::economy::may_build_weapon(&one_tower, &state),
+        coregeek::brain::economy::may_build_weapon(&towers(25, 1, 1), &state),
         "second weapon builds with 25g"
     );
-
-    // Two level-1 weapons: the gold must be reserved for the main weapon's
-    // WeaponUpgradeVoucher1 instead of a third level-1 weapon.
-    let two_l1 = turn_from(day_world_at(
-        5,
-        vec![
-            station(10, 20, 1),
-            gatling(10020, 10, 10, 1),
-            railgun(10030, 12, 10, 1),
-        ],
-        25,
-        vec![],
-        vec![],
-    ));
+    // The third slot is no longer hostage to the level-2 voucher: 25 gold in
+    // hand and no level-2 gun is exactly the board the analysis was about.
     assert!(
-        !coregeek::brain::economy::may_build_weapon(&two_l1, &state),
-        "reserve held for upgrade voucher"
+        coregeek::brain::economy::may_build_weapon(&towers(25, 2, 1), &state),
+        "the third weapon is bought with 25g, not with 125"
     );
-
-    // Once the main weapon is level 2, more weapons may be built while gold
-    // still leaves the 25g reserve untouched.
-    let two_with_l2 = turn_from(day_world_at(
-        5,
-        vec![
-            station(10, 20, 1),
-            gatling(10020, 10, 10, 2),
-            railgun(10030, 12, 10, 1),
-        ],
-        50,
-        vec![],
-        vec![],
-    ));
     assert!(
-        coregeek::brain::economy::may_build_weapon(&two_with_l2, &state),
-        "level-2 main weapon unlocks more builds"
+        coregeek::brain::economy::may_build_weapon(&towers(25, 2, 2), &state),
+        "…and an already-upgraded main gun does not change that"
+    );
+    // The two doors that remain. One gold short is one gold short — the gate is
+    // the price, and a level-1 main gun does not lower it.
+    assert!(
+        !coregeek::brain::economy::may_build_weapon(&towers(24, 2, 1), &state),
+        "24 gold does not buy a 25-gold weapon"
+    );
+    // Three towers is the cap, whatever the purse says (build order and the
+    // no-overwrite rule are `tower_gaps`' and `validate`'s, unchanged).
+    assert!(
+        !coregeek::brain::economy::may_build_weapon(&towers(500, 3, 1), &state),
+        "the three-tower cap holds with any amount of gold"
     );
 }
 
 #[test]
-fn worker_keeps_gold_reserve_for_weapon_upgrade() {
+fn the_worker_lays_the_third_weapon_the_moment_the_gold_is_there() {
     // Two level-1 weapons + 25g, with a worker standing right next to the open
-    // rocket slot: the gold must be held for the main weapon's upgrade voucher,
-    // so the worker must NOT build a third level-1 weapon.
+    // rocket slot. P0-2: that 25 gold is the third gun's, not a reserve held
+    // for the 100-gold voucher — the analysis' five two-gun matches are exactly
+    // this board. Day 2 on purpose: while day 1's ring is still being built the
+    // 2nd/3rd tower waits for the ring (see `wall_first_p0.rs`:
+    // `no_second_weapon_while_the_day_one_ring_is_still_open`).
     let turn = turn_from(day_world_at(
-        5,
+        day_round(5 + coregeek::model::ROUNDS_PER_DAY),
         vec![
             station(10, 20, 1),
             gatling(10020, 5, 5, 1),
@@ -1401,9 +1395,17 @@ fn worker_keeps_gold_reserve_for_weapon_upgrade() {
     ));
     let mut state = BotState::default();
     let plan = coregeek::brain::day::plan(&turn, &mut state);
-    assert!(
-        plan.commands.values().all(|cmd| cmd.action != "build"),
-        "gold reserved for the upgrade: no third level-1 weapon"
+    let built: Vec<&str> = plan
+        .commands
+        .values()
+        .filter(|cmd| cmd.action == "build")
+        .filter_map(|cmd| cmd.name.as_deref())
+        .collect();
+    assert_eq!(
+        built,
+        vec!["rocket"],
+        "25 gold in hand and the third weapon is not being laid: {:?}",
+        plan.commands
     );
 }
 
@@ -2916,7 +2918,7 @@ fn wall_vouchers_wait_for_the_ring_and_the_weapon_path() {
 }
 
 #[test]
-fn third_tower_fallback_fires_only_when_the_upgrade_is_out_of_reach() {
+fn the_third_weapon_no_longer_waits_for_the_upgrade_voucher() {
     let two_l1 = |round_no: i64, gold: i64| {
         turn_from(day_world_at(
             round_no,
@@ -2933,42 +2935,45 @@ fn third_tower_fallback_fires_only_when_the_upgrade_is_out_of_reach() {
     };
     let state = BotState::default();
 
-    // Early in the day 25 gold still has time to become the 100-gold upgrade:
-    // hold the purse, do not spend it on a third level-1 gun.
+    // P0-2 (docs/FAILURE-ANALYSIS-2026-09-14.md §2.2). The old rule held the
+    // purse for WeaponUpgradeVoucher1 until the upgrade was *provably* out of
+    // reach, and "out of reach" was measured in `liquid_gold` — cash plus every
+    // sellable ore in a backpack. A worker that picks up iron on the way to the
+    // stone vein therefore carried ≥ 100 of it all day, so the fallback never
+    // fired and the third gun never came. Both halves of that door are gone:
+    // the gun is bought whenever the purse can pay for it, at any hour.
     let early = two_l1(day_round(5), 25);
     assert!(
-        !coregeek::brain::economy::may_build_weapon(&early, &state),
-        "the reserve still belongs to the upgrade at round 5"
+        coregeek::brain::economy::may_build_weapon(&early, &state),
+        "25 gold at round 5 is a third gun, not a reserve for a 100-gold voucher"
     );
-
-    // Past the fallback round with only 25 gold the upgrade is out of reach:
-    // the 25-gold rocket beats an empty third slot for the whole first night.
     let late = two_l1(day_round(coregeek::brain::economy::DUSK_ROUND - 15), 25);
-    assert!(
-        !coregeek::brain::economy::upgrade_reachable(&late, &state),
-        "25 gold cannot become 100 before dusk"
-    );
     assert!(
         coregeek::brain::economy::may_build_weapon(&late, &state),
         "the rocket must not be postponed indefinitely (issue #9)"
     );
 
-    // With the gold for the upgrade already banked, the upgrade path wins and
-    // the reserve rule is unchanged: buy the voucher, apply it, then the third
-    // slot unlocks. The 25-gold rocket is the fallback for an upgrade we can no
-    // longer reach — never a replacement for one we can.
+    // The upgrade keeps its OWN priority: it is the head of the shopping list
+    // and is funded before the larger purchases (`intent_list`, priority 0).
+    // What it lost is the veto over the gun.
     let funded = two_l1(day_round(coregeek::brain::economy::DUSK_ROUND - 15), 100);
     assert!(
         coregeek::brain::economy::upgrade_reachable(&funded, &state),
         "100 gold in hand keeps the upgrade path alive"
     );
+    let intent = coregeek::brain::economy::intent_list(&funded, &state, 0);
+    assert_eq!(
+        intent.first().map(|need| need.name.as_str()),
+        Some("WeaponUpgradeVoucher1"),
+        "the 100-gold upgrade is still the first thing the economy funds"
+    );
     assert!(
-        !coregeek::brain::economy::may_build_weapon(&funded, &state),
-        "the banked upgrade is spent first; the third slot waits for it"
+        coregeek::brain::economy::may_build_weapon(&funded, &state),
+        "…and it no longer blocks the third slot while it is being saved for"
     );
 
-    // The same holds when the voucher is already in a backpack and the purse is
-    // empty: the upgrade is on its way, so the rocket stays unbought.
+    // A voucher already in a backpack is the same story: the upgrade is on its
+    // way, and the gun is built alongside it rather than after it.
     let mut carried: Vec<Value> = vec![
         station(10, 20, 1),
         gatling(10020, 10, 10, 1),
@@ -2991,8 +2996,8 @@ fn third_tower_fallback_fires_only_when_the_upgrade_is_out_of_reach() {
         "a carried voucher makes the upgrade reachable without any gold"
     );
     assert!(
-        !coregeek::brain::economy::may_build_weapon(&held, &state),
-        "no rocket while the upgrade is already in a backpack"
+        coregeek::brain::economy::may_build_weapon(&held, &state),
+        "the banked upgrade no longer costs the third slot"
     );
 }
 
@@ -3180,32 +3185,42 @@ fn two_l1_with_gold(gold: i64, in_day: i64) -> Turn {
 }
 
 #[test]
-fn a_funded_voucher_does_not_block_the_third_weapon() {
+fn a_rich_purse_buys_the_third_weapon_and_the_voucher_together() {
     // Issue #15: "may_build_weapon 判定逻辑未在金币充裕时触发第3座建造" — the
-    // opponent's three guns out-shot our two for the whole first night. The
-    // old rule held the entire purse for WeaponUpgradeVoucher1 whenever the
-    // main weapon was still level 1, even when the purse covered the voucher
-    // AND the 25-gold build at once, so the rocket pad was never laid.
+    // opponent's three guns out-shot our two for the whole first night. Under
+    // P0-2 this is the easy case rather than the only one: the gun is gated by
+    // its own price, so a purse that covers the voucher too spends both.
     let state = BotState::default();
     let both = coregeek::model::WEAPON_BUILD_COST + coregeek::brain::economy::WEAPON_VOUCHER1_PRICE;
     assert!(
         coregeek::brain::economy::may_build_weapon(&two_l1_with_gold(both, 5), &state),
         "{both} gold covers the third weapon and the upgrade voucher together"
     );
-    // The reserve the two-tower rule exists to protect survives the build:
-    // 125 - 25 = 100 is exactly the voucher's price.
+    // The upgrade's own funding is untouched by the build: 125 - 25 = 100 is
+    // exactly the voucher's price, and the voucher is still head of the list.
     assert_eq!(
         both - coregeek::model::WEAPON_BUILD_COST,
         coregeek::brain::economy::WEAPON_VOUCHER1_PRICE,
-        "the gate is set so the voucher is still affordable after the build"
+        "the build leaves the voucher's price in the purse"
     );
-
-    // One gold short and the reserve wins: the upgrade is the better purchase,
-    // so the third weapon waits rather than eating into the voucher.
+    assert_eq!(
+        coregeek::brain::economy::intent_list(
+            &two_l1_with_gold(both, 5),
+            &state,
+            coregeek::model::WEAPON_BUILD_COST
+        )
+        .first()
+        .map(|need| need.name.as_str()),
+        Some("WeaponUpgradeVoucher1"),
+        "the upgrade is funded before anything else, gun or no gun"
+    );
+    // Issue #15's other half, unchanged: one gold short is one gold short.
     assert!(
-        !coregeek::brain::economy::may_build_weapon(&two_l1_with_gold(both - 1, 5), &state),
-        "{} gold cannot cover both, so the voucher keeps the reserve",
-        both - 1
+        !coregeek::brain::economy::may_build_weapon(
+            &two_l1_with_gold(coregeek::model::WEAPON_BUILD_COST - 1, 5),
+            &state
+        ),
+        "the gun still costs its own 25 gold"
     );
 }
 

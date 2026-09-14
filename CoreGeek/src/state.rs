@@ -79,6 +79,21 @@ pub struct TaskSession {
     pub phase_missing_rounds: i32,
     pub point_closed_round: Option<i64>,
     pub post_submit_error: bool,
+    /// The judger's own words about the answers it rejected, in arrival order
+    /// and deduplicated.
+    ///
+    /// Every rejection comes back as a coarse `errorCode` (2 = "答案错误，不正确
+    /// **或不完全正确**") plus one `description` that says WHICH way it was
+    /// wrong — `MissingNamedInput: city`, `键值比对不通过: $/token: 缺少键`. That
+    /// description was parsed into `Turn::error_descriptions` and written to the
+    /// log, and then dropped; `build_prompt` retried on `schema_gaps` /
+    /// `discovered_fields` instead, both of which are *guesses* at the schema
+    /// derived from a placeholder description or from the LLM's own `FIELDS:`
+    /// line. So the one authoritative piece of feedback the judger ever gives
+    /// never reached the retry, and three rejected answers were three blind
+    /// rewrites (docs/FAILURE-ANALYSIS-2026-09-14.md §3.1). This is that text,
+    /// replayed verbatim into the next prompt.
+    pub rejection_feedback: Vec<String>,
     /// Fields the task text asked for that the produced answer did not carry.
     /// Fed back into the next prompt so the retry can close the gap.
     pub schema_gaps: Vec<String>,
@@ -570,6 +585,7 @@ impl BotState {
 
             let just_submitted = matches!(self.task.stage, TaskStage::WaitingSubmit { .. });
             if just_submitted && turn.error_codes.iter().any(|code| *code == 2) {
+                self.absorb_rejection_feedback(turn);
                 self.task.post_submit_error = true;
                 self.task.wrong_answers = self.task.wrong_answers.saturating_add(1);
                 self.task.stage = TaskStage::Planning;
@@ -601,6 +617,27 @@ impl BotState {
                     crate::brain::treasure::on_llm_resp(self, &turn.llm_resp, turn.round_no);
                 }
             }
+        }
+    }
+
+    /// Keep the judger's verbatim reason for every `errorCode == 2` rejection
+    /// in the current round. `error_codes` and `error_descriptions` are
+    /// parallel and same-order (WORKFLOW_REQUEST §7.3 表 4b), so the pair is
+    /// read by index; a rejection the judger described with an empty string
+    /// teaches nothing and is skipped, which is exactly today's behaviour.
+    fn absorb_rejection_feedback(&mut self, turn: &Turn) {
+        for (index, code) in turn.error_codes.iter().enumerate() {
+            if *code != 2 {
+                continue;
+            }
+            let Some(description) = turn.error_descriptions.get(index) else {
+                continue;
+            };
+            let text = description.trim();
+            if text.is_empty() || self.task.rejection_feedback.iter().any(|old| old == text) {
+                continue;
+            }
+            self.task.rejection_feedback.push(text.to_string());
         }
     }
 

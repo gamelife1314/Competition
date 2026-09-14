@@ -520,6 +520,15 @@ pub fn tower_stand_cells(turn: &Turn, tower_pos: Pos) -> Vec<Pos> {
 /// ring has sealed us out), demolish an adjacent wall of ours to reopen the
 /// way. A role already standing on a usable cell returns None (no movement
 /// needed) rather than tearing down a wall needlessly.
+///
+/// "Reopen the way" is meant literally: a candidate wall is only torn down
+/// when its removal makes `stands` reachable. Tearing one down otherwise spends
+/// a cell of the day's ring — and therefore a hole the night can be entered
+/// through — on a role that still cannot get home afterwards. A ring whose
+/// inner band is occupied by towers and teammates has walls like that: the two
+/// cells beside the door lead into a gun and into the operator standing on it,
+/// so demolishing them opens nothing, while the ring ends the day two cells
+/// short and the gate seal waits on a role that was never let in.
 pub fn walk_or_remove_wall(
     turn: &Turn,
     role: &Unit,
@@ -532,10 +541,16 @@ pub fn walk_or_remove_wall(
     if let Some(cmd) = walk_toward(turn, role, stands, claimed) {
         return Some(cmd);
     }
+    let blocked = turn.blocked_for(role.id);
     turn.walls()
         .into_iter()
         .map(|wall| wall.pos)
         .filter(|pos| chebyshev(role.pos, *pos) == 1)
+        .filter(|pos| {
+            let mut opened = blocked.clone();
+            opened.remove(pos);
+            crate::path::step_toward_stands(turn, role.pos, stands, &opened).is_some()
+        })
         .min_by_key(|pos| {
             stands
                 .iter()

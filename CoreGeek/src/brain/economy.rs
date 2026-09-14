@@ -33,9 +33,6 @@ pub const STONE_BUFFER: i64 = 2;
 /// ore is converted to gold so the night is spent upgrading, not digging.
 pub const DUSK_ROUND: i64 = 55;
 
-/// Gold kept out of new weapon builds so the main weapon's level-2 upgrade
-/// (WeaponUpgradeVoucher1) is never starved by a third level-1 weapon.
-pub const WEAPON_UPGRADE_RESERVE: i64 = 25;
 /// Shop price of WeaponUpgradeVoucher1 — the funding goal of the main weapon.
 pub const WEAPON_VOUCHER1_PRICE: i64 = 100;
 
@@ -48,16 +45,17 @@ pub const READINESS_LEAD: i64 = 25;
 /// Rounds before dusk at which a night consumable may dip into the tower build
 /// reserve — a night with no Medicine is where controllers die.
 const READINESS_URGENT: i64 = 10;
-/// Rounds before dusk at which an unreachable weapon upgrade stops blocking the
-/// third tower (issue #9: the rocket never arrived on the first night).
+/// Rounds before dusk at which the third tower's fund comes under guard
+/// (issue #9: the rocket never arrived on the first night). With the ordering
+/// rule gone (P0-2) the guard is purely financial — it holds the 25 gold the
+/// third gun costs, so small purchases cannot spend the purse below it.
 pub const FALLBACK_LEAD: i64 = 20;
 
-/// Rounds before the fallback window opens at which the build reserve starts
-/// guarding the 25 gold the third tower costs (P0-4). The fallback itself
-/// fires at `DUSK_ROUND - FALLBACK_LEAD`; the guard exists so the gold is
-/// still there when it does — consumables and wall vouchers used to be able
-/// to spend the purse below 25 in the very rounds the window was about to
-/// open, which is how the rocket pad never got laid (issues #22/#23:
+/// Rounds before `DUSK_ROUND - FALLBACK_LEAD` at which the build reserve starts
+/// guarding the 25 gold the third tower costs (P0-4). The guard exists so the
+/// gold is still there when the window opens — consumables and wall vouchers
+/// used to be able to spend the purse below 25 in the very rounds it was about
+/// to open, which is how the rocket pad never got laid (issues #22/#23:
 /// "第 3 塔从未建造", `tower_plan mayBuild=false` 全天).
 pub const GUARD_LEAD: i64 = 6;
 
@@ -507,8 +505,8 @@ pub fn budget(turn: &Turn, state: &BotState, reserve: i64) -> Budget {
 /// `sell_command` refuses to sell it while the ring still wants it, so pricing
 /// it as cash read spending power out of a backpack the shop will not honour.
 /// Issue #22 paid for that twice in one match. The ring's stone read as "the
-/// 100-gold upgrade is still reachable", so `third_tower_fallback` never fired
-/// and the match was fought with two guns for the fourth battle running; and
+/// 100-gold upgrade is still reachable", which held the third tower back and
+/// the match was fought with two guns for the fourth battle running; and
 /// `buyer_must_preposition` marched the only economic worker to the shop on
 /// stone it could not sell, where it camped while the purse froze at 5 gold and
 /// the whole match produced exactly one sale. Only `gold` and the ore the
@@ -634,41 +632,29 @@ fn funding_next_weapon(turn: &Turn, role: &Unit) -> bool {
     turn.towers().len() < 3 && turn.gold < WEAPON_BUILD_COST && total_ores(role) > 0
 }
 
-/// Whether we may spend 25g building another weapon this round. Build 1-2
-/// weapons first (a gold reserve must survive), then stop until the main
-/// weapon reaches level 2 — a level-2 weapon out-values a third level-1
-/// weapon, and the gold is better spent on WeaponUpgradeVoucher1.
-pub fn may_build_weapon(turn: &Turn, state: &BotState) -> bool {
-    let towers = turn.towers();
-    if towers.len() < 2 {
-        return turn.gold >= WEAPON_BUILD_COST;
-    }
-    if towers.iter().any(|tower| tower.level >= 2) {
-        return turn.gold >= WEAPON_BUILD_COST + WEAPON_UPGRADE_RESERVE;
-    }
-    // Gold plentiful: the third slot no longer competes with the level-2
-    // voucher, it is funded ALONGSIDE it. The gate is the voucher's full price
-    // on top of the build, so the reserve the two-tower rule exists to protect
-    // is still intact after the 25 gold is spent — the third gun costs the day
-    // nothing it was saving for. Issue #15: "may_build_weapon 判定逻辑未在金币
-    // 充裕时触发第3座建造", and the opponent's three guns out-shot our two for
-    // the whole first night.
-    if turn.gold >= WEAPON_BUILD_COST + WEAPON_VOUCHER1_PRICE {
-        return true;
-    }
-    // Two level-1 towers with neither upgraded: the gold is normally held for
-    // the level-2 step. But when that step is clearly out of reach before dusk
-    // (issue #9: the rocket never arrived and the first night had two guns),
-    // buy the 25-gold rocket instead of hard-waiting for a 100-gold voucher.
-    third_tower_fallback(turn, state)
-}
-
-/// The weapon upgrade is unreachable in time, so a third level-1 weapon beats
-/// an empty gold hoard. Only fires once the upgrade deadline is in sight.
-fn third_tower_fallback(turn: &Turn, state: &BotState) -> bool {
-    turn.gold >= WEAPON_BUILD_COST
-        && turn.in_day_round >= DUSK_ROUND - FALLBACK_LEAD
-        && !upgrade_reachable(turn, state)
+/// Whether we may spend 25g building another weapon this round.
+///
+/// One door, and it is the purse: three towers is the cap, 25 gold is the
+/// price. The two-tower rule that used to stand in front of it — hold the whole
+/// purse for WeaponUpgradeVoucher1 until the main gun reaches level 2, and let
+/// the third tower through only once the upgrade was provably out of reach —
+/// was the ordering bug behind five straight matches fought with two guns
+/// (docs/FAILURE-ANALYSIS-2026-09-14.md §2.2):
+///
+/// * the upgrade costs 100 gold and income froze at 5–25, so the door it was
+///   guarding never opened either;
+/// * "out of reach" was measured in `liquid_gold` — cash plus every sellable
+///   ore in a backpack — and a worker that picks up iron on the way to the
+///   stone vein always carried ≥100 of it, so `upgrade_reachable` was true all
+///   day and the fallback never fired. The tower was held hostage to a purchase
+///   that could not happen.
+///
+/// The upgrade keeps its own priority and always did: `intent_list` lists
+/// WeaponUpgradeVoucher1 at priority 0 and `tower_build_reserve` still reserves
+/// the 1-2 tower fund, so the voucher is bought the moment the collect→sell→buy
+/// loop can pay for it. What it no longer gets is a veto over the third gun.
+pub fn may_build_weapon(turn: &Turn, _state: &BotState) -> bool {
+    turn.towers().len() < 3 && turn.gold >= WEAPON_BUILD_COST
 }
 
 /// Can the team still put 100 gold together before dusk? A carried voucher
@@ -678,12 +664,10 @@ pub fn upgrade_reachable(turn: &Turn, _state: &BotState) -> bool {
 }
 
 /// Should the 25-gold third-tower fund be guarded from the shopping list?
-/// True once the fallback window is near AND the level-2 upgrade is out of
-/// reach — exactly the condition `third_tower_fallback` re-tests when the
-/// window opens, so the gold the fallback needs is still in the purse by
-/// then. While the upgrade is still reachable the guard stays off and the
-/// "两塔先升级" priority is untouched (the issue #13 lesson); an existing
-/// third tower or an already-upgraded gun leaves nothing to guard.
+/// True once the build window is near AND the level-2 upgrade is out of reach
+/// — an upgrade the team can still pay for is the better purchase and may
+/// spend the purse (the issue #13 lesson); a third tower or an already-upgraded
+/// gun leaves nothing to guard.
 pub fn third_tower_guard(turn: &Turn, state: &BotState) -> bool {
     let towers = turn.towers();
     if towers.len() != 2 || towers.iter().any(|tower| tower.level >= 2) {
@@ -818,6 +802,23 @@ pub fn sell_command(
             continue;
         }
         if ore == STONE && team_ores(turn, STONE) <= stone_demand + STONE_BUFFER {
+            continue;
+        }
+        // Stone is sold down to the ring's own reserve, never through it. The
+        // test above decides WHETHER stone is sellable at all; this decides HOW
+        // MUCH, and the whole stack used to leave with the vendor — including
+        // the cells the day still owes the ring. It matters most on the day
+        // whose only stone demand IS a gap: day 2 mines stone because the door
+        // counts in `stone_demand`, the dusk cash-out then sells every stone in
+        // the pack, and the door cut that morning is still open at nightfall
+        // because no carrier has one left to close it with (`sellable_ores`
+        // already counts the surplus this way; the sale now agrees with it).
+        let count = if ore == STONE {
+            count.min((team_ores(turn, STONE) - stone_demand - STONE_BUFFER).max(0))
+        } else {
+            count
+        };
+        if count <= 0 {
             continue;
         }
         let base = state.base_prices.get(ore).copied().unwrap_or(1).max(1);

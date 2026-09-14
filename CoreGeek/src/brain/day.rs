@@ -5,7 +5,8 @@
 use std::collections::HashSet;
 
 use crate::brain::{
-    economy, night, stand_cells, task, tower_stand_cells, treasure, walk_toward, Plan,
+    economy, night, stand_cells, task, tower_stand_cells, treasure, walk_or_remove_wall,
+    walk_toward, Plan,
 };
 use crate::model::{
     chebyshev, footprint_distance, station_footprint, Turn, Unit, STONE, WEAPON_BUILD_COST,
@@ -409,7 +410,12 @@ fn fallback_toward_station(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
     if stands.is_empty() {
         return None;
     }
-    walk_toward(turn, role, &stands, &mut HashSet::new())
+    // Demolish our own wall if that is the only way home — the same escape
+    // hatch the night recall keeps (P0-3). A role sealed out holds still
+    // forever otherwise: `walk_toward` finds no route, this returns nothing,
+    // and since it is `away` from home the dusk seal never fires either, so the
+    // ring stays open all night with the role on the wrong side of it.
+    walk_or_remove_wall(turn, role, &stands, &mut HashSet::new())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -679,10 +685,26 @@ fn worker_day(
         }
     }
     // 6. Build weapons (gold) once the wall line is underway — but keep a
-    //    gold reserve so the main weapon's level-2 upgrade is never starved,
-    //    unless that upgrade is out of reach before dusk (see
-    //    economy::may_build_weapon).
-    if economy::may_build_weapon(turn, state) {
+    //    gold reserve so the main weapon's level-2 upgrade is never starved
+    //    (see economy::may_build_weapon).
+    //
+    //    P0-4 墙环在建时不折返建塔：第 1 天墙线还有缺口（= `shared_wall_duty`）
+    //    且首塔已经立起来时，跳过第 2/3 塔，等环成型再建。首塔 gatling 豁免
+    //    ——环需要石头，石头需要采矿，而采矿需要一个能守住矿点的开局。
+    //
+    //    没有这道闸，P0-2 的 `may_build_weapon` 会在 R3（墙环一砖未砌时）就
+    //    把第 3 座塔放上去，当天的走路预算随即在"塔位 ↔ 石矿 ↔ 墙线"之间翻
+    //    倍，`day1_sim` 的墙优先用例整组转红（实测：3 塔 0 墙）。有闸之后第
+    //    2/3 塔等环成型——分析 §4 要的正是这条顺序。
+    //
+    //    闸门看的是"塔已经存在"这个回合快照事实，不是"这个回合谁打算建塔"。
+    //    把队友本回合的建塔意向也算进来会更严格，实测会把"石头不可达"那种
+    //    整天砌不出墙的地图变成整天只有一门炮（`day1_sim` 的
+    //    stone_out_of_reach 板：远矿行军 + 收入冻结，issue #17 原样复发），
+    //    因此按分析 §4 的原文只认已存在的塔；该图第 2/3 塔顺延到 D2，是分析
+    //    已经接受的权衡。
+    let ring_still_forming = turn.day == 1 && shared_wall_duty && !turn.towers().is_empty();
+    if economy::may_build_weapon(turn, state) && !ring_still_forming {
         for (site, kind) in tower_gaps {
             if claimed.contains(site) {
                 continue;
@@ -1314,7 +1336,11 @@ fn build_or_walk(
 
 /// Walk a role back inside the ring, onto a cell at footprint distance <= 1
 /// from the station. Returns `None` when it is already inside or when nothing
-/// inside is reachable, so a genuinely boxed-in role holds rather than paces.
+/// inside is reachable at all, so a genuinely boxed-in role holds rather than
+/// paces. "Reachable" now includes demolishing one of our own walls on the way
+/// in (`walk_or_remove_wall`, P0-3): the ring was built to keep robots out, and
+/// a role the crew accidentally sealed on the wrong side of it is a hole in the
+/// gate seal for the whole night, which costs more than one wall cell.
 fn retreat_inside(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>) -> Option<RoleCommand> {
     let station = turn.station()?;
     let footprint = station_footprint(station.pos);
@@ -1325,7 +1351,7 @@ fn retreat_inside(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>) -> Optio
     if stands.is_empty() {
         return None;
     }
-    walk_toward(turn, role, &stands, claimed)
+    walk_or_remove_wall(turn, role, &stands, claimed)
 }
 
 /// Is there a walkable route from `start` to any of `stands`? A role already
@@ -1348,15 +1374,35 @@ fn night_goal(turn: &Turn, pairs: &[(i64, i64)], role_id: i64) -> Option<Vec<Pos
     Some(tower_stand_cells(turn, tower.pos))
 }
 
-/// Every controllable role must still be able to reach its night weapon. If
-/// any can't, wall building must stop — the gate stays open until everyone is
-/// inside, so we never seal a role outside the ring.
+/// Where a role has to be able to get before the ring closes around it: the
+/// operating cells of the tower it mans tonight, or — for a role with no gun to
+/// man — the inside of the ring itself.
+///
+/// The second case is the whole of issue #15's "idle role walled out". With
+/// two towers and three roles, the odd role out has no `night_goal` at all, so
+/// both safety checks used to `continue` past it: it could be mining outside,
+/// the crew could close the last ring cell behind it, and its home — the inner
+/// band `update_wall_gate` measures "everyone is inside" against — became
+/// unreachable. The gate then never sealed (`wall_gate_open` for all fifteen
+/// rounds of the dusk window, 5c naming the role), and the base spent the night
+/// behind an open wall. An idle role's home is as load-bearing as a
+/// controller's gun, so it is checked the same way.
+fn night_home(turn: &Turn, pairs: &[(i64, i64)], role_id: i64) -> Vec<Pos> {
+    night_goal(turn, pairs, role_id).unwrap_or_else(|| crate::brain::interior_cells(turn))
+}
+
+/// Every controllable role must still be able to reach its night post — its
+/// gun, or the inside of the ring when it has no gun. If any can't, wall
+/// building must stop: the gate stays open until everyone is inside, so we
+/// never seal a role outside the ring.
 fn roles_can_reach(turn: &Turn, pairs: &[(i64, i64)]) -> bool {
     for role in turn.controllable() {
-        if let Some(stands) = night_goal(turn, pairs, role.id) {
-            if !can_reach(turn, role.pos, &stands) {
-                return false;
-            }
+        let home = night_home(turn, pairs, role.id);
+        if home.is_empty() {
+            continue; // nowhere to be: not a verdict this check can make
+        }
+        if !can_reach(turn, role.pos, &home) {
+            return false;
         }
     }
     true
@@ -1372,20 +1418,24 @@ fn wall_would_trap(turn: &Turn, pairs: &[(i64, i64)], state: &BotState, site: Po
     let mut blocked = turn.blocked_for(-1);
     blocked.insert(site);
     for role in turn.controllable() {
-        let Some(stands) = night_goal(turn, pairs, role.id) else {
+        // A role with no gun to man is measured against the inside of the ring
+        // (see `night_home`): "no tower" is not "no home", and the hole this
+        // wall would cut is in ITS way home, not only in a controller's.
+        let home = night_home(turn, pairs, role.id);
+        if home.is_empty() {
             continue;
-        };
-        if stands.iter().any(|stand| *stand == role.pos) {
-            continue; // already at the weapon: nothing to trap
         }
-        // A role that cannot reach its weapon even WITHOUT this wall is not
+        if home.iter().any(|stand| *stand == role.pos) {
+            continue; // already at the weapon / already home: nothing to trap
+        }
+        // A role that cannot reach its post even WITHOUT this wall is not
         // what the wall would trap. Counting it anyway vetoes every remaining
         // ring cell at once — the gate included — which is how day 1 ended at
         // 19/20 with the last stone sitting in a backpack (issues #12/#13/#14).
-        if !crate::brain::can_reach_any(turn, role, &stands) {
+        if !crate::brain::can_reach_any(turn, role, &home) {
             continue;
         }
-        if crate::path::step_toward_stands(turn, role.pos, &stands, &blocked).is_none() {
+        if crate::path::step_toward_stands(turn, role.pos, &home, &blocked).is_none() {
             return true;
         }
     }
@@ -2093,6 +2143,115 @@ mod tests {
 
     fn pos(x: i32, y: i32) -> Pos {
         Pos { x, y }
+    }
+
+    fn unit(id: i64, kind: &str, at: Pos) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "pos": {"x": at.x, "y": at.y}, "roleType": kind,
+            "health": 1000, "level": 1, "backPackCapability": 100, "backpack": []
+        })
+    }
+
+    fn board(roles: Vec<serde_json::Value>) -> Turn {
+        let payload = serde_json::json!({
+            "roundNo": 5,
+            "mapInfo": {"width": 41, "height": 32, "zones": []},
+            "teamOur": {
+                "type": "challenger", "goldNum": 0, "totalScore": 0,
+                "playerTasks": [], "roles": roles
+            },
+            "teamEnemy": {"roles": []},
+            "robot": {"roles": []},
+        });
+        let req: crate::protocol::Request =
+            serde_json::from_value(payload).expect("payload parses");
+        Turn::from_request(req)
+    }
+
+    /// One worker in a pocket of our own walls whose only opening is `(21,20)`,
+    /// plus the station. Nothing pairs it to a gun: this is the "idle role" of
+    /// P0-3, the third role on a two-tower board. `seal` closes the opening.
+    fn pocketed_idle_role(seal: bool) -> Turn {
+        let mut roles = vec![unit(10001, "station", pos(10, 24))];
+        let mut cells = vec![
+            pos(19, 19),
+            pos(19, 20),
+            pos(19, 21),
+            pos(20, 19),
+            pos(20, 21),
+            pos(21, 19),
+            pos(21, 21),
+        ];
+        if seal {
+            cells.push(pos(21, 20));
+        }
+        for (index, at) in cells.iter().enumerate() {
+            roles.push(unit(20000 + index as i64, "wall", *at));
+        }
+        roles.push(unit(10002, "worker", pos(20, 20)));
+        board(roles)
+    }
+
+    /// P0-3: a role with no gun to man still has a home — the inside of the
+    /// ring — and a wall that would cut it off from that home is a wall the
+    /// crew may not build. Both safety checks used to `continue` past such a
+    /// role, which is how an idle worker ended a day sealed outside the ring
+    /// with the gate open behind it (docs/FAILURE-ANALYSIS-2026-09-14.md §3.3).
+    #[test]
+    fn a_wall_that_seals_an_idle_role_out_is_refused() {
+        let turn = pocketed_idle_role(false);
+        let state = BotState::default();
+        let idle = turn.role_by_id(10002).expect("the idle role exists");
+        assert!(
+            night_goal(&turn, &[], idle.id).is_none(),
+            "test setup: this role mans no gun tonight"
+        );
+        // The pocket has exactly one opening and the role is not standing on
+        // its home band, so today it can still get home — which is what makes
+        // the wall on that opening the crew's doing and not the role's problem.
+        assert!(
+            crate::brain::can_reach_any(&turn, idle, &crate::brain::interior_cells(&turn)),
+            "test setup: the role must be able to reach home BEFORE the wall"
+        );
+        assert!(
+            roles_can_reach(&turn, &[]),
+            "test setup: nobody is cut off yet, so the wall step is running"
+        );
+        assert!(
+            wall_would_trap(&turn, &[], &state, pos(21, 20)),
+            "the one cell that lets the idle role home was about to be walled over"
+        );
+    }
+
+    /// …and once that cell IS wall — by the crew, by a robot, or by the crew's
+    /// own earlier mistake — the whole wall step stands down instead of
+    /// building somewhere else with a role sealed out of its own base.
+    #[test]
+    fn an_idle_role_already_sealed_out_stops_the_wall_line() {
+        let sealed = pocketed_idle_role(true);
+        assert!(
+            !roles_can_reach(&sealed, &[]),
+            "wall building went ahead with a role sealed out of its own base"
+        );
+    }
+
+    /// The same predicate on a board where nobody is cut off: an idle role
+    /// standing inside is not a veto, and neither is a wall far from it.
+    #[test]
+    fn a_wall_nobody_is_cut_off_by_is_allowed() {
+        let turn = board(vec![
+            unit(10001, "station", pos(10, 24)),
+            unit(10002, "worker", pos(12, 24)),
+        ]);
+        let state = BotState::default();
+        assert!(
+            roles_can_reach(&turn, &[]),
+            "an idle role standing inside the base is not a veto"
+        );
+        assert!(
+            !wall_would_trap(&turn, &[], &state, pos(20, 20)),
+            "a wall in the open, far from every role's way home, traps nobody"
+        );
     }
 
     #[test]

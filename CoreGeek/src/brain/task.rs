@@ -395,6 +395,24 @@ pub fn build_prompt(state: &BotState, _turn: &Turn) -> String {
             state.task.schema_extras.join("、")
         ));
     }
+    // The judger's own rejection text, verbatim and last (P0-1). Everything
+    // above this point is inference — `discovered_fields` is what the sandbox
+    // echoed, `schema_gaps`/`schema_extras` are a diff against a field list
+    // guessed from the task text. This is the only line the judging authority
+    // wrote itself ("缺少键 $/token"), and it is the one the successful opponent
+    // path in issue #10 retried against. Ordered oldest-first so the newest
+    // verdict is the last thing read before the answer is rewritten.
+    if !state.task.rejection_feedback.is_empty() {
+        prompt.push_str("\n判题器对你已提交答案的原话反馈（按时间先后）：\n");
+        for feedback in &state.task.rejection_feedback {
+            prompt.push_str("- ");
+            prompt.push_str(&truncate(feedback, 300));
+            prompt.push('\n');
+        }
+        prompt.push_str(
+            "请严格按判题器原话修正：它点名缺哪个键就补哪个键（键名逐字照抄），说哪个键的值不符就只重算那一个值。判题器没有提到的字段一律保持原样，不要顺手增删。\n",
+        );
+    }
     prompt
 }
 

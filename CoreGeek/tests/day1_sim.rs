@@ -734,10 +734,22 @@ fn the_economy_earns_once_the_ring_is_up() {
         actions.contains("collect"),
         "day 2 never mined anything; saw {actions:?}"
     );
+    // "The economy earns" is measured as the purse MOVING, not as a closing
+    // balance above where the day started. Since P0-2 the third tower goes up
+    // the moment 25 gold is in hand — on day 2 that is the opening purse — so a
+    // day of entirely healthy mining and selling still ends below its opening
+    // balance (measured: 25 → 16 across the day, 69 rounds in which the purse
+    // was doing something). The freeze this test exists for looks like the
+    // opposite: issue #14's track never changed at all.
+    let moved = world
+        .gold_track
+        .iter()
+        .filter(|(_, gold)| *gold != day_one_gold)
+        .count();
     assert!(
-        world.gold > day_one_gold,
-        "gold went {day_one_gold} -> {} across a full day of mining and selling",
-        world.gold
+        moved >= 5,
+        "gold sat at {day_one_gold} for all but {moved} of day 2's rounds — the \
+         issue #14 freeze is back"
     );
 }
 
