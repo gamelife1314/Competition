@@ -553,7 +553,12 @@ fn fallback_toward_station(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
     // forever otherwise: `walk_toward` finds no route, this returns nothing,
     // and since it is `away` from home the dusk seal never fires either, so the
     // ring stays open all night with the role on the wrong side of it.
-    walk_or_remove_wall(turn, role, &stands, &mut HashSet::new())
+    //
+    // The ladder rather than `walk_or_remove_wall` alone, because a role the
+    // backstop reaches has already been declined by every step above it, and
+    // the demolition hatch still refuses when no SINGLE cut reopens the route
+    // (issues #176-#185: 20011 on (24,16) for twelve straight dusk rounds).
+    walk_home_or_reroute(turn, role, &stands, &mut HashSet::new())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2057,7 +2062,66 @@ fn retreat_inside(turn: &Turn, state: &BotState, role: &Unit, claimed: &mut Hash
         return None;
     }
     let stands = gate_clear_stands(turn, state, stands);
-    walk_or_remove_wall(turn, role, &stands, claimed)
+    walk_home_or_reroute(turn, role, &stands, claimed)
+}
+
+/// Walk a role home under a dusk deadline: the second rung of the night
+/// recall's ladder, which the day side never got (issues #176-#185).
+///
+/// [`walk_or_remove_wall`] has a deliberate HOLD branch: when `walk_toward`
+/// finds nothing but a route exists once this round's claims are ignored, it
+/// issues NO command, on the reasoning that a claim is an intent and the
+/// claimer moves on. That reasoning holds mid-day and fails at a deadline,
+/// because at a deadline the claimer does not move on — it is walking home too
+/// and stops on the cell it claimed. Two roles whose only route crosses each
+/// other's claimed cell then freeze each other, and neither issues a command
+/// again.
+///
+/// The measurement is exactly that, and the log says so in its own column. A
+/// role frozen on one cell for eleven or twelve straight dusk rounds is listed
+/// by `wall_gate_open` with an EMPTY `stuck` list, and `stuck` is populated by
+/// `can_reach_any` — which is `step_toward_stands` over `blocked_for(-1)`, the
+/// pathfinder with every claim dropped. An empty `stuck` therefore *is* the
+/// hold branch's guard: the route home exists, the role is not walled off, it
+/// simply never takes a step. In 179 the dusk window names 20012 on (28,10)
+/// for eleven rounds; 178 does it twice over, 20011 on (24,16) for twelve and
+/// 20012 for eleven, and `wall_gate_forced` then seals the ring with BOTH of
+/// them outside — that match also carries the batch's worst `tower_unpaired`
+/// (78), the guns of the two roles the ring closed on. 176 and 182 are the same
+/// shape, and eight of the ten reports leave the gate open for 5-12 of the
+/// fifteen dusk rounds.
+///
+/// So under a deadline the hold is not a trade, it is the loss: survival is
+/// `10xday` for every day the station stands (任务书 ch.6, 550 over ten) and the
+/// ring is what the station stands behind.
+///
+/// This is the SAME rung `night.rs` already runs for its recall — try the
+/// claims, then try ignoring them — for the same defect ("126's 20040 for 11
+/// rounds at (27,13), 129's 20020 for 14 at (32,10). Both guns were silent for
+/// the whole night"). The night side got it in #126-#130 and the day side did
+/// not. `break_out` is deliberately NOT part of this: its other half cuts a
+/// wall, and by day a wall is the asset being defended rather than the
+/// obstacle — a role that is genuinely walled off keeps
+/// `walk_or_remove_wall`'s demolition hatch, which only ever cuts a cell whose
+/// removal reopens the route.
+///
+/// `claimed` is filled on the first rung and left alone afterwards, so a role
+/// that takes the ignoring-claims rung does not reserve the cell against a
+/// teammate's legal move.
+pub fn walk_home_or_reroute(
+    turn: &Turn,
+    role: &Unit,
+    stands: &[Pos],
+    claimed: &mut HashSet<Pos>,
+) -> Option<RoleCommand> {
+    if let Some(cmd) = walk_or_remove_wall(turn, role, stands, claimed) {
+        return Some(cmd);
+    }
+    // The round's reservations dropped. With no claims in the set, `walk_toward`
+    // and the claim-free pathfinder agree, so a role the hold branch would have
+    // parked instead takes the step it can already legally take.
+    let mut ignored = HashSet::new();
+    walk_or_remove_wall(turn, role, stands, &mut ignored)
 }
 
 /// Is there a walkable route from `start` to any of `stands`? A role already

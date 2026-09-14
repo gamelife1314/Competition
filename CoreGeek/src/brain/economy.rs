@@ -532,15 +532,50 @@ pub fn boss_suppression_window(turn: &Turn) -> bool {
 /// (Improve.kimi.md §7, P1-1 row). `drive` is taken explicitly so tests can
 /// exercise both branches without touching the process-wide dial.
 pub fn clear_gap_order_with(drive: bool, turn: &Turn, needs: &mut Vec<Need>) {
-    if !drive || crate::brain::combat::firepower_gap(turn) <= 0 {
+    if !drive {
         return;
     }
-    for need in needs.iter_mut() {
-        if matches!(
-            need.name.as_str(),
-            "StationUpgradeVoucher1" | "StationUpgradeVoucher2"
-        ) {
-            need.priority = 5;
+    let gap = crate::brain::combat::firepower_gap(turn);
+    if gap <= 0 {
+        return;
+    }
+    // AN ACTIONABLE GAP, NOT A BACKGROUND ONE (issues #176-#185).
+    //
+    // `firepower_gap > 0` is the state of the game, not a finding: the wave
+    // estimate starts at 3150 and our three level-1 towers put out 1600, so the
+    // gap is positive from the first round of the first day and only widens.
+    // Gating the STATION DEMOTION on it alone therefore demotes the station
+    // voucher in every round of every match — which is what the ten reports
+    // show. All ten log `coach_move {switch: gap_funding, to: on, why:
+    // station_breached}` the first night our station takes a hit, and
+    // `policy.gapFunding` is true from then on; from that round the station
+    // voucher sits at priority 5 against the weapon voucher's 0, and
+    // `shopping_list` gives the whole purse to the gun. 表 2a across the ten:
+    // one `WeaponUpgradeVoucher1` bought (185, round 145, 121 gold — the exact
+    // purchase §19.4's acceptance criterion says should have been the base), and
+    // not one `StationUpgradeVoucher1`; 表 8's 我方基地等级 is 1 in all ten and
+    // the base falls in all ten.
+    //
+    // A gap one voucher can close is a firepower problem and the demotion is
+    // right. A gap one voucher cannot close is neither fixed nor worsened by
+    // that voucher, and the station — the loss condition itself (任务书 ch.7),
+    // the only asset with no repair item, and `score_3` — is the better 100
+    // gold. This does not disable the reorder: on a board one upgrade from
+    // covering the wave the demotion still fires and the guns still come first.
+    //
+    // The harassment suppression below keeps the plain `gap > 0` trigger: "do
+    // not spend 200-500 gold on summons while the wave out-HPs the guns" is a
+    // statement about the wave, not about what one voucher buys, and leaving it
+    // where it was keeps this change to the single decision the evidence
+    // overturns.
+    if gap <= crate::brain::combat::best_weapon_step_gain(turn) {
+        for need in needs.iter_mut() {
+            if matches!(
+                need.name.as_str(),
+                "StationUpgradeVoucher1" | "StationUpgradeVoucher2"
+            ) {
+                need.priority = 5;
+            }
         }
     }
     needs.retain(|need| need.name != "BossRobotSummonOrder");

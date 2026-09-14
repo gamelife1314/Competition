@@ -819,5 +819,31 @@ fn shelter(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan
         plan.push(role.id, cmd);
         return true;
     }
+    // A SPARE ROLE THE RING CLOSED ON HAS NO WAY BACK IN (issues #176-#185).
+    //
+    // This walk was plain `walk_toward`, and it is the last resort of a role
+    // that holds no tower. The paired controller has a three-rung ladder for
+    // exactly this (the recall above: claims, then no claims, then `break_out`),
+    // but a spare has nothing — `night_goal` returns None for it, so it is not
+    // in `pairs`, so it never reaches that block. `gate_open_record` is just as
+    // strict about it: a spare counts as home only by standing within one cell
+    // of the station footprint, with no `interior_cells` substitute.
+    //
+    // 178 day 2 is the case: `wall_gate_forced` seals the ring with 20011 on
+    // (24,16) and 20012 on (28,6), both outside, and that match carries the
+    // batch's worst `tower_unpaired` count (78) — two of three guns lost on the
+    // night the base started dying. Being behind the ring is the whole of a
+    // spare's night duty (任务书: the three valid night duties are operate,
+    // heal, retreat), so a spare that cannot walk in must cut its way in, the
+    // same as the controller next to it.
+    let mut ignored = HashSet::new();
+    if let Some(cmd) = walk_or_remove_wall(turn, role, &stands, &mut ignored) {
+        plan.push(role.id, cmd);
+        return true;
+    }
+    if let Some(cmd) = break_out(turn, role, &stands, &mut ignored) {
+        plan.push(role.id, cmd);
+        return true;
+    }
     false
 }

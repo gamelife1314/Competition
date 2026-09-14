@@ -774,3 +774,87 @@ fn two_equidistant_doors_are_closed_in_coordinate_order() {
         "two equidistant doors must be closed in coordinate order, smallest first"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The dusk hold (issues #176-#185)
+// ---------------------------------------------------------------------------
+
+/// A corridor to the station with exactly one gap in it: walls down the whole
+/// height of the map at x=16 except (16,24), and a worker out at (20,24). The
+/// only route from the worker to the station's inner band runs through (16,24),
+/// which makes one reserved cell enough to close the day's only way home.
+fn corridor_board() -> Value {
+    let mut ours = vec![station(), role(10002, "worker", 20, 24)];
+    let mut index = 0;
+    for y in 0..HEIGHT {
+        if y == 24 {
+            continue;
+        }
+        ours.push(wall(20000 + index, 16, y));
+        index += 1;
+    }
+    world(60, ours, Vec::new())
+}
+
+/// The dusk return must never answer "hold" (issues #176-#185).
+///
+/// `walk_or_remove_wall` holds — issues NO command — when `walk_toward` finds
+/// nothing but a route exists once this round's claims are ignored. That is a
+/// sound mid-day trade and a fatal one at a deadline, because at a deadline the
+/// role holding the claim is walking home too and stops on the cell it took.
+///
+/// The ten reports measure the result: a role frozen on one cell for eleven or
+/// twelve consecutive dusk rounds, named by `wall_gate_open` every round with an
+/// EMPTY `stuck` list — and an empty `stuck` is exactly this branch's guard,
+/// since `stuck` is filled by `can_reach_any`, the pathfinder with every claim
+/// dropped. 179 freezes 20012 on (28,10) for eleven rounds; 178 freezes 20011 on
+/// (24,16) for twelve and 20012 for eleven and then `wall_gate_forced` seals the
+/// ring with both outside. Eight of the ten leave the gate open for 5-12 of the
+/// fifteen dusk rounds, and the gate is the hole the night walks through.
+#[test]
+fn a_reserved_cell_does_not_park_a_role_at_dusk() {
+    let turn = turn_from(corridor_board());
+    let role = turn.role_by_id(10002).expect("the worker is on the board");
+    let stands = coregeek::brain::interior_cells(&turn);
+    assert!(!stands.is_empty(), "the station has an inner band");
+
+    // A teammate has reserved the one gap for this round.
+    let reserved = Pos { x: 16, y: 24 };
+    let mut claimed: HashSet<Pos> = HashSet::new();
+    claimed.insert(reserved);
+
+    assert!(
+        coregeek::brain::walk_or_remove_wall(&turn, role, &stands, &mut claimed).is_none(),
+        "precondition: with the gap reserved, `walk_or_remove_wall` holds"
+    );
+
+    // The dusk return takes the step anyway. Reverting the second rung of
+    // `walk_home_or_reroute` makes this return `None` and the role stand still
+    // for the rest of the window, which is the eleven frozen rounds above.
+    let mut claimed: HashSet<Pos> = HashSet::new();
+    claimed.insert(reserved);
+    let cmd = coregeek::brain::day::walk_home_or_reroute(&turn, role, &stands, &mut claimed)
+        .expect("a dusk deadline is not a reason to stand still");
+    assert_eq!(cmd.action, "move", "the answer is a step, not a demolition");
+    let target = cmd
+        .targetPos
+        .as_ref()
+        .and_then(|list| list.first())
+        .expect("a move carries a destination");
+    // The step must close on the gap at (16,24). The A* tie-break does NOT
+    // promise WHICH of the equal-cost first steps it returns — (19,24) and
+    // (19,23) both reach the gap in four rounds from (20,24) — so assert the
+    // property this fix is about (a real step that closes on the gap) rather
+    // than pinning one of the tied cells. The guard against a regression is the
+    // `.expect(...)` above: reverting the second rung of `walk_home_or_reroute`
+    // makes it return `None` and the role stand still, which panics there.
+    assert_eq!(
+        chebyshev(role.pos, *target),
+        1,
+        "the answer is a single step, not a teleport"
+    );
+    assert!(
+        chebyshev(*target, reserved) < chebyshev(role.pos, reserved),
+        "and the step genuinely closes on the gap the crew is holding"
+    );
+}

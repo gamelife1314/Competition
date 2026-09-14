@@ -994,10 +994,21 @@ pub fn estimated_wave_hp(day: i64) -> i64 {
 /// are per-round. This is the ceiling the wave estimate is compared against —
 /// the arithmetic of Improve.kimi.md §3.1: 2×L1 = 1200 < the D1 wave's 3150.
 pub fn night_fire_capacity(turn: &Turn) -> i64 {
+    night_fire_capacity_with(turn, -1, 0)
+}
+
+/// [`night_fire_capacity`] with one tower's level shifted, so the funding order
+/// can ask what a voucher would actually buy. `bump_id < 0` shifts nothing.
+fn night_fire_capacity_with(turn: &Turn, bump_id: i64, bump: i32) -> i64 {
     turn.towers()
         .iter()
         .map(|tower| {
-            let level = tower.level.max(1) as i64;
+            let raw = if tower.id == bump_id {
+                tower.level + bump
+            } else {
+                tower.level
+            };
+            let level = raw.max(1) as i64;
             let per_round = match tower.kind {
                 UnitKind::Gatling => 10 * level,
                 UnitKind::Railgun => {
@@ -1022,6 +1033,34 @@ pub fn night_fire_capacity(turn: &Turn) -> i64 {
 /// station upgrade or harassment spend.
 pub fn firepower_gap(turn: &Turn) -> i64 {
     estimated_wave_hp(turn.day) - night_fire_capacity(turn)
+}
+
+/// The most `night_fire_capacity` one more weapon level can still add: the best
+/// single step available among the towers that are not level 3 yet.
+///
+/// This is the yardstick that tells an ACTIONABLE gap from a background one, and
+/// [`firepower_gap`] alone cannot (issues #176-#185). `estimated_wave_hp` starts
+/// at 3150 on day 1 and grows 900 a day; three level-1 towers — the board this
+/// bot actually fields, and the one `night_fire_capacity`'s own docstring names
+/// ("2×L1 = 1200 < the D1 wave's 3150") — put out 1600. So the gap is positive
+/// from round 1 of day 1 and grows; closing it needs 4800, i.e. three level-3
+/// towers. A test that is true on every board this bot has ever fielded is not
+/// detecting a firepower emergency, it is describing the game.
+///
+/// The distinction the funding order needs is whether ONE voucher closes the
+/// gap. If it does, funding firepower wins tonight and the order is right. If it
+/// does not, the voucher does not win tonight either — the wave still out-HPs
+/// the guns — and the gold is better spent on the asset whose destruction ends
+/// the half outright (任务书 ch.7) and whose survival is `score_3`
+/// (`Σ 10×day`, 550 over ten).
+pub fn best_weapon_step_gain(turn: &Turn) -> i64 {
+    let base = night_fire_capacity(turn);
+    turn.towers()
+        .iter()
+        .filter(|tower| tower.level < 3)
+        .map(|tower| night_fire_capacity_with(turn, tower.id, 1) - base)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Cells of the enemy station, in range, padded out to `projectiles`, with the
