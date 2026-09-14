@@ -6,6 +6,7 @@ pub mod day;
 pub mod economy;
 pub mod news;
 pub mod night;
+pub mod route;
 pub mod task;
 pub mod treasure;
 pub mod verify;
@@ -692,13 +693,25 @@ pub fn walk_or_remove_wall(
     if let Some(cmd) = walk_toward(turn, role, stands, claimed) {
         return Some(cmd);
     }
-    let blocked = turn.blocked_for(role.id);
+    // A route that exists once this round's CLAIMS are ignored is a route
+    // that exists next round: hold rather than tear a wall down for a
+    // one-round collision with a teammate's reservation. Claims are intents
+    // (the claimer moves on); a genuinely sealed route — a parked teammate,
+    // a closed ring — shows up in the static set too, and only that earns a
+    // demolition. Measured on the day-2 board: the gatling operator's way
+    // home crossed one claimed cell for one round, the hatch cut (13,23) for
+    // it, and the cut then had to be re-walled from outside with stone the
+    // seal did not have.
+    let static_blocked = turn.blocked_for(role.id);
+    if crate::path::step_toward_stands(turn, role.pos, stands, &static_blocked).is_some() {
+        return None;
+    }
     turn.walls()
         .into_iter()
         .map(|wall| wall.pos)
         .filter(|pos| chebyshev(role.pos, *pos) == 1)
         .filter(|pos| {
-            let mut opened = blocked.clone();
+            let mut opened = static_blocked.clone();
             opened.remove(pos);
             crate::path::step_toward_stands(turn, role.pos, stands, &opened).is_some()
         })

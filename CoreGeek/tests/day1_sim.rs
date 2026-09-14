@@ -684,6 +684,31 @@ fn day_one_closes_the_wall_ring_before_nightfall() {
 }
 
 #[test]
+fn the_day_one_ring_is_sealed_before_the_night() {
+    // Hard constraint, and the one the whole defence rests on: the ring is
+    // SEALED before nightfall. A shell at 19/20 is not a ring — the cell that
+    // is missing is the day's own entrance, and an entrance left open is the
+    // exact hole issues #111/#112/#115 fought the whole of night 1 through
+    // (`wall_gate_open` for 15 of the 15 dusk rounds, base destroyed on night
+    // 2). `day_one_closes_the_wall_ring_before_nightfall` allows one open cell
+    // because a teammate can be standing on the last one when the sweep goes
+    // past; this pins the other half — the seal itself has to happen.
+    let world = run_day_one();
+    report("seal", &world);
+    assert!(
+        world.state.wall_gate_sealed,
+        "the day-1 gate never sealed: the ring spent the night with its own \
+         entrance open, which is the hole the robots walk through"
+    );
+    assert_eq!(
+        world.open_cells(),
+        Vec::new(),
+        "the gate sealed but the shell is still open: {:?}",
+        world.open_cells()
+    );
+}
+
+#[test]
 fn the_wall_ring_is_up_before_the_third_tower() {
     // "Day 1 墙优先于武器" — and AUDIT_PLAN defines wall-first as forming the
     // minimal closed load-bearing layer fast, not as never building a gun. The
@@ -985,5 +1010,35 @@ fn the_workers_build_the_ring_from_their_own_stone() {
     assert!(
         builders.len() >= 2,
         "only {builders:?} built walls; the second worker's stone never became ring"
+    );
+}
+
+
+#[test]
+fn the_same_board_produces_the_same_plan_twice() {
+    // Determinism (hard constraint): the same board must yield the same plan.
+    // `BotState::door_cells` and `blacklisted_builds` are `HashSet`s, and a
+    // `sort_by_key` that reads only the DISTANCE to a role leaves two
+    // equidistant doors ordered by hash iteration — a different plan on the
+    // same board. Rust seeds each `HashSet` instance separately, so playing
+    // the same two days twice in one process is enough to expose an order that
+    // leaked into a decision. Day 2 is the day under test because that is when
+    // `open_door` cuts doors and the dusk reseal chooses between them.
+    let plan_of = || {
+        let mut world = run_day_one();
+        world.commands.clear();
+        run_day(&mut world, 2);
+        world.commands.clone()
+    };
+    let first = plan_of();
+    assert!(
+        !first.is_empty(),
+        "day 2 issued no commands at all, so this proves nothing"
+    );
+    let second = plan_of();
+    assert_eq!(
+        first, second,
+        "the same board produced two different plans; a set-iteration order has \
+         leaked into a decision"
     );
 }

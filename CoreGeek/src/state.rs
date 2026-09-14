@@ -511,6 +511,17 @@ pub struct BotState {
     /// stand, then remains sealed for the rest of the half.
     pub wall_gate_sealed: bool,
 
+    /// The ring cell this day leaves open — `brain::route`'s planned entrance,
+    /// latched at daybreak.
+    ///
+    /// `None` means "the planner had no evidence" (a board with no zones on it)
+    /// and every reader falls back to `route::legacy_entrance`, the fixed
+    /// `(xmax + 2, ymin - 1)` cell. Latched rather than recomputed per round
+    /// because the errand set moves during the day — the stone demand falls as
+    /// the ring goes up, and a mine can go on outage — and an entrance that
+    /// moved mid-afternoon would re-open a cell the crew had just walled.
+    pub gate_cell: Option<Pos>,
+
     /// Set the first time the radius-2 ring around the station has no holes.
     ///
     /// A ring that has been closed before and has holes NOW is not being
@@ -589,6 +600,10 @@ impl BotState {
             // Yesterday's door was sealed at dusk; today may need a new one.
             self.door_cells.clear();
             self.wall_gate_sealed = false;
+            // A new day, a new entrance: the errand set is re-read from the
+            // board (ore prices move, veins go on outage) and the opening is
+            // placed where TODAY's work is. See `brain::route::entrance`.
+            self.gate_cell = None;
             // Every dusk commitment was discharged by last night's recall.
             self.dusk_home.clear();
         }

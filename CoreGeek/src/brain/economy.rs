@@ -941,14 +941,18 @@ pub fn choose_sellable_mine(
 ) -> Option<(Pos, String)> {
     // Nearest first, equal distance broken by higher vendor value — the same
     // rule `choose_mine` uses once it has no stone to fetch.
-    let mut best: Option<(i32, std::cmp::Reverse<i64>, i32, i32, Pos, String)> = None;
+    let mut best: Option<(i64, std::cmp::Reverse<i64>, i32, i32, Pos, String)> = None;
     for (pos, ore) in turn.all_mines() {
         if ore == STONE || state.ore_on_outage(&ore, turn.day) || claimed.contains(&pos) {
             continue;
         }
         let price = turn.vendor_prices.get(&ore).copied().unwrap_or(1);
         let key = (
-            chebyshev(role_pos, pos),
+            // Through the day's entrance, exactly as `choose_mine` measures it:
+            // the two selectors feed the same trip, and pricing them differently
+            // made the economy worker and the wall crew disagree about which
+            // vein was near.
+            crate::brain::route::trip_rounds(turn, role_pos, pos),
             std::cmp::Reverse(price),
             pos.x,
             pos.y,
@@ -965,10 +969,22 @@ pub fn choose_sellable_mine(
     choose_mine(turn, state, role_pos, 0, claimed)
 }
 
-/// Pick the nearest mine for this worker: stones first while wall demand is
-/// unmet, otherwise the closest mine of any ore. Distance always beats value
-/// — a short walk keeps the build loop moving faster than a high-value ore
-/// on the far side of the map.
+/// Pick the mine for this worker: stones first while wall demand is unmet,
+/// otherwise the closest mine of any ore.
+///
+/// **Distance is measured through the ring, not across it** (joint route/order
+/// planner). `chebyshev(role_pos, mine)` is the straight line, and once the
+/// shell is up that line goes through a wall: a vein three cells east of the
+/// base is three rounds away only if the day's entrance happens to be on the
+/// east side, and fifteen if it is on the west. The old metric therefore sent
+/// the crew to the geometrically nearest vein and paid for it in the walk home
+/// — the owner's *"如果朝哪个地方采矿，朝这个方向给开个口方便他进来，减少回合
+/// 浪费"*, read from the other end. `route::trip_rounds` is that same walk with
+/// the opening priced in, so the pick and the entrance agree by construction.
+///
+/// Distance still beats value — a short walk keeps the build loop moving faster
+/// than a high-value ore on the far side of the map — but it is the real
+/// distance now.
 pub fn choose_mine(
     turn: &Turn,
     state: &BotState,
@@ -989,6 +1005,7 @@ pub fn choose_mine(
     if options.is_empty() {
         return None;
     }
+    let walk = |pos: Pos| crate::brain::route::trip_rounds(turn, role_pos, pos);
     // Stones for the wall line: nearest stone mine wins (coordinate tiebreak
     // keeps the pick deterministic across HashMap iteration order). When no
     // stone is reachable, fall back to the nearest mine of any ore rather
@@ -997,7 +1014,7 @@ pub fn choose_mine(
         if let Some((pos, ore)) = options
             .iter()
             .filter(|(_pos, ore)| ore == STONE)
-            .min_by_key(|(pos, _ore)| (chebyshev(role_pos, *pos), pos.x, pos.y))
+            .min_by_key(|(pos, _ore)| (walk(*pos), pos.x, pos.y))
         {
             return Some((*pos, ore.clone()));
         }
@@ -1005,11 +1022,6 @@ pub fn choose_mine(
     // Nearest mine first; equal distance broken by higher vendor value.
     options.into_iter().min_by_key(|(pos, ore)| {
         let price = turn.vendor_prices.get(ore).copied().unwrap_or(1);
-        (
-            chebyshev(role_pos, *pos),
-            std::cmp::Reverse(price),
-            pos.x,
-            pos.y,
-        )
+        (walk(*pos), std::cmp::Reverse(price), pos.x, pos.y)
     })
 }

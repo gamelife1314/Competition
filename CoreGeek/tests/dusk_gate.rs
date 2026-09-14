@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 
 use coregeek::brain::day::{gate_open_record, plan as day_plan, tower_gaps};
 use coregeek::brain::night;
-use coregeek::model::{footprint_distance, station_footprint, Turn};
+use coregeek::model::{chebyshev, footprint_distance, station_footprint, Turn};
 use coregeek::protocol::{Pos, Request};
 use coregeek::state::BotState;
 
@@ -676,5 +676,101 @@ fn the_day_two_gate_is_a_door_the_stone_crew_can_close() {
         ("build", Some(vec![gate])),
         "the day-2 dusk left the gate open (got {cmd:?}): the ring keeps a \
          robot-sized hole for the whole night"
+    );
+}
+
+#[test]
+fn two_equidistant_doors_are_closed_in_coordinate_order() {
+    // `door_cells` is a `HashSet`. `worker_day` step 3b sorts the day's doors
+    // by the walk from the carrier and then takes the first one it can build —
+    // so when two doors are the same distance away, the sort key alone leaves
+    // the choice to hash iteration, and the same board yields a different plan
+    // on a different run. The planner's tiebreak everywhere else is the
+    // coordinate pair, and the door list must use it too.
+    //
+    // `the_day_two_gate_is_a_door_the_stone_crew_can_close` sets this board up
+    // with one hole; here the gate (13,22) has a twin at (11,21), both exactly
+    // one step from the carrier. The lexicographically smaller one must win.
+    let gate = gate_cell();
+    let twin = Pos { x: 13, y: 23 };
+    let other = Pos { x: 11, y: 21 };
+    let footprint = station_footprint(Pos {
+        x: STATION.0,
+        y: STATION.1,
+    });
+    for door in [gate, twin, other] {
+        assert_eq!(
+            footprint_distance(door, &footprint),
+            2,
+            "test setup: {door:?} must be a ring cell"
+        );
+    }
+    let carrier = Pos {
+        x: gate.x - 1,
+        y: gate.y,
+    };
+    assert_eq!(
+        chebyshev(carrier, twin),
+        chebyshev(carrier, other),
+        "test setup: the two doors must be equidistant from the carrier"
+    );
+    assert!(other.x < twin.x, "test setup: `other` sorts first");
+
+    let mut ours = vec![
+        station(),
+        gatling(10020, 11, 22),
+        json!({
+            "id": 10002, "pos": {"x": carrier.x, "y": carrier.y}, "roleType": "worker",
+            "health": 220, "attackPower": 0, "attackRange": 0,
+            "level": 1, "backPackCapability": 100,
+            "backpack": ["stone", "stone", "stone", "stone", "stone", "stone"]
+        }),
+        role(10004, "pioneer", 10, 23),
+    ];
+    let mut index = 0;
+    for x in -2..WIDTH + 2 {
+        for y in -2..HEIGHT + 2 {
+            let pos = Pos { x, y };
+            if pos.x < 0 || pos.y < 0 || pos.x >= WIDTH || pos.y >= HEIGHT {
+                continue;
+            }
+            if footprint.contains(&pos) || footprint_distance(pos, &footprint) != 2 {
+                continue;
+            }
+            if pos == twin || pos == other {
+                continue; // both holes belong to the branch under test
+            }
+            ours.push(wall(20000 + index, pos.x, pos.y));
+            index += 1;
+        }
+    }
+    let turn = turn_from(world(130 + 55, ours, Vec::new()));
+    assert_eq!(turn.day, 2, "test setup: this is the day-2 dusk");
+    assert_eq!(turn.in_day_round, 55);
+
+    // One fresh `BotState` per attempt: Rust seeds every `HashSet` instance
+    // separately, so a 32-run sweep is what turns "usually the same" into
+    // "always the same". Without the tiebreak the choice is roughly a coin
+    // flip per run, and one differing run fails this test.
+    let mut targets: Vec<Option<Vec<Pos>>> = Vec::new();
+    for _ in 0..32 {
+        let mut state = BotState::default();
+        state.door_cells.insert(twin);
+        state.door_cells.insert(other);
+        let plan = day_plan(&turn, &mut state);
+        targets.push(
+            plan.commands
+                .get(&10002)
+                .and_then(|cmd| cmd.targetPos.clone()),
+        );
+    }
+    assert!(
+        targets.iter().all(|target| target == &targets[0]),
+        "the same board closed a different door on different runs: {targets:?}"
+    );
+    assert_eq!(
+        targets[0],
+        Some(vec![other]),
+        "two equidistant doors must be closed in coordinate order, smallest first"
     );
 }

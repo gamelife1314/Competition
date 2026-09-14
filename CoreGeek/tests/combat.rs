@@ -1290,6 +1290,62 @@ fn trapped_worker_removes_wall_to_escape() {
 }
 
 #[test]
+fn a_claimed_cell_is_not_a_reason_to_tear_the_ring_down() {
+    // The demolition hatch is the last resort, not the first. A cell a
+    // TEAMMATE has claimed this round is a one-round collision — the claimer
+    // moves on — so a route that exists once this round's claims are ignored
+    // exists again next round. Tearing a wall out of the ring for it spends a
+    // cell of the day's shell and leaves a hole the night can be entered
+    // through, on a role that would have walked home anyway.
+    //
+    // Same board as `trapped_worker_removes_wall_to_escape`, with one change:
+    // the pocket has a second exit, (2,3), and a teammate has claimed it. The
+    // role at (2,2) has no route THIS round (its only free neighbour is the
+    // claimed cell; everything else is zone or wall) and a route the moment
+    // the claim is ignored. It must hold.
+    let wall_unit = json!({
+        "id": 10050, "pos": {"x": 3, "y": 2}, "roleType": "wall",
+        "health": 1000, "attackPower": 0, "attackRange": 0,
+        "level": 1, "backPackCapability": 0, "backpack": []
+    });
+    let mut zones = Vec::new();
+    for (zx, zy) in [(1, 1), (2, 1), (3, 1), (1, 2), (1, 3), (3, 3)] {
+        zones.push(zone(zx, zy, "iron"));
+    }
+    let turn = turn_from(world_zones(
+        vec![worker(10010, 2, 2), wall_unit],
+        vec![],
+        zones,
+    ));
+    let role = turn.role_by_id(10010).unwrap();
+    let stands = vec![Pos { x: 4, y: 2 }];
+
+    // The escape cell is free: with no claim the role simply walks it, and the
+    // wall at (3,2) is never a candidate. This is the control — it is what
+    // makes the claim, and not the geometry, the thing under test.
+    let mut free = std::collections::HashSet::new();
+    let control = coregeek::brain::walk_or_remove_wall(&turn, role, &stands, &mut free);
+    assert_ne!(
+        control.as_ref().map(|cmd| cmd.action.as_str()),
+        Some("remove"),
+        "a reachable pocket must not demolish anything: {control:?}"
+    );
+
+    let mut claimed: std::collections::HashSet<Pos> = std::collections::HashSet::new();
+    claimed.insert(Pos { x: 2, y: 3 });
+    let cmd = coregeek::brain::walk_or_remove_wall(&turn, role, &stands, &mut claimed);
+    assert!(
+        cmd.is_none(),
+        "the only thing blocking the route is a teammate's claim, so the ring \
+         must be left alone; got {cmd:?}"
+    );
+    assert!(
+        turn.walls().iter().any(|wall| wall.pos == Pos { x: 3, y: 2 }),
+        "the wall the old predicate would have cut is still standing"
+    );
+}
+
+#[test]
 fn task_description_persists_when_phase_task_clears() {
     // The judger sometimes stops echoing phaseTask while the task is still
     // live. A cleared field must NOT end the task or erase the description —
