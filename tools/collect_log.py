@@ -43,7 +43,7 @@ from collections import Counter
 ARCHIVE_ERRORS = (OSError, EOFError, zlib.error, zipfile.BadZipFile)
 
 # 每张表的行数封顶。**这是预算的唯一出处**——WORKFLOW_REQUEST §7.3 的预算表和 §8 的
-# cap_lines_total 都是这个数，CoreGeek/tests/collect_log.rs 会核对总量不超过 640 行。
+# cap_lines_total 都是这个数，CoreGeek/tests/collect_log.rs 会核对总量不超过 660 行。
 # 加一节而忘了给预算，或者把某一节放大到超出总量，都会在那里失败。
 CAPS = {
     "tower_plan": 20,      # 聚合式，恒定
@@ -62,10 +62,11 @@ CAPS = {
     "night_reasons": 20,   # 聚合式，恒定
     "night_towers": 40,    # 塔数 × 原因数
     "score_attr": 12,      # 一天一行，10 天 + 余量
+    "enemy_build": 12,     # 一天一行，10 天 + 余量
 }
 CAP_TOTAL = sum(CAPS.values())
 
-# `--day N` 点名的逐回合明细。**不计入 640**：那十六张是每批都要贴的，这个是点了名才印的。
+# `--day N` 点名的逐回合明细。**不计入 660**：那十七张是每批都要贴的，这个是点了名才印的。
 DRILL_CAP = 160
 
 # 一天/一夜的回合数，用来把 round 换算成「第几天、当天第几回合」。
@@ -578,6 +579,43 @@ def build_tables(records, day):
                  for r in pick(records, "night_debug")
                  for p in data(r).get("pairs") or [] if isinstance(p, dict)],
                 lambda t: sorted(t)), CAPS["night_towers"],
+    )
+
+    # ------------------------------------------------- 表 7 对手建造节奏（v16 §13）
+    # 对手的塔、墙、基地等级都在每个回合的请求里（`teamEnemy.roles`），我们
+    # **自己的 stdout 一直都看得见**：`enemyWall`/`enemyBase` 早就在 `round`
+    # 记录里，`enemyTowers` 是 v16 才补上的那一格。这一张表回答的是老板那句
+    # "对手优先造武器、我们优先造墙"——没有它，这句话只能拿我们自己的数据去推。
+    #
+    # 三个块都受 §2 压缩规则 2 约束（**没变的块不重写**），所以必须带值前行：
+    # 某回合没有这个键，就是沿用上一次出现的值。只读键的读者会在没写的那几个
+    # 回合上读到"对手没有塔"，而它只是没变。
+    carried = {"enemyTowers": None, "enemyWall": None, "enemyBase": None}
+    last_of_day = {}
+    for r in pick(records, "round"):
+        d = data(r)
+        n = d.get("round")
+        if not isinstance(n, int):
+            continue
+        for key in carried:
+            if d.get(key) is not None:
+                carried[key] = d[key]
+        last_of_day[day_of(n)] = (n, dict(carried))
+    enemy_rows = []
+    for which in sorted(last_of_day):
+        n, snapshot = last_of_day[which]
+        towers = snapshot.get("enemyTowers") or {}
+        wall = snapshot.get("enemyWall") or {}
+        base = snapshot.get("enemyBase") or []
+        level = base[1] if isinstance(base, list) and len(base) > 1 else None
+        enemy_rows.append(tsv([
+            which, n,
+            towers.get("count"), ",".join(towers.get("kinds") or []),
+            wall.get("count"), level,
+        ]))
+    section(
+        "表 7 · 对手建造节奏（每天最后一个回合）　列：第几天 回合 对方塔数 对方塔型 对方墙数 对方基地等级",
+        enemy_rows, CAPS["enemy_build"],
     )
 
     if day is not None:

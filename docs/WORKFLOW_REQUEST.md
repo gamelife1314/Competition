@@ -1,6 +1,18 @@
 # 对战数据交付规范（workflow agent 接口）
 
-> **版本 v15** · 本文档是内网自动对战 workflow 的**交付规范**。
+> **版本 v16** · 本文档是内网自动对战 workflow 的**交付规范**。
+> **v16 只加一节：§13 请求八**，别的什么都没动——交付方式、**收集命令一个字没变**，
+> 你那边**不需要做任何新动作**，重跑一次那条命令就会多印一段**表 7（对手建造节奏）**。
+> 行数预算 640 → **660**（只多了表 7 的 12 行）。
+> 起因是这一批的 Part B：老板看了比赛，说"**对手优先造武器，我们优先造墙**"。这条
+> 观察的对手那一半，`receipt.enemy_seen`（§3）报过两次"拿不到"。**前半句对，后半句
+> 不对**：`teamEnemy.roles` 里一直带着对手的所有单位，我们的 `round` 记录里也一直写着
+> `enemyWall` 和 `enemyBase`——缺的只是 `enemyTowers` 那一格，这一版补上了。于是
+> "对手第几天有几门炮"现在能从**我们自己的日志**里读出来，不再依赖那个拿不到的回执
+> 字段。§13 说明这一格为什么能定 Part B（我们实测：前两座塔 R2、第一块墙 R16、第 3 座
+> 塔要到第 2 天；而把第 3 座塔提到第 1 天，代价是环上留一个洞）。
+>
+> **v15** · 本文档是内网自动对战 workflow 的**交付规范**。
 > **v15 加了一节：§12 请求七**，并把 §7.3 / §8 的行数预算从 560 提到 640——因为 §7.3
 > 从**十三张表**变成了**十六张**：多了表 0（分数归属）、表 4c（每条沙盒命令）和表 4d
 > （没有答案的原因）。
@@ -437,7 +449,7 @@ Debian/Ubuntu `sudo apt-get install -y python3`；装完**重开终端**再跑�
 | 5 封门 | 5a / 5b / 5c | 52 / 3 / 1 | 160 / 20 / 20 | **每天最多 15 行** |
 | 6 夜间塔况 | 6a / 6b | 3 / 7 | 20 / 40 | 聚合式，恒定 |
 
-**封顶在脚本里，不用你数**：跑一次最多 640 行表格（那是"每天都出问题"的极端场），典型一场
+**封顶在脚本里，不用你数**：跑一次最多 660 行表格（那是"每天都出问题"的极端场），典型一场
 250 行 / 7.0 KB。被截断的节会自己写明「本表共 N 行」——**看到那句就照贴，我会知道哪节被切了**。
 
 - 表 5 的 5a 是唯一按回合线性长的：黄昏窗口一天就 15 回合，所以**每天封顶 15 行**，10 天
@@ -834,7 +846,7 @@ agent_request:
         title: 逐场结果回执
         content: one receipt.json per battle (see receipt_fields)
       - id: evidence_tables
-        title: 六张证据表
+        title: 证据表（v16 共 17 张）
         desc: >
           One command, over the local stdout capture, pasted whole. The script already
           aggregates and already caps each section, so the whole output goes in; the all-match
@@ -844,7 +856,7 @@ agent_request:
           deliverable. If one table blows past its budget, paste it anyway and say why (gate
           table: the gate WAS open that long).
         produced_by: python tools/collect_log.py <log>
-        cap_lines_total: 640   # the script's per-section caps summed; a typical battle prints 250 lines (219 rows)
+        cap_lines_total: 660   # the script's per-section caps summed; a typical battle prints 250 lines (219 rows)
         tables:
           - id: tower_plan
             sections: [表 1 造塔计划: 20 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
@@ -898,6 +910,17 @@ agent_request:
             gotchas:
               - '"fired" is the default, so a raw reason histogram mixes the good case in with the causes of silence — filter it out to count idle reasons'
               - 'pairs is pruned away when empty, so the key can be missing entirely — read that as "no rows", not as a broken log'
+          - id: enemy_build
+            sections: [表 7 对手建造节奏: 12 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
+            name: 对手建造节奏
+            tells: whether the opponent arms before they fortify — the owner's report was "they build weapons first, we build walls", and this is the only place that claim can be checked against a real match (the receipt field `enemy_seen` has twice come back unobtainable)
+            fields:
+              enemyTowers: '{"count": n, "kinds": ["gatling", ...]} — the opponent's guns, from `teamEnemy.roles`, which we have always been sent and never logged'
+              enemyWall: '{"count": n, "hp": n} — logged since v1'
+              enemyBase: '[hp, level] — logged since v1'
+            gotchas:
+              - 'all three blocks are change-gated (§2 rule 2): a round without `enemyTowers` means UNCHANGED, not "no guns" — read the series with carry-forward'
+              - 'the table prints one row per day, at the day''s last round, so read the day-1 row for "did they have three guns on night 1"'
       - id: gaps
         title: 缺口
         content: everything unobtainable, with the reason. A table that printed （0 行） and a thing that did not happen are different claims — say so when you cannot tell them apart.
@@ -1193,6 +1216,67 @@ score_2 就没挣到；`总分` 减 `击杀分` 减 `survival` 就是任务线�
 - 表 1、2、3、4a、4b、5、6 **不变**；收集命令不变。
 - 行数预算 560 → **640**（"每天最多 15 行"的表 5a 等上限一个都没动）。
 
+### 12.6 v16 一句话
+
+§13 请求八**只加一张表 7（对手建造节奏，每天 1 行，封顶 12 行）**，行数预算 640 →
+**660**。交付方式、收集命令、其余十六张表一个字没改；采集命令照旧
+`python tools/collect_log.py <日志文件>`，表 7 会自动多印一段。
+
 ---
 
 *本文件由本地 agent 维护，作为向内部 workflow 下发数据交付指令的接口。*
+
+---
+
+## 13. 请求八：对手的建造节奏（v16）
+
+### 13.1 这一节要什么：**重跑一次那条命令就行**，交付方式一个字没变
+
+```bash
+python tools/collect_log.py <你的日志文件>
+```
+
+这一版**不需要你做任何新动作**：收集脚本会自己多印一段**表 7**（对手建造节奏，
+每天最后一个回合一行，封顶 12 行）。
+
+```text
+----- 表 7 · 对手建造节奏（每天最后一个回合）　列：第几天 回合 对方塔数 对方塔型 对方墙数 对方基地等级 -----
+1	130	2	gatling,railgun	17	1
+2	260	3	gatling,railgun,rocket	19	1
+```
+
+起因是这一批的 Part B：老板看了比赛，说"**对手优先造武器，我们优先造墙**"。
+这条观察的对手那一半，`receipt.enemy_seen`（§3）报过两次"拿不到——对手基地等级/塔数/
+墙数在详情页上没有，我方 stdout 也看不见"。**前半句对，后半句不对**：`teamEnemy.roles`
+里一直带着对手的所有单位（塔、墙、基地都在），我们的 `round` 记录里也一直写着
+`enemyWall` 和 `enemyBase`——缺的只是 `enemyTowers` 那一格。这一版把它补上了，所以
+**对手的建塔节奏现在能从我们自己的日志里读出来**，不再依赖那个拿不到的回执字段。
+
+三个块都受 §2 压缩规则 2 约束（**没变的块不重写**），脚本已经按"带值前行"读——
+某回合没有 `enemyTowers` 键不是"对手没有塔"，是"和上一回合一样"。
+
+### 13.2 这一格能定什么
+
+拿我们自己的日志 + 规则推"墙优先还是武器优先"，这一批能证明的是：
+
+- 我们的**第 1、2 座塔在 R2** 就起来了，**第一块墙是 R16**——所以"我们优先造墙"
+  在**前两座塔**上不成立；
+- 真正被"墙优先"压住的是**第 3 座塔**：P0-4 的闸门把它顺延到**第 2 天第 2 回合**
+  （本机 day-1 仿真实测 R132），第 1 夜因此是**两门炮打三个角色**，多出来的那个角色
+  既没有火力、也没有黄昏归位的岗位（这正是 P1 封门那条的病根）；
+- 而把第 3 座塔提到第 1 天，实测的代价是**环上留一个洞**（19/20，
+  `ring_ever_complete` 不置位，第 2 天的补墙预算掉回 6 格，也就是 issue #21 那个死法）。
+
+**表 7 能让最后这句从"两难"变成"有答案"**：
+
+- 如果对手第 1 天就有 3 门炮、而且基地比我们活得久 → "武器优先"赢，环上那个洞要另想
+  办法补（例如把第 3 座塔挪到不挡西侧那块墙的塔位），下一批就按这个方向改；
+- 如果对手第 1 天同样只有 2 门炮 → 这一批"保持墙优先"的结论成立，这条可以结案。
+
+**怎么读**：看**第 1 天那一行**的"对方塔数"和"对方墙数"。塔数 3 = 对手第 1 天就三炮；
+塔数 ≤ 1 而墙数 ≥ 10 = 对手也是先墙。基地等级那一列顺带回答"对手是不是先升基地"。
+
+### 13.3 拿不到就写一句
+
+表 7 印出 `（0 行）` 或者"对方塔数"整列是空的，就照 §7.4 写"拿不到 + 为什么"，
+**不要填 0**——填 0 和"对手一座塔都没有"长得一模一样，而这两件事的结论正好相反。

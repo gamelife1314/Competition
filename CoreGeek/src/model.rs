@@ -401,6 +401,21 @@ impl Turn {
             .filter(|unit| unit.kind == UnitKind::Wall && unit.alive())
             .collect()
     }
+    /// The opponent's guns, in a stable order. Their gold, score and task
+    /// submissions are invisible to us, but their ARMED FORCES are in every
+    /// request, and `enemy_walls()` was the only half of that we ever logged.
+    /// Logging the other half is what makes "the opponent builds weapons first"
+    /// answerable from our own match record instead of from a report about a
+    /// report (WORKFLOW_REQUEST §13).
+    pub fn enemy_towers(&self) -> Vec<&Unit> {
+        let mut towers: Vec<&Unit> = self
+            .enemy
+            .iter()
+            .filter(|unit| unit.kind.is_tower() && unit.alive())
+            .collect();
+        towers.sort_by_key(|unit| (unit.pos.x, unit.pos.y));
+        towers
+    }
     pub fn role_by_id(&self, id: i64) -> Option<&Unit> {
         self.ours.iter().find(|unit| unit.id == id)
     }

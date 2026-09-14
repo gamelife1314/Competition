@@ -283,6 +283,21 @@ fn log_round(
     let enemy_station_lvl = turn.enemy_station().map(|station| station.level);
     let wall = json!({"count": turn.walls().len(), "hp": wall_hp, "hpDelta": wall_hp_delta});
     let enemy_wall = json!({"count": turn.enemy_walls().len(), "hp": enemy_wall_hp});
+    // The opponent's armed forces, change-gated like every other roster block.
+    // `enemyWall` above and `enemyStationLvl` already say how much wall and how
+    // big a base they have; WITHOUT this line the log cannot say how many guns
+    // are behind that wall, which is exactly the question "do they build
+    // weapons first?" asks — and the only other place the answer could come
+    // from is a receipt field the delivery workflow has reported unobtainable
+    // twice (WORKFLOW_REQUEST §3.4, §13).
+    let enemy_towers = json!({
+        "count": turn.enemy_towers().len(),
+        "kinds": turn
+            .enemy_towers()
+            .iter()
+            .map(|tower| format!("{:?}", tower.kind).to_lowercase())
+            .collect::<Vec<_>>(),
+    });
     let task = json!({
         "active": state.task.active,
         "session": state.task.session_id,
@@ -352,11 +367,12 @@ fn log_round(
     let object = data.as_object_mut().expect("round data is an object");
     let base = json!([station_hp, station_lvl]);
     let enemy_base = json!([enemy_station_hp, enemy_station_lvl]);
-    let gated: [(&str, &serde_json::Value, &mut Option<String>); 9] = [
+    let gated: [(&str, &serde_json::Value, &mut Option<String>); 10] = [
         ("base", &base, &mut state.log_sigs.station),
         ("enemyBase", &enemy_base, &mut state.log_sigs.enemy_station),
         ("wall", &wall, &mut state.log_sigs.wall),
         ("enemyWall", &enemy_wall, &mut state.log_sigs.enemy_wall),
+        ("enemyTowers", &enemy_towers, &mut state.log_sigs.enemy_towers),
         ("towers", &towers, &mut state.log_sigs.towers),
         ("roles", &roles, &mut state.log_sigs.roles),
         ("pairs", &pairs, &mut state.log_sigs.pairs),

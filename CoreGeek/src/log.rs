@@ -126,6 +126,8 @@ pub struct LogSigs {
     pub enemy_station: Option<String>,
     pub wall: Option<String>,
     pub enemy_wall: Option<String>,
+    /// The opponent's gun roster (`enemyTowers`), gated like every other block.
+    pub enemy_towers: Option<String>,
     pub towers: Option<String>,
     pub roles: Option<String>,
     pub pairs: Option<String>,

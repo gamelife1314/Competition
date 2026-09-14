@@ -270,6 +270,60 @@ fn a_quiet_round_leaves_the_gates_shut_and_a_moved_one_opens_them() {
 }
 
 #[test]
+fn the_opponents_guns_reach_the_log_and_move_it_when_they_change() {
+    // The opponent's wall count and base level have always been in the round
+    // record; their GUNS were not, so "the opponent builds weapons first"
+    // (WORKFLOW_REQUEST §13) could not be answered from a captured match at
+    // all — the delivery workflow has reported the `enemy_seen` receipt field
+    // unobtainable, and `teamEnemy.roles` was being read and thrown away.
+    // `enemyTowers` is gated like every other roster block, so it costs one
+    // line the day a gun appears and nothing on the rounds in between.
+    fn with_enemy_towers(round_no: i64, towers: usize) -> Vec<u8> {
+        const KINDS: [&str; 3] = ["gatling", "railgun", "rocket"];
+        let mut enemy: Vec<serde_json::Value> = Vec::new();
+        for index in 0..towers {
+            enemy.push(json!({
+                "id": 50000 + index as i64,
+                "pos": {"x": 30 + index as i32, "y": 10},
+                "roleType": KINDS[index % 3],
+                "health": 1000, "attackPower": 10, "attackRange": 5,
+                "level": 1, "backPackCapability": 0, "backpack": [],
+            }));
+        }
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&board(round_no, 500)).expect("board parses");
+        payload["teamEnemy"] = json!({"roles": enemy});
+        serde_json::to_vec(&payload).expect("payload serialises")
+    }
+
+    let mut state = BotState::default();
+    decide_with(&mut state, &with_enemy_towers(1, 2)).expect("round 1 decides");
+    let two = state.log_sigs.enemy_towers.clone();
+    assert_eq!(
+        two.as_deref(),
+        Some(r#"{"count":2,"kinds":["gatling","railgun"]}"#),
+        "the opponent's two guns must be written, with their kinds"
+    );
+
+    decide_with(&mut state, &with_enemy_towers(2, 2)).expect("round 2 decides");
+    assert_eq!(
+        state.log_sigs.enemy_towers, two,
+        "a round in which their arsenal did not move re-sends nothing"
+    );
+
+    decide_with(&mut state, &with_enemy_towers(3, 3)).expect("round 3 decides");
+    assert!(
+        state
+            .log_sigs
+            .enemy_towers
+            .as_deref()
+            .is_some_and(|sig| sig.contains("rocket")),
+        "their third gun is a change and has to be written: {:?}",
+        state.log_sigs.enemy_towers
+    );
+}
+
+#[test]
 fn a_multiline_blob_becomes_one_line_of_its_own_text() {
     // `cmd_result.head` and `task_cmd_failed.head` exist to answer the one
     // question the character count could not: what did the sandbox actually

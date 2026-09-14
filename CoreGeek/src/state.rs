@@ -416,6 +416,20 @@ pub struct BotState {
     /// crew fills them. Cleared at day rollover.
     pub door_cells: HashSet<Pos>,
 
+    /// Roles that have turned for home for tonight's dusk lock-in.
+    ///
+    /// Latched rather than recomputed each round, because every dusk deadline in
+    /// this planner is measured from where the role currently IS (`dusk_recall_round`,
+    /// `pioneer_recall_round`, `preposition_round`). A deadline that shrinks as
+    /// the role walks in un-fires the moment it gets closer: the role arrives,
+    /// the deadline moves past the current round, the economy steps below the
+    /// checkpoint take it straight back out, and it arrives again. That two-cell
+    /// oscillation is what the 2026-09-14(b) analysis measured — `away`
+    /// alternating between two cells for fifteen consecutive rounds while
+    /// `wall_gate_open` never cleared. A role that has committed stays committed
+    /// for the rest of the day; the set is cleared at day rollover.
+    pub dusk_home: HashSet<i64>,
+
     /// day -> official news text (dedup)
     pub official_seen: HashMap<i64, String>,
     /// day -> folk legend text (dedup)
@@ -575,6 +589,8 @@ impl BotState {
             // Yesterday's door was sealed at dusk; today may need a new one.
             self.door_cells.clear();
             self.wall_gate_sealed = false;
+            // Every dusk commitment was discharged by last night's recall.
+            self.dusk_home.clear();
         }
         self.last_round = turn.round_no;
 

@@ -124,6 +124,11 @@ const SEAL_GRACE: i64 = 8;
 /// Slack on top of the walk home before the pioneer's dusk recall fires, for a
 /// blocked cell or a detour. Mirrors the three rounds `preposition_round` keeps.
 const PIONEER_RETREAT_SLACK: i64 = 2;
+/// Day-rounds before dusk from which a role with no gun to man stops taking
+/// errands outside the ring. One ordinary walk home (a worker is four to eight
+/// cells out at the vein or the wall line) plus slack — the mirror of
+/// `SEAL_GRACE`, which is the same budget on the far side of dusk.
+const DUSK_RETREAT_LEAD: i64 = 8;
 /// Day-rounds that must still be available before a task point is worth
 /// accepting.
 ///
@@ -747,6 +752,15 @@ fn worker_day(
     //    stone_out_of_reach 板：远矿行军 + 收入冻结，issue #17 原样复发），
     //    因此按分析 §4 的原文只认已存在的塔；该图第 2/3 塔顺延到 D2，是分析
     //    已经接受的权衡。
+    //
+    //    P1-B 复核（2026-09-14 b 批）：这道闸**没有**拦住第 2 塔——两个工人同一
+    //    回合各占一个塔位，判据看到的 `towers` 还是空的，于是 gatling 和 railgun
+    //    都在 R2 立起来，**早于第一块墙（R16）**。它真正顺延的是第 3 塔：实测
+    //    R132 = 第 2 天第 2 回合，第 1 夜（R71–R130）因此是两门炮打三个角色。
+    //    但把第 3 塔提到第 1 天实测的代价是**环上留一个洞**（19/20，
+    //    `ring_ever_complete` 不置位 → 第 2 天补墙预算掉回 6 格 = issue #21 的
+    //    死法），所以这一批**保持原样**，没有动这道闸。缺的那一块证据是对手的
+    //    建塔节奏，见 WORKFLOW_REQUEST §13（表 7）。
     let ring_still_forming = turn.day == 1 && shared_wall_duty && !turn.towers().is_empty();
     if economy::may_build_weapon(turn, state) && !ring_still_forming {
         for (site, kind) in tower_gaps {
@@ -760,6 +774,24 @@ fn worker_day(
             }
         }
     }
+    // 6b. Has this role's day outside the ring ended? (P1.) The steps above have
+    //     had their turn — a role carrying stone to a legal gap built it, and a
+    //     role that could pay for a gun built that — and everything from here
+    //     down is an errand OUTSIDE the ring: the shop trip, the vendor, the
+    //     mine. A role outside the ring at dusk is the hole the gate cannot
+    //     close; see `dusk_recall_round` for the measured shape (15/15 open
+    //     rounds in #111 day 1, #112 both days, #115 day 1).
+    //
+    //     Two steps are deliberately left above the lock-in, because each is
+    //     worth a round and each ends beside the base: the wall repair (step 8,
+    //     the ring is at the base) and the sale (step 9, the ore in the pack
+    //     becomes the gold the next day's towers are bought with). Only the
+    //     WALKS are cut — a carried Medicine is still drunk at step 1.
+    //
+    //     Gunners are excluded: step 4 (`preposition_round`) already locks them
+    //     and repeating it here would only shadow a deadline that works.
+    let committed = !pairs.iter().any(|(controller, _)| *controller == role.id)
+        && dusk_committed(state, turn, role, dusk_recall_round());
     // 7. Shopping (dedicated buyer) — upgrades come after survival. When
     //    nothing is affordable YET the buyer still sets off once the ore in its
     //    pack covers the price, so the purchase lands the round the sale does.
@@ -771,7 +803,16 @@ fn worker_day(
     //    to sell sells it and shops next round — the gold in hand is what
     //    `budget.shopping` is computed from, so this is also the only order in
     //    which the purchase can happen at all.
-    if buyer_id == Some(role.id) && !economy::should_sell(turn, state, role, stone_demand) {
+    //
+    //    A role whose dusk commitment has fired does not shop. The shop is the
+    //    farthest errand on the board (its stands are the ones `buyerShopDist`
+    //    measures in the teens), and the round trip is what parked the loose
+    //    role outside the ring for the whole dusk window in the measurement
+    //    behind `dusk_recall_round`. It sells what it carries and goes in.
+    if committed {
+        // fall through: steps 8 and 9 still run, everything below them is
+        // replaced by the lock-in.
+    } else if buyer_id == Some(role.id) && !economy::should_sell(turn, state, role, stone_demand) {
         if !budget.shopping.is_empty() {
             if let Some(cmd) = buyer_flow(turn, role, &budget.shopping, claimed) {
                 plan.push(role.id, cmd);
@@ -787,10 +828,13 @@ fn worker_day(
     // 7b. Personal Medicine: only its carrier can drink it, so this is a
     //     per-role errand, after the team list has had its turn. For a
     //     critically wounded role it is the recovery path, and the walk is
-    //     part of it.
-    if let Some(cmd) = self_provision(turn, role, claimed, true) {
-        plan.push(role.id, cmd);
-        return;
+    //     part of it. Same rule for the committed role: drinking a carried
+    //     Medicine needs no walk (step 1) and is untouched, buying one does.
+    if !committed {
+        if let Some(cmd) = self_provision(turn, role, claimed, true) {
+            plan.push(role.id, cmd);
+            return;
+        }
     }
     // 7c. Cut a door in our own wall line. Everything the economy needs — ore,
     //     the vendor, the shop — is OUTSIDE the ring, and a ring with no door is
@@ -835,6 +879,15 @@ fn worker_day(
             plan.push(role.id, cmd);
             return;
         }
+    }
+    // 9b. The lock-in. Steps 8 and 9 have had their turn — a wall mended and a
+    //     pack sold are both worth a round and both end beside the base — and
+    //     everything from here down (the mine, the last-resort repair, the
+    //     summon order) is an errand that leaves the ring and holds the gate
+    //     open. See `dusk_recall_round` for what that costs.
+    if committed {
+        lock_in_for_dusk(turn, role, claimed, plan);
+        return;
     }
     // 10. Mine the nearest ore (stone first while walls are wanted). Mining
     //    pauses during dusk so the ore we hold is converted to gold instead.
@@ -895,7 +948,12 @@ fn pioneer_day(
     //    This subsumes the older "abort at dusk when a tower would go unmanned"
     //    checkpoint: it fires strictly earlier (the walk home is already
     //    subtracted) and for every pioneer, paired or not.
-    let recalled = turn.in_day_round >= pioneer_recall_round(turn, pioneer);
+    //    Latched (`dusk_committed`): this deadline is measured from where the
+    //    pioneer IS, so re-testing it each round used to let a pioneer that had
+    //    walked one cell closer fall back out of the recall, accept a task, and
+    //    walk straight back out — the same two-cell oscillation §2.4 measured on
+    //    the workers, on the one role whose work is always outside the ring.
+    let recalled = dusk_committed(state, turn, pioneer, pioneer_recall_round(turn, pioneer));
     // A session that has produced nothing at all after `MAX_STERILE_ROUNDS` is
     // not converging, and the pioneer is worth more on the wall line than on a
     // point nothing is coming out of (issue #15's lesson; issue #26 lost the
@@ -1154,12 +1212,88 @@ impl BotState {
 /// — the further out it has drifted, the earlier it has to turn around, and an
 /// errand it cannot finish and still be home by dusk is never started.
 fn pioneer_recall_round(turn: &Turn, pioneer: &Unit) -> i64 {
-    let walk = crate::brain::interior_cells(turn)
-        .iter()
-        .map(|cell| chebyshev(pioneer.pos, *cell))
-        .min()
-        .unwrap_or(0) as i64;
+    let walk = walk_home(turn, pioneer.pos);
     (economy::DUSK_ROUND - 1 - walk - PIONEER_RETREAT_SLACK).max(0)
+}
+
+/// Rounds of walking from `from` to the nearest cell inside the ring.
+fn walk_home(turn: &Turn, from: Pos) -> i64 {
+    crate::brain::interior_cells(turn)
+        .iter()
+        .map(|cell| chebyshev(from, *cell))
+        .min()
+        .unwrap_or(0) as i64
+}
+
+/// Day-round from which a role with NO gun to man must stop working outside the
+/// ring and be inside it.
+///
+/// `preposition_round` covers a controller that has a tower, and the pioneer has
+/// its own recall. A role with neither — the odd one out on a three-role board
+/// with two guns, which is what day 1 always is (see `ring_still_forming`) —
+/// had no deadline at all: `worker_day` falls straight through the pre-position
+/// step, and every step below it (walls, buyer, shop, vendor, mine) is an errand
+/// outside the ring.
+///
+/// Measured on a three-role board with one gun and the ring open: the role with
+/// no gun walked to the weapon shop and issued `buy Medicine` on every single
+/// round from r52 to r70 while `wall_gate_open` named it — the record that
+/// issues #111/#112/#115 carry for the whole dusk window (15/15 open rounds,
+/// base destroyed on night 2). The gate is the last ring cell and it does not
+/// close while any role is outside, so one role's shopping trip is the hole the
+/// night walks through.
+///
+/// The lead is FLAT, not measured from where the role currently is — the one
+/// place this differs from `pioneer_recall_round`. A walk-based deadline reads
+/// tighter but costs the whole afternoon: a worker eighteen cells out at the
+/// far vein is told to stop at in-day 34 and hold for twenty rounds, and the day
+/// then produces neither a coin nor a tower (measured on the
+/// `stone_out_of_reach` board: the purse never moved off its opening 75 and the
+/// gun count stayed at zero). `DUSK_RETREAT_LEAD` is one ordinary walk home plus
+/// slack; a role caught further out than that still arrives inside the dusk
+/// window (rounds 55-69), and arriving at 62 is the seal happening — which is
+/// the thing that was never happening at all.
+fn dusk_recall_round() -> i64 {
+    economy::DUSK_ROUND - DUSK_RETREAT_LEAD
+}
+
+/// Has this role's dusk commitment fired? Latching is the whole point: the
+/// deadline above is measured from where the role IS, so re-testing it every
+/// round lets a role that has walked one cell closer fall back out of the
+/// commitment, take an economy errand, and walk straight back out — the
+/// two-cell oscillation of §2.4. One commitment per role per day; the set is
+/// cleared at day rollover (`BotState::observe`).
+fn dusk_committed(state: &mut BotState, turn: &Turn, role: &Unit, deadline: i64) -> bool {
+    if state.dusk_home.contains(&role.id) {
+        return true;
+    }
+    if turn.in_day_round < deadline {
+        return false;
+    }
+    state.dusk_home.insert(role.id);
+    true
+}
+
+/// Walk `role` inside the ring and hold there — the role's post for the rest of
+/// the day. A no-command round inside is the intended answer, not idleness:
+/// standing on the band `update_wall_gate` measures "everyone is inside" against
+/// is exactly what lets the gate cell be built.
+///
+/// Once committed the role does not leave again. Falling through to the economy
+/// steps when it is already inside is the oscillation: the buyer walks to the
+/// shop, the next round it is outside past its deadline, it walks back in, and
+/// the gate opens and closes on alternate rounds (measured: `wall_gate_open`
+/// naming the same role on every odd round of the window).
+///
+/// The shelter walk keeps `walk_or_remove_wall`'s demolition escape hatch, so a
+/// role the crew walled out still gets in rather than pacing the outside.
+fn lock_in_for_dusk(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) {
+    if let Some(cmd) = retreat_inside(turn, role, claimed) {
+        plan.push(role.id, cmd);
+    }
+    // Inside already, or nowhere walkable to walk: both mean "no more errands
+    // out there". `retreat_inside` has tried to cut a way through our own wall
+    // before giving up, and the night recall keeps the same hatch.
 }
 
 fn loiter_at_task_point(
@@ -1925,21 +2059,34 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
         reserved.extend(tower_stand_cells(turn, tower.pos));
     }
     // Cell occupancy splits in two for the corridor question. A unit standing
-    // somewhere is transient — it will move — but the station and a built
-    // tower are there for good, and only those can strand a corridor cell.
+    // somewhere is transient — it will move — but the station, a built tower
+    // and a wall are there for good, and only those can strand a corridor cell.
     // Reading a teammate's position as permanent is what let the rocket land
     // on the one cell that cut the base interior in half.
+    //
+    // The site choice reads the SAME set, and that is what makes it stable. It
+    // used to test standing room against `occupied` — every unit's footprint,
+    // controllers included — and a site whose only standing cells are the cells
+    // the crew happens to be standing on then flips to the next candidate the
+    // moment the role walks toward it, and back the round after: measured on
+    // the day-1 board, `tower_gaps` alternated between (10,22) and (10,25)
+    // every single round from R35 to R48 while the worker walked (9,23) ↔
+    // (9,24), which is the two-cell oscillation of §2.4 in its purest form —
+    // the site list is a function of the role's position, and the role's
+    // position is a function of the site list. The third gun then stood unbuilt
+    // with 25 gold in the purse and one free cell on the board.
     let mut permanent: HashSet<Pos> = footprint.iter().copied().collect();
     for tower in turn.towers() {
         permanent.insert(tower.pos);
     }
+    permanent.extend(turn.walls().iter().map(|wall| wall.pos));
     let mut gaps: Vec<(Pos, String)> = Vec::new();
     let mut used: HashSet<Pos> = HashSet::new();
     for (have_idx, kind) in build_order {
         if have[have_idx] > 0 {
             continue;
         }
-        let mut taken = occupied.clone();
+        let mut taken = permanent.clone();
         taken.extend(used.iter().copied());
         taken.extend(reserved.iter().copied());
         let mut fixed = permanent.clone();

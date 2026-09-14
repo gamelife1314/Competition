@@ -156,6 +156,7 @@ fn the_collector_still_carries_every_section() {
         "表 4c · 每条沙盒命令",
         "表 5a · 封门",
         "表 6a · 夜间沉默",
+        "表 7 · 对手建造节奏",
     ] {
         assert!(text.contains(marker), "the collector lost its `{marker}` section");
     }
@@ -183,7 +184,7 @@ fn the_row_budget_lives_in_the_script_and_adds_up() {
     let table = caps(&text);
     assert_eq!(
         table.len(),
-        16,
+        17,
         "expected one budget per section, got {table:?}"
     );
     assert!(
@@ -200,14 +201,14 @@ fn the_row_budget_lives_in_the_script_and_adds_up() {
     }
     assert_eq!(
         text.matches("CAPS[\"").count(),
-        16,
+        17,
         "a section is spending a budget that is not in the CAPS table"
     );
 
     let total: usize = table.iter().map(|(_, cap)| cap).sum();
     assert!(
-        total <= 640,
-        "the caps add up to {total} lines, over the 640 the docs promise"
+        total <= 660,
+        "the caps add up to {total} lines, over the 660 the docs promise"
     );
 }
 
