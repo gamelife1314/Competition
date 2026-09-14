@@ -499,3 +499,182 @@ fn the_build_site_does_not_depend_on_where_the_crew_is_standing() {
          gun that is never built"
     );
 }
+
+/// `HARD_SEAL_ROUND` in `brain::day`: the day-round past which the gate is
+/// sealed whether or not the crew is home.
+const HARD_SEAL_IN_DAY: i64 = coregeek::brain::economy::DUSK_ROUND + 11;
+
+/// A complete ring around the station with one role locked outside it.
+fn ring_with_a_role_locked_out() -> Value {
+    let footprint = station_footprint(Pos {
+        x: STATION.0,
+        y: STATION.1,
+    });
+    let mut ours = vec![
+        station(),
+        gatling(10020, 11, 22),
+        role(10002, "worker", 12, 24),
+        role(10004, "pioneer", 10, 23),
+    ];
+    let mut index = 0;
+    for x in -2..WIDTH + 2 {
+        for y in -2..HEIGHT + 2 {
+            let pos = Pos { x, y };
+            if pos.x < 0 || pos.y < 0 || pos.x >= WIDTH || pos.y >= HEIGHT {
+                continue;
+            }
+            if footprint.contains(&pos) || footprint_distance(pos, &footprint) != 2 {
+                continue;
+            }
+            ours.push(wall(20000 + index, pos.x, pos.y));
+            index += 1;
+        }
+    }
+    // Nine cells out on the west side, and the ring is complete: there is no
+    // route home and the night recall can only cut one.
+    ours.push(role(10003, "worker", 1, 24));
+    world(1, ours, Vec::new())
+}
+
+#[test]
+fn the_ring_is_closed_even_when_a_role_never_makes_it_home() {
+    // Issues #121-#125: across five matches the gate never sealed on ANY day
+    // after the first — `wall_gate_open` for 5, 7, 10, 11 and 15 of the fifteen
+    // dusk rounds (#121 day 2, #122 day 2, #124 day 2, #123 day 2, #125 days 1
+    // and 2), the last of those being the whole window. The seal waits for
+    // every role, the day ends, and nothing revisits it: the ring then keeps a
+    // robot-sized hole for the whole night, every night, while `score_3` pays
+    // 10×day for a station that is still standing.
+    let mut day = Day::new(ring_with_a_role_locked_out());
+    let mut sealed_at: Option<i64> = None;
+    while day.round <= DAY_END {
+        let round = day.round;
+        day.step();
+        if day.state.wall_gate_sealed && sealed_at.is_none() {
+            sealed_at = Some(round);
+        }
+    }
+    assert_eq!(
+        sealed_at,
+        Some(HARD_SEAL_IN_DAY + 1),
+        "the gate never took its deadline: a straggler that cannot get home \
+         held the ring open for the whole day, which is the hole the night \
+         walks through"
+    );
+}
+
+#[test]
+fn a_far_role_is_home_before_the_day_ends() {
+    // The measured shape of #122 and #124 day 2: a worker was still nineteen to
+    // twenty cells out when the dusk window opened, walked one cell per round
+    // for the whole of it, and `wall_gate_open` named it on the LAST day round
+    // — the gate sealed a round too late to matter. `dusk_recall_round` was a
+    // flat `DUSK_ROUND - 8`, which is the right lead only for a role one
+    // ordinary walk from home.
+    let far = world(
+        1,
+        vec![
+            station(),
+            gatling(10020, 11, 22),
+            // The odd one out: three roles, one gun, so this worker has no
+            // tower to pre-position at and `preposition_round` never fires.
+            role(10002, "worker", 38, 2),
+            role(10004, "pioneer", 10, 23),
+        ],
+        vec![zone(36, 4, "stone")],
+    );
+    let day = Day::play_day(far);
+    let last = day
+        .outside_on(DAY_END)
+        .into_iter()
+        .filter(|(id, _)| *id == 10002)
+        .collect::<Vec<_>>();
+    assert!(
+        last.is_empty(),
+        "the far worker was still outside the ring on the last day round: \
+         {last:?} — the gate it holds open is the one the night comes through"
+    );
+}
+
+/// The cell `brain::day::wall_gate` designates: `(xmax + 2, ymin - 1)` of the
+/// station footprint.
+fn gate_cell() -> Pos {
+    let footprint = station_footprint(Pos {
+        x: STATION.0,
+        y: STATION.1,
+    });
+    Pos {
+        x: footprint.iter().map(|pos| pos.x).max().unwrap() + 2,
+        y: footprint.iter().map(|pos| pos.y).min().unwrap() - 1,
+    }
+}
+
+#[test]
+fn the_day_two_gate_is_a_door_the_stone_crew_can_close() {
+    // Between the night's seal and the morning's `open_door` there is exactly
+    // one hole in the ring, and on day 2+ it is the designated gate. This is
+    // the day-2 half of the batch's defect: `wall_gate_open` named a straggler
+    // on 5-15 rounds of the dusk window in every one of issues #121-#125, and
+    // the ring kept that hole for the night.
+    //
+    // The property guarded here is the outcome, not one branch of it: at the
+    // first dusk round of day 2, with the crew home and stone in a backpack
+    // beside the gate, the gate cell is built.
+    let gate = gate_cell();
+    let footprint = station_footprint(Pos {
+        x: STATION.0,
+        y: STATION.1,
+    });
+    assert_eq!(
+        footprint_distance(gate, &footprint),
+        2,
+        "test setup: the designated gate must be a ring cell"
+    );
+    let mut ours = vec![
+        station(),
+        gatling(10020, 11, 22),
+        // Inside, with stone, next to the gate.
+        json!({
+            "id": 10002, "pos": {"x": gate.x - 1, "y": gate.y}, "roleType": "worker",
+            "health": 220, "attackPower": 0, "attackRange": 0,
+            "level": 1, "backPackCapability": 100,
+            "backpack": ["stone", "stone", "stone", "stone", "stone", "stone"]
+        }),
+        role(10004, "pioneer", 10, 23),
+    ];
+    let mut index = 0;
+    for x in -2..WIDTH + 2 {
+        for y in -2..HEIGHT + 2 {
+            let pos = Pos { x, y };
+            if pos.x < 0 || pos.y < 0 || pos.x >= WIDTH || pos.y >= HEIGHT {
+                continue;
+            }
+            if footprint.contains(&pos) || footprint_distance(pos, &footprint) != 2 {
+                continue;
+            }
+            if pos == gate {
+                continue; // the hole the branch is supposed to close
+            }
+            ours.push(wall(20000 + index, pos.x, pos.y));
+            index += 1;
+        }
+    }
+    // Day 2, in-day 55: the first round of the dusk window.
+    let turn = turn_from(world(130 + 55, ours, Vec::new()));
+    assert_eq!(turn.day, 2, "test setup: this is the day-2 dusk");
+    assert_eq!(turn.in_day_round, 55);
+    assert!(!turn.walls().iter().any(|unit| unit.pos == gate));
+
+    let mut state = BotState::default();
+    let plan = day_plan(&turn, &mut state);
+    let cmd = plan
+        .commands
+        .get(&10002)
+        .expect("the stone carrier must be given a command at dusk");
+    assert_eq!(
+        (cmd.action.as_str(), cmd.targetPos.clone()),
+        ("build", Some(vec![gate])),
+        "the day-2 dusk left the gate open (got {cmd:?}): the ring keeps a \
+         robot-sized hole for the whole night"
+    );
+}

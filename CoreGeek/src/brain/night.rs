@@ -330,6 +330,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         // single hardest failure to diagnose from the logs (battles pk575060 /
         // pk575098 / pk575557), so each idle tower now carries its own reason.
         let mut idle_reason = "fired";
+        // `(pos, operating cells, adjacent walls of ours)` when the recall
+        // could not move the controller at all — see the `controller_stuck`
+        // branch below for what the three numbers answer.
+        let mut recall_site: Option<(Pos, usize, usize)> = None;
 
         // SURVIVAL OUTRANKS THE POST. A controller that is about to die on its
         // own operating cell (or on the way to it) mans nothing: the gun goes
@@ -364,6 +368,28 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                     plan.push(controller.id, cmd);
                     moved = true;
                 }
+            }
+            // WHY IT COULD NOT MOVE (issues #121-#125). `controller_stuck` is
+            // the second-largest silence reason in the batch after `cooldown`
+            // — 11 rounds for tower 20020 in #125, 10 in #122, 3-4 elsewhere —
+            // and #125 has a controller frozen on the SAME cell (30,13) for all
+            // fifteen rounds of the night, which is a whole gun silent for a
+            // whole night. From the log alone the cause was unreadable: the row
+            // carried the tower, the controller and the reason, and none of the
+            // three things the answer needs. So the failing rounds now carry
+            // where the controller stood, how many operating cells it was
+            // walking to, and whether an adjacent wall of ours was even
+            // available to cut — the three inputs `walk_or_remove_wall`
+            // decides on.
+            if !moved {
+                recall_site = Some((
+                    controller.pos,
+                    stands.len(),
+                    turn.walls()
+                        .into_iter()
+                        .filter(|wall| chebyshev(controller.pos, wall.pos) == 1)
+                        .count(),
+                ));
             }
             // No third fallback onto plain `stand_cells`. The inner cells are
             // the ones behind the wall line, and everything `stand_cells` adds
@@ -435,6 +461,15 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         }
         if idle_reason == "controller_withdrawn" {
             row["hp"] = serde_json::json!(controller.health);
+        }
+        // `stuck`: where the controller is, how many operating cells it was
+        // walking to, and how many of our own walls it could have cut. A zero
+        // in the third slot with a non-zero second says the pocket has no
+        // adjacent wall left to open — the one case `walk_or_remove_wall`
+        // cannot answer, and the one the next batch needs to size before
+        // widening the hatch.
+        if let Some((pos, stands, walls)) = recall_site {
+            row["stuck"] = serde_json::json!([pos.x, pos.y, stands, walls]);
         }
         night_rows.push(row);
     }

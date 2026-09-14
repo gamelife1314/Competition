@@ -62,6 +62,7 @@ CAPS = {
     "night_reasons": 20,   # 聚合式，恒定
     "night_towers": 40,    # 塔数 × 原因数
     "score_attr": 12,      # 一天一行，10 天 + 余量
+    "score_split": 20,     # 一天一行，10 天 + 余量（v17 §14）
     "enemy_build": 12,     # 一天一行，10 天 + 余量
 }
 CAP_TOTAL = sum(CAPS.values())
@@ -426,12 +427,89 @@ def score_rows(records):
     return rows
 
 
+def score_split_rows(records):
+    """我方分数的三块拆解，外加 `score_3` 的「应得」对照（v17 §14）。
+
+    任务书第六章：`总积分 = score_1 + score_2 + score_3`，
+    `score_3 = Σ_{day=1..10} 10 × day × 存活系数`（满 550）。表 0 印的是同一批数据，
+    但列名没说清「击杀分」是**哪一方**的，于是 2026-09-14 那五场（我方 31/34/47/54/152，
+    对手 488/1065/645/203/1151）读了一整批才读出「那一列不是我们的」。
+
+    这一张把三件事一次说清：
+
+      * `scoreAttr.*` 是**我们自己的**字段，原样印出——改名或换算都会再造一个
+        上一批那样的误读；
+      * `生存分应得` = 5 × day × (day + 1)，也就是 Σ 10×d（d = 1..day）：基地当天
+        还活着就该拿到这么多。**这一列与 `scoreAttr.survival` 的差额就是 score_3
+        丢掉的部分**，而它是全场最大的一块（满 550）；
+      * `基地` 两列让我们自己判断「当天还活着」，不用猜。
+
+    `总分` 小于 `scoreAttr.kill` 是**照印不误**的：两者口径不同，把它印出来，矛盾才
+    看得见，而不是被一个"看起来合理"的列名盖住。
+    """
+    rounds = pick(records, "round")
+    if not rounds:
+        return []
+    rows, seen = [], set()
+    for index, rec in enumerate(rounds):
+        block = data(rec)
+        round_no = block.get("round")
+        if not isinstance(round_no, int):
+            continue
+        is_day_end = (index + 1 == len(rounds)) or (
+            isinstance(data(rounds[index + 1]).get("round"), int)
+            and day_of(data(rounds[index + 1]).get("round")) != day_of(round_no)
+        )
+        if not is_day_end or day_of(round_no) in seen:
+            continue
+        seen.add(day_of(round_no))
+        attr = block.get("scoreAttr") or {}
+        day = day_of(round_no)
+        rows.append(tsv([
+            day, round_no, block.get("score"),
+            attr.get("kill"), attr.get("survival"), attr.get("residual"),
+            5 * day * (day + 1), block.get("stationHp"), block.get("enemyStationHp"),
+        ]))
+    return rows
+
+
+def stuck_reason(pair):
+    """`reason`，遇到卡位时把卡点也带上（v17 §15）。
+
+    `controller_stuck` 是这一批夜里第二大的沉默原因（#125 的 20020 卡了 11 回合，
+    #122 卡了 10 回合，而且 #125 有一个角色**整夜 15 回合钉在同一格 (30,13)**——
+    一门炮整晚没开）。旧的行里只有塔号、角色号和 `controller_stuck` 三个字，
+    而 `walk_or_remove_wall` 真正据以决策的三件事（站在哪、要走到哪几个操作格、
+    旁边有没有己方的墙可拆）一件都没写。这一版把这三件事接在原因后面：
+
+        controller_stuck@30,13/4/0
+
+    读法：`@x,y` 是卡住的那一格，第一个数是要走到的操作格数，第二个数是**紧邻**的
+    己方墙数。第二个数为 0 而第一个数不为 0 = 这个死角里已经没有墙可拆了，是
+    `walk_or_remove_wall` 唯一答不上来的情形；要放宽拆墙范围，先看有多少回合是这一格。
+    """
+    reason = jstr(pair.get("reason"))
+    stuck = pair.get("stuck")
+    if not isinstance(stuck, list) or len(stuck) != 4:
+        return reason
+    return "%s@%s,%s/%s/%s" % ((reason,) + tuple(stuck))
+
+
 def build_tables(records, day):
     # ------------------------------------------------------------ 表 0 分数归属
     section(
         "表 0 · 分数归属（每天最后一个回合）　列：第几天 回合 总分 击杀分 survival residual 我方基地 对方基地"
         "（`survival` = 任务书第六章的 score_3，满 550；`residual` = score_1 加归属误差）",
         score_rows(records), CAPS["score_attr"],
+    )
+
+    # ------------------------------------------- 表 8 分数拆解（v17 §14）
+    section(
+        "表 8 · 我方分数三块与生存分应得（每天最后一个回合）　列：第几天 回合 总分 "
+        "scoreAttr.kill scoreAttr.survival scoreAttr.residual 生存分应得 我方基地HP 对方基地HP"
+        "（前三列是 `round.scoreAttr` 的**我方**原值；生存分应得 = Σ10×d，满 550——"
+        "它和 `scoreAttr.survival` 的差额就是 score_3 丢掉的分数）",
+        score_split_rows(records), CAPS["score_split"],
     )
 
     # ------------------------------------------------------------ 表 1 造塔计划
@@ -537,7 +615,10 @@ def build_tables(records, day):
     )
 
     # ---------------------------------------------------------------- 表 5 封门
-    gate = pick(records, "wall_gate_seal", "wall_gate_open")
+    # `wall_gate_forced` (v17) 是"期限到了、没等散兵就封门"那一回合，单独一行事件：
+    # 表 5b 数的是 `wall_gate_open`（"门开着"），不能把它算进去，否则
+    # "最后一天硬封"会被读成"门又开了"。
+    gate = pick(records, "wall_gate_seal", "wall_gate_open", "wall_gate_forced")
     section(
         "表 5a · 封门逐回合　列：回合 第几天 当天第几回合 事件 没归队的 走不回岗位的",
         [tsv([data(r).get("round"), day_of(data(r).get("round") or 0),
@@ -574,8 +655,9 @@ def build_tables(records, day):
                 lambda t: sorted(t)), CAPS["night_reasons"],
     )
     section(
-        "表 6b · 哪座塔在沉默　列：回合数 塔id 原因",
-        counted([tsv([p.get("tower"), p.get("reason")])
+        "表 6b · 哪座塔在沉默　列：回合数 塔id 原因（v17：`controller_stuck` 后面跟 "
+        "`@x,y/N/M` = 卡在哪一格、几个操作格、旁边有几面可拆的己方墙）",
+        counted([tsv([p.get("tower"), stuck_reason(p)])
                  for r in pick(records, "night_debug")
                  for p in data(r).get("pairs") or [] if isinstance(p, dict)],
                 lambda t: sorted(t)), CAPS["night_towers"],

@@ -353,3 +353,32 @@ fn a_multiline_blob_becomes_one_line_of_its_own_text() {
     assert_eq!(headline("", 160), "");
     assert_eq!(headline("   \n\t ", 160), "");
 }
+
+#[test]
+fn a_stuck_recall_reports_where_it_was_and_what_it_could_cut() {
+    // `controller_stuck` is the second-largest night silence reason in issues
+    // #121-#125 (11 rounds for tower 20020 in #125, 10 in #122) and #125 has a
+    // controller frozen on one cell for all fifteen rounds of the night. The
+    // row carried the tower, the controller and the reason — and none of the
+    // three inputs the recall actually decided on, so the cause was unreadable
+    // from the log. The round now carries `stuck: [x, y, 操作格数, 可拆的己方墙数]`.
+    //
+    // Asserted through `prune`, because that is where a diagnostic dies
+    // silently: a zero is kept and an empty list is dropped, so a pocket with
+    // no operating cells and no wall to cut must still print its two zeros
+    // rather than collapsing into "nothing to report".
+    let pruned = prune(json!({
+        "round": 187,
+        "robots": 3,
+        "pairs": [{"tower": 20020, "controller": 20011, "reason": "controller_stuck",
+                   "stuck": [30, 13, 4, 0]}],
+    }));
+    assert_eq!(
+        pruned["pairs"][0]["stuck"],
+        json!([30, 13, 4, 0]),
+        "the stuck site must survive pruning: `[30,13,4,0]` means the pocket has \
+         four operating cells to walk to and no adjacent wall left to cut, which \
+         is a different defect from a controller with a wall it could open"
+    );
+    assert_eq!(pruned["pairs"][0]["reason"], json!("controller_stuck"));
+}

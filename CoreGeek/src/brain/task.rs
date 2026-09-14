@@ -372,8 +372,28 @@ pub fn plan_pioneer(
             // that un-happens because the judger explained itself would submit
             // the shape it already rejected.
             let flip = state.task.rejections > 0;
-            let payload =
-                submittable_answer_shaped(&fields, &state.task.description, &answer, flip);
+            // The judger's named keys first, then the keys the session has
+            // evidence for — a run that printed `TOKEN: …` answers a `$/token`
+            // rejection without another sandbox round (#123).
+            let named = missing_keys_from_feedback(&state.task.rejection_feedback);
+            let mut wanted = named.clone();
+            if let Some(schema) = &state.task.discovered_schema {
+                for field in &schema.required {
+                    if !wanted.iter().any(|old| old.eq_ignore_ascii_case(field)) {
+                        wanted.push(field.clone());
+                    }
+                }
+            }
+            let merged = harvest_answer(&wanted, &state.task.result_history)
+                .map(|harvested| merge_into(&answer, &harvested))
+                .unwrap_or_else(|| answer.clone());
+            let payload = submittable_answer_for_keys(
+                &fields,
+                &state.task.description,
+                &merged,
+                flip,
+                &named,
+            );
             let (logged, chars) = answer_for_log(&payload);
             crate::log::event(
                 "task_answer_submit",
@@ -458,6 +478,14 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     // so the round is spent twice — once on the script that never finished and
     // once on the replan. Nothing in the old prompt mentioned the ceiling.
     prompt.push_str("9. 判题器对每条命令有 **15 秒硬超时**，超时整条命令作废（拿不到任何输出）：脚本必须在 15 秒内跑完并打印结果。因此不要 `sleep`、不要写重试/轮询循环、不要不带 `-maxdepth` 去 `find /`（扫全盘很慢）、不要访问外网地址（沙盒无外网，连接会挂到超时）。\n");
+    // The three shapes that actually killed runs in issues #121-#125, each
+    // measured: 9 `exit_nonzero` in #122 and 8 in #121, `FIELDS:: command not
+    // found` twice, and `/bin/sh^M: bad interpreter` three times across the
+    // batch. None of them is a sandbox fault — every one is a script the model
+    // wrote and the prompt never warned about.
+    prompt.push_str("10. **不要使用 `set -e`**：脚本中途任何一条命令非 0 退出都会让整条命令以非 0 结束、丢掉后面所有的输出。要容错就写 `cmd || true`。\n");
+    prompt.push_str("11. `FIELDS:`、`SCHEMA:`、`ANSWER:` 这三行**必须用 `echo` 打印**（例如 `echo \"FIELDS: $F\"`）。直接写成裸行会被 shell 当成命令，报 `FIELDS:: command not found` 并让整条命令失败——上一批有 4 个 session 就是这么丢掉答案的。\n");
+    prompt.push_str("12. 任务文件自带的检查脚本（如 `ws_1/check`）可能是 Windows 换行，直接 `./check` 会报 `bad interpreter: /bin/sh^M`。**先 `sed -i 's/\\r$//' <脚本>` 再用 `bash <脚本>` 运行**，不要因为这一步失败就放弃答案：答案往往就在这个脚本的输出里（例如它打印的 `TOKEN: …`）。\n");
     if !state.task.discovered_fields.is_empty() {
         prompt.push_str(&format!(
             "\n已从任务文件确认的输出字段：{}。ANSWER 的 JSON 必须恰好包含这些字段，不多不少。\n",
@@ -870,8 +898,71 @@ pub fn submittable_answer_shaped(
     answer: &str,
     flip: bool,
 ) -> String {
+    submittable_answer_for_keys(fields, description, answer, flip, &[])
+}
+
+/// [`submittable_answer_shaped`] plus the keys the JUDGER itself named as
+/// missing.
+///
+/// Issues #121-#125 carry the verdict verbatim: `键值比对不通过: $/token: 缺少键`
+/// (#123 session 1, twice) and `键值比对不通过: $: 值不符` (#122 session 6,
+/// #124 session 3). Both sessions then re-submitted the same bytes — the
+/// retry loop only ever swapped a one-key OBJECT for its scalar, and a scalar
+/// answer took the early return above, so the other shape was never tried.
+/// Measured cost: three submissions each and a whole task scored zero with the
+/// sandbox having already printed the right value.
+///
+/// Two additions:
+///   * a key the judger named outranks every guess about shape — the value is
+///     moved under exactly that key, spelled exactly as the judger spelled it;
+///   * once a rejection has landed, a bare scalar with one known field is
+///     wrapped instead of resubmitted. That is the direction that was missing,
+///     and issue #125's session 3 is the proof it wins: `SCHEMA:
+///     {"token":"string"}` was echoed, the bare value was rejected once, and
+///     the 25-character `{"token": "…"}` submitted by the retry was
+///     `confirmed_success`.
+pub fn submittable_answer_for_keys(
+    fields: &[String],
+    description: &str,
+    answer: &str,
+    flip: bool,
+    missing_keys: &[String],
+) -> String {
+    // A key the judger named comes first: it is the only statement about the
+    // expected shape that comes from the judging authority rather than from our
+    // own reading of the task text.
+    for key in missing_keys {
+        if let Some(value) = value_for_named_key(answer, key) {
+            // RE-KEY, do not duplicate. The value moves under the key the
+            // judger named and the label we invented is dropped: a value kept
+            // under both names is wrong under one of them by construction, and
+            // an invented key is the `schema_extras` defect the prompt already
+            // warns against.
+            let mut map = serde_json::Map::new();
+            map.insert(key.clone(), value);
+            if let Ok(text) = serde_json::to_string(&serde_json::Value::Object(map)) {
+                return text;
+            }
+        }
+    }
     if fields.len() >= 2 {
         return answer.to_string();
+    }
+    // The inverse direction (issues #121-#125). The object arm below can only
+    // ever DROP a wrapper; a scalar therefore had exactly one shape to offer and
+    // the retry spent its rounds resubmitting it. A declared or echoed
+    // single-field schema says the answer is that field's value, so once the
+    // scalar has been rejected the wrapper is the other shape to try.
+    if flip && fields.len() == 1 {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(answer) {
+            if !value.is_object() && !value.is_array() {
+                let mut map = serde_json::Map::new();
+                map.insert(fields[0].clone(), value);
+                if let Ok(text) = serde_json::to_string(&serde_json::Value::Object(map)) {
+                    return text;
+                }
+            }
+        }
     }
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(answer)
     else {
@@ -895,6 +986,120 @@ pub fn submittable_answer_shaped(
         return answer.to_string(); // `flip` reached the other shape: keep this one
     }
     bare_scalar(value).unwrap_or_else(|| answer.to_string())
+}
+
+/// The value to file under a key the judger named, taken from the answer we
+/// already have. `None` when the answer cannot supply one: a multi-key object
+/// says nothing about which of its values belongs under the judger's key, and
+/// guessing there would replace a wrong answer with a different wrong answer.
+fn value_for_named_key(answer: &str, key: &str) -> Option<serde_json::Value> {
+    let value = serde_json::from_str::<serde_json::Value>(answer).ok()?;
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.len() != 1 || map.contains_key(key) {
+                return None;
+            }
+            map.into_iter().next().map(|(_, value)| value)
+        }
+        other if !other.is_array() && !other.is_null() => Some(other),
+        _ => None,
+    }
+}
+
+/// Every key the judger has named as missing, oldest verdict first.
+///
+/// The rejection text is the judging authority's own statement about the shape
+/// it wanted — `键值比对不通过: $/token: 缺少键` names `token` — and it is the one
+/// input that no amount of re-reading the task text can substitute for.
+pub fn missing_keys_from_feedback(feedback: &[String]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for text in feedback {
+        if let Some(key) = missing_key_in(text) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys.truncate(4);
+    keys
+}
+
+/// The JSON pointer segment named by a "missing key" verdict, e.g.
+/// `键值比对不通过: $/token: 缺少键` -> `token`.
+///
+/// Deliberately narrow: the text must say something was MISSING (`缺少键`,
+/// `MissingNamedInput`) and must carry an explicit `$/…` pointer, so a value
+/// mismatch (`$/world_heritage_count: 数值不符` — the field was there and
+/// wrong) never relabels the answer. Re-keying on a value mismatch is how a
+/// correct field gets destroyed by a retry.
+pub fn missing_key_in(text: &str) -> Option<String> {
+    let missing = text.contains("缺少键")
+        || text.contains("MissingNamedInput")
+        || text.contains("missing key");
+    if !missing {
+        return None;
+    }
+    // The two shapes the judger uses: a JSON pointer before the verdict
+    // (`键值比对不通过: $/token: 缺少键`) and the key named after it
+    // (`MissingNamedInput: city`).
+    if let Some(start) = text.find("$/") {
+        let rest = &text[start + 2..];
+        let end = rest
+            .find(|c: char| c == ':' || c == '：' || c.is_whitespace() || c == '，' || c == ',')
+            .unwrap_or(rest.len());
+        return clean_key(rest[..end].rsplit('/').find(|part| !part.is_empty())?);
+    }
+    let after = ["MissingNamedInput", "missing key", "缺少键"]
+        .iter()
+        .filter_map(|marker| text.find(marker).map(|at| at + marker.len()))
+        .min()?;
+    let rest = text[after..].trim_start_matches(|c: char| {
+        c == ':' || c == '：' || c == ' ' || c == '\t' || c == '$' || c == '/' || c == '"'
+    });
+    let end = rest
+        .find(|c: char| c == ':' || c == '：' || c.is_whitespace() || c == ',' || c == '，' || c == '"')
+        .unwrap_or(rest.len());
+    clean_key(&rest[..end])
+}
+
+fn clean_key(key: &str) -> Option<String> {
+    let key = key.trim().trim_matches(|c: char| c == '"' || c == '\'' || c == '`');
+    if key.is_empty() || key.chars().count() > 64 {
+        return None;
+    }
+    Some(key.to_string())
+}
+
+/// `answer` with every key of `harvested` it does not already carry.
+///
+/// Keys already present are left exactly as the model wrote them — a harvested
+/// value never overwrites the session's own answer, it only fills a hole the
+/// judger has already complained about. A scalar `answer` has no holes to fill
+/// and is replaced outright, because the harvested object is the only shape
+/// that can carry the named key at all.
+pub fn merge_into(answer: &str, harvested: &str) -> String {
+    let Ok(serde_json::Value::Object(extra)) = serde_json::from_str::<serde_json::Value>(harvested)
+    else {
+        return answer.to_string();
+    };
+    match serde_json::from_str::<serde_json::Value>(answer) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            let mut changed = false;
+            for (key, value) in extra {
+                if !map.keys().any(|old| old.eq_ignore_ascii_case(&key)) {
+                    map.insert(key, value);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return answer.to_string();
+            }
+            serde_json::to_string(&serde_json::Value::Object(map))
+                .unwrap_or_else(|_| answer.to_string())
+        }
+        Ok(_) => harvested.to_string(),
+        Err(_) => harvested.to_string(),
+    }
 }
 
 /// A scalar rendered bare, or None when the value is structured/empty.
@@ -1248,8 +1453,182 @@ pub fn partial_answer(state: &BotState) -> Option<String> {
     {
         answers.push(state.task.best_answer.clone());
     }
-    let best = answers.last()?.clone();
-    Some(merge_json_fields(&answers).unwrap_or(best))
+    // NO `ANSWER:` LINE, BUT THE VALUE IS IN THE OUTPUT (issues #121-#125).
+    //
+    // Every one of these five matches ran 5-7 sessions and submitted almost
+    // nothing: #121 submitted zero answers across seven sessions, #122 found
+    // one, #124 three. The sandbox output they discarded `ANSWER:`-less is not
+    // a file listing — #123's round-18 run printed
+    // `[ OK ] 全部通过 (6/6) TOKEN: fc1e78eb2a5a`, which is the exact value
+    // issue #125's one successful session submitted as `{"token": "…"}`. The
+    // model's script answered; it simply labelled the line.
+    //
+    // Only keys the session has EVIDENCE for are read: a field the task file
+    // declared, a field a script echoed, or a key the judger itself named. That
+    // is what keeps this clear of the red line — this is the task's own value
+    // under the task's own field name, never a stray line of exploratory
+    // output dressed as an answer.
+    let harvested = harvest_answer(&harvest_keys(state), &state.task.result_history);
+    match answers.last() {
+        Some(best) => {
+            let merged = merge_json_fields(&answers);
+            Some(merged.or(harvested).unwrap_or_else(|| best.clone()))
+        }
+        None => harvested,
+    }
+}
+
+/// Keys a run's raw output may carry an answer under, strongest evidence first:
+/// the declared schema, the echoed field list, fields named in the description,
+/// and — because #123's winning key came from nowhere else — every key the
+/// judger named as missing.
+pub fn harvest_keys(state: &BotState) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    let push = |key: &str, keys: &mut Vec<String>| {
+        let key = key.trim();
+        if key.is_empty() || key.chars().count() > 32 {
+            return;
+        }
+        if !keys.iter().any(|old| old.eq_ignore_ascii_case(key)) {
+            keys.push(key.to_string());
+        }
+    };
+    if let Some(schema) = &state.task.discovered_schema {
+        for field in schema.required.iter().chain(schema.fields.iter()) {
+            push(field, &mut keys);
+        }
+    }
+    for field in &state.task.discovered_fields {
+        push(field, &mut keys);
+    }
+    for field in &expected_fields(&state.task.description) {
+        push(field, &mut keys);
+    }
+    for key in missing_keys_from_feedback(&state.task.rejection_feedback) {
+        push(&key, &mut keys);
+    }
+    keys.truncate(8);
+    keys
+}
+
+/// Pull a `<key>: <value>` pair for each of `keys` out of raw sandbox output.
+///
+/// Returns a JSON object, or `None` when the output carries none of the keys.
+/// The value is read as JSON when it parses as a JSON scalar (`15` stays a
+/// number) and as a string otherwise (`fc1e78eb2a5a`).
+pub fn harvest_answer(keys: &[String], outputs: &[String]) -> Option<String> {
+    let mut map = serde_json::Map::new();
+    for key in keys {
+        for output in outputs.iter().rev() {
+            if let Some(value) = value_for_key(strip_status_line(output), key) {
+                map.insert(key.clone(), value);
+                break;
+            }
+        }
+    }
+    if map.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&serde_json::Value::Object(map)).ok()
+}
+
+/// The value on a `key: value` (or `"key": value`) line, when the line is one.
+///
+/// The key must sit on a word boundary and be followed by a separator, so
+/// `FIELDS: port, name` yields nothing for `port` and a JSON line
+/// (`{"token": "x"}`) is left to `extract_answer`, which already understands
+/// it. Sentinels and container fragments are refused: a harvested value has to
+/// be a real scalar or it is the exploratory output the red line forbids.
+fn value_for_key(output: &str, key: &str) -> Option<serde_json::Value> {
+    let key_bytes = key.as_bytes();
+    if key_bytes.is_empty() {
+        return None;
+    }
+    for line in output.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Scanned on BYTE offsets into `line` itself, not into a lowercased
+        // copy: `str::to_lowercase` can change a string's byte length
+        // (`İ` → `i̇`), so an offset found in the copy is not an offset into the
+        // line, and `line[..at]` would then be a slice that panics on a
+        // char boundary — inside a match, in the round a task is being
+        // answered. `eq_ignore_ascii_case` gives the case-insensitivity the
+        // field names need without ever building the copy.
+        let bytes = line.as_bytes();
+        let mut at = 0usize;
+        while at + key_bytes.len() <= bytes.len() {
+            let hit = bytes[at..at + key_bytes.len()].eq_ignore_ascii_case(key_bytes)
+                && line.is_char_boundary(at)
+                && line.is_char_boundary(at + key_bytes.len());
+            if !hit {
+                at += 1;
+                continue;
+            }
+            let after = at + key_bytes.len();
+            at = after;
+            let before_ok = at == key_bytes.len()
+                || !line[..at - key_bytes.len()]
+                    .chars()
+                    .next_back()
+                    .map_or(false, |c| c.is_alphanumeric() || c == '_');
+            if !before_ok {
+                continue;
+            }
+            let rest = line[after..].trim_start();
+            let rest = rest
+                .strip_prefix('"')
+                .or_else(|| rest.strip_prefix('\''))
+                .unwrap_or(rest)
+                .trim_start();
+            let Some(rest) = rest
+                .strip_prefix(':')
+                .or_else(|| rest.strip_prefix('：'))
+                .or_else(|| rest.strip_prefix('='))
+            else {
+                continue;
+            };
+            let value = rest
+                .trim()
+                .trim_end_matches(|c: char| c == ',' || c == ';' || c == '，' || c == '；')
+                .trim()
+                .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+                .trim();
+            if value.is_empty()
+                || value.chars().count() > 200
+                || value.contains('{')
+                || value.contains('}')
+                || value.contains('[')
+                || value.contains(']')
+                || value.contains('\n')
+                || is_failure_answer(value)
+                || is_marker_word(value)
+            {
+                continue;
+            }
+            // The value must be a value, not the rest of a sentence: `key:`
+            // followed by a whole clause is the task file's own prose, which is
+            // the same defect `is_failure_answer` guards the `ANSWER:` marker
+            // against.
+            if value.split_whitespace().count() > 4 {
+                continue;
+            }
+            return Some(match serde_json::from_str::<serde_json::Value>(value) {
+                Ok(parsed) if !parsed.is_object() && !parsed.is_array() => parsed,
+                _ => serde_json::Value::String(value.to_string()),
+            });
+        }
+    }
+    None
+}
+
+/// Words that are a marker, never a value.
+fn is_marker_word(text: &str) -> bool {
+    matches!(
+        text.trim().to_lowercase().as_str(),
+        "fields" | "schema" | "answer" | "token_pending"
+    )
 }
 
 /// Union of the fields of every JSON object among `answers` (later runs win on

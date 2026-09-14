@@ -121,6 +121,25 @@ const SECOND_LAYER_GATE_CLEARANCE: i32 = 2;
 /// close the last hole in the ring. Long enough for a round trip from any
 /// tower post, short enough that the gun is manned again well before night.
 const SEAL_GRACE: i64 = 8;
+/// The day-round past which the gate is sealed whether or not the crew is home.
+///
+/// `SEAL_GRACE` is the window the seal is *allowed* to spend; this is the point
+/// at which it stops being allowed to spend more. Across issues #121-#125 the
+/// gate never sealed on any day after the first in ANY of the five matches —
+/// `wall_gate_open` for 5, 7, 10, 11 and 15 of the fifteen dusk rounds, the
+/// last of those being the whole window, i.e. the ring kept a robot-sized hole
+/// every night of the match. The cause is that the seal waits for every role,
+/// and a role fourteen to twenty cells out at dusk cannot arrive in time; the
+/// wait then outlives the day, and the night planner never revisits the flag,
+/// so the hole is permanent.
+///
+/// A straggler left outside is recoverable — the night recall's
+/// `walk_or_remove_wall` hatch cuts back through our own ring — while an open
+/// ring is not: the wall is the only thing between the waves and the station,
+/// and `score_3` is 10×day for every day the station stands (550 over ten).
+/// Sealing with three day-rounds to spare is also what leaves the stone carrier
+/// time to actually place the gate cell.
+const HARD_SEAL_ROUND: i64 = economy::DUSK_ROUND + 11;
 /// Slack on top of the walk home before the pioneer's dusk recall fires, for a
 /// blocked cell or a detour. Mirrors the three rounds `preposition_round` keeps.
 const PIONEER_RETREAT_SLACK: i64 = 2;
@@ -495,10 +514,10 @@ fn worker_day(
     if state.wall_gate_sealed && role.count_item(STONE) > 0 {
         let mut gaps = wall_gaps.to_vec();
         gaps.sort_by_key(|site| chebyshev(role.pos, *site));
-        if let Some(site) = gaps
-            .into_iter()
-            .find(|site| !wall_would_trap(turn, pairs, state, *site))
-        {
+        if let Some(site) = gaps.into_iter().find(|site| {
+            !wall_would_trap(turn, pairs, state, *site)
+                || turn.in_day_round >= HARD_SEAL_ROUND
+        }) {
             let gate = wall_gate(turn) == Some(site);
             if chebyshev(role.pos, site) == 1 {
                 state.walls_built_today = state.walls_built_today.saturating_add(1);
@@ -514,7 +533,13 @@ fn worker_day(
                 plan.push(role.id, RoleCommand::build(site, "wall"));
                 return;
             }
-            if turn.in_day_round < economy::DUSK_ROUND + SEAL_GRACE {
+            // The seal cell may be walked to until the day ends, not only until
+            // `SEAL_GRACE`. The grace bounds the ordinary wall sweep, which has
+            // the whole afternoon; this step only ever runs once the flag is up,
+            // and across issues #121-#125 that was late or never. Three of the
+            // five matches had a stone carrier on the wrong side of a sealed
+            // gate when the day ran out.
+            if turn.in_day_round < crate::model::DAY_ROUNDS {
                 if let Some(cmd) = build_or_walk(turn, role, site, "wall", claimed) {
                     claimed.insert(site);
                     plan.push(role.id, cmd);
@@ -534,8 +559,27 @@ fn worker_day(
         && turn.in_day_round >= economy::DUSK_ROUND
         && turn.in_day_round < crate::model::DAY_ROUNDS
     {
+        // THE DESIGNATED GATE IS A DOOR TOO (issues #121-#125).
+        //
+        // This step only ever saw `door_cells`, and on day 2+ that set is
+        // usually EMPTY: `open_door` returns early when the role can already
+        // reach the outside, which it can — through the gate the previous
+        // night's seal built and the morning `open_door`/rebuild left open. So
+        // the one hole the ring actually has was the one cell this step never
+        // offered, and it stayed open all night in every match of the batch.
+        // Step 3 covers it only once `wall_gate_sealed` is set, which is
+        // exactly the flag a straggler keeps down.
         let mut doors: Vec<Pos> = state.door_cells.iter().copied().collect();
+        if let Some(gate) = wall_gate(turn) {
+            if !doors.contains(&gate) {
+                doors.push(gate);
+            }
+        }
         doors.sort_by_key(|site| chebyshev(role.pos, *site));
+        // Past the hard deadline the ring outranks the straggler: a role walled
+        // out can cut its way back in (the night recall's demolition hatch),
+        // while an open ring cannot be closed again before morning.
+        let forced = turn.in_day_round >= HARD_SEAL_ROUND;
         if let Some(site) = doors.into_iter().find(|site| {
             turn.is_land(*site)
                 && !claimed.contains(site)
@@ -543,7 +587,7 @@ fn worker_day(
                 // already sealed it this round, `door_cells` still lists it —
                 // never wall a cell that already has our wall in it.
                 && !turn.walls().iter().any(|wall| wall.pos == *site)
-                && !wall_would_trap(turn, pairs, state, *site)
+                && (forced || !wall_would_trap(turn, pairs, state, *site))
         }) {
             claimed.insert(site);
             if chebyshev(role.pos, site) == 1 {
@@ -791,7 +835,7 @@ fn worker_day(
     //     Gunners are excluded: step 4 (`preposition_round`) already locks them
     //     and repeating it here would only shadow a deadline that works.
     let committed = !pairs.iter().any(|(controller, _)| *controller == role.id)
-        && dusk_committed(state, turn, role, dusk_recall_round());
+        && dusk_committed(state, turn, role, dusk_recall_round(turn, role));
     // 7. Shopping (dedicated buyer) — upgrades come after survival. When
     //    nothing is affordable YET the buyer still sets off once the ore in its
     //    pack covers the price, so the purchase lands the round the sale does.
@@ -1253,8 +1297,21 @@ fn walk_home(turn: &Turn, from: Pos) -> i64 {
 /// slack; a role caught further out than that still arrives inside the dusk
 /// window (rounds 55-69), and arriving at 62 is the seal happening — which is
 /// the thing that was never happening at all.
-fn dusk_recall_round() -> i64 {
-    economy::DUSK_ROUND - DUSK_RETREAT_LEAD
+fn dusk_recall_round(turn: &Turn, role: &Unit) -> i64 {
+    let flat = economy::DUSK_ROUND - DUSK_RETREAT_LEAD;
+    // ...except that a FLAT lead is only ever right for a role that is one
+    // ordinary walk from home, and issues #121-#125 show the other case is the
+    // common one. In #122 and #124 a worker was still fourteen-plus cells out
+    // when the dusk window opened and walked one cell per round for the whole
+    // of it — `wall_gate_open` named it from day-round 56 to 70, the last day
+    // round, and the gate never sealed. The lead is still flat for everyone it
+    // fits; the floor below only moves the roles it demonstrably does not fit,
+    // and it moves them just far enough to arrive INSIDE the window rather than
+    // after it. Anchoring on `DUSK_ROUND + SEAL_GRACE` and not on `DUSK_ROUND`
+    // is what keeps the afternoon: an eighteen-cell role turns around at
+    // day-round 45, not at 34.
+    let walked = economy::DUSK_ROUND + SEAL_GRACE - walk_home(turn, role.pos);
+    flat.min(walked)
 }
 
 /// Has this role's dusk commitment fired? Latching is the whole point: the
@@ -2197,16 +2254,40 @@ fn update_wall_gate(turn: &Turn, state: &mut BotState, pairs: &[(i64, i64)]) {
         return;
     };
     let footprint = station.footprint();
-    match gate_open_record(turn, pairs, &footprint) {
-        None => {
-            state.wall_gate_sealed = true;
-            crate::log::event(
-                "wall_gate_seal",
-                serde_json::json!({"round": turn.round_no, "dayRound": turn.in_day_round}),
-            );
+    let open = gate_open_record(turn, pairs, &footprint);
+    if let Some(record) = &open {
+        // THE HARD DEADLINE. Up to [`HARD_SEAL_ROUND`] a straggler still holds
+        // the ring open, which is the whole point of waiting — the crew walks
+        // in and the seal costs nobody. Past it the trade inverts: the day has
+        // three rounds left, the night planner never revisits this flag, and a
+        // ring that is still open at nightfall stays open for the night. See
+        // [`HARD_SEAL_ROUND`] for the measurement across issues #121-#125.
+        if turn.in_day_round < HARD_SEAL_ROUND {
+            crate::log::event("wall_gate_open", record.clone());
+            return;
         }
-        Some(record) => crate::log::event("wall_gate_open", record),
+        // Who the deadline overrode, in the same two lists `wall_gate_open`
+        // carries, so the next batch can tell "the seal was late" from "the
+        // seal was forced" without re-deriving it from the positions.
+        crate::log::event(
+            "wall_gate_forced",
+            serde_json::json!({
+                "round": turn.round_no,
+                "dayRound": turn.in_day_round,
+                "away": record["away"].clone(),
+                "stuck": record["stuck"].clone(),
+            }),
+        );
     }
+    state.wall_gate_sealed = true;
+    crate::log::event(
+        "wall_gate_seal",
+        serde_json::json!({
+            "round": turn.round_no,
+            "dayRound": turn.in_day_round,
+            "reason": if open.is_some() { "deadline" } else { "all_home" },
+        }),
+    );
 }
 
 /// The `wall_gate_open` record — who the dusk seal is still waiting on, or
