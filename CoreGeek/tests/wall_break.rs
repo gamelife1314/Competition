@@ -349,9 +349,13 @@ fn a_killable_station_still_outranks_the_breach() {
 }
 
 #[test]
-fn the_breach_waits_while_a_hunter_is_uncovered() {
-    // Issue #7's "有余力时": the robot coming for us is 18 cells from the only
-    // gun, so there is no firepower to spare and nothing is fired at all.
+fn the_breach_waits_but_the_station_does_not() {
+    // The robot coming for us is 18 cells from the only gun, so there is no
+    // firepower to spare — the breach gate still holds (issue #7's "有余力时"
+    // applies to the breach tactic specifically). But offense-first
+    // (issues #201-#205) means the rocket fires at their station instead of
+    // sitting idle: the tower was going to do nothing anyway, and 20 damage
+    // on the enemy station is permanent progress toward the win condition.
     let mut robots = marching_on_them();
     robots.push(robot(30002, 2, 2, 40, "challenger"));
     let turn = breach_board(robots, 900, 40);
@@ -360,7 +364,12 @@ fn the_breach_waits_while_a_hunter_is_uncovered() {
     assert!(!wall_breach(&turn, tower, &init_sim(&turn)));
 
     let mut sim = init_sim(&turn);
-    assert_eq!(choose_attack(&turn, tower, &mut sim), None);
+    let targets = choose_attack(&turn, tower, &mut sim).expect("the rocket fires at the enemy station");
+    let footprint = station_footprint(Pos { x: 24, y: 20 });
+    assert!(
+        targets.iter().all(|cell| footprint.contains(cell)),
+        "expected the enemy station footprint {footprint:?}, got {targets:?}"
+    );
 }
 
 #[test]

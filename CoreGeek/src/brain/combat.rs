@@ -446,12 +446,11 @@ pub fn choose_attack_kind_with(
             return Some((targets, TargetKind::Robots));
         }
     }
-    // Fallback: opportunistic shots at the opponent's assets. Issue #7 allows
-    // this only "有余力时" — while nothing that hunts us is walking in
-    // unopposed (see `spare_firepower`).
-    if !spare_firepower(turn) {
-        return None;
-    }
+    // Fallback: fire at the opponent's assets. The tower has no NPC robot in
+    // range (robot targeting returned empty above), so firing at enemy units
+    // for kill points does not split our defense — this tower was going to
+    // sit idle anyway. Offense-first: every idle volley into the enemy is
+    // permanent progress toward the win condition (issues #201-#205).
     let targets = choose_enemy_targets_with(policy, turn, tower, projectiles, sim);
     targets.map(|targets| {
         sim.fired.insert(tower.id);

@@ -355,10 +355,11 @@ fn an_enemy_building_destroyed_by_one_tower_is_not_shot_by_the_next() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn an_idle_weapon_holds_fire_while_a_hunter_is_out_of_every_towers_reach() {
+fn an_idle_weapon_fires_at_the_enemy_when_no_robot_is_in_range() {
     // The only gun is a level-1 gatling (range 3); the robot coming for us is
-    // ten cells away and nothing can touch it. Plinking the enemy now would be
-    // spending the night's attention elsewhere, so the gun holds.
+    // ten cells away and nothing can touch it. The tower was going to sit idle
+    // anyway, so offense-first (issues #201-#205) sends the volley into the
+    // enemy gatling two cells away — kill points are permanent progress.
     let turn = world(
         vec![gatling(10020, 10, 10, 1)],
         vec![enemy(20020, "gatling", 12, 10, 1000)],
@@ -367,7 +368,10 @@ fn an_idle_weapon_holds_fire_while_a_hunter_is_out_of_every_towers_reach() {
     assert!(!spare_firepower(&turn));
     let tower = turn.role_by_id(10020).unwrap();
     let mut sim = init_sim(&turn);
-    assert_eq!(choose_attack(&turn, tower, &mut sim), None);
+    assert_eq!(
+        choose_attack(&turn, tower, &mut sim).unwrap(),
+        vec![Pos { x: 12, y: 10 }]
+    );
 }
 
 #[test]

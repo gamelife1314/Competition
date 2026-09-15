@@ -539,9 +539,18 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     );
     prompt.push_str("2. 执行顺序固定为【侦察→作答】两段：先用 find/ls 定位并 cat 任务文件与相关文档（如 API_DOCS.md），确认接口地址、认证方式、输入数据、以及任务【要求输出的字段名】；再计算答案。侦察结论必须用一行 `FIELDS: 字段1,字段2` 打印出来（字段名以任务文件原文为准；单值答案打印 `FIELDS: value`）。即使本轮还算不出答案，也要先把已确认的字段通过 FIELDS 行打印出来——下一轮会带着它继续。若任务文件里写明了输出结构（JSON Schema，或「输出字段：名字+类型」这类格式），再打印一行 `SCHEMA: <原文 JSON>`——把文件里那段结构原样贴成一行 JSON（例如 `SCHEMA: {\"token\":\"string\",\"count\":\"integer\"}`，或 `SCHEMA: {\"properties\":{...},\"required\":[...]}`）。判分只按这个结构逐字段比对，所以这一行比任何推断都权威。\n");
     prompt.push_str("3. 脚本最后一行必须打印 `ANSWER: <最终答案>`，多字段答案用 JSON 表示，且 JSON 的字段名必须与 FIELDS 行完全一致。\n");
+    prompt.push_str("3a. Python 脚本中处理中文参数（如城市名「北京」）时，HTTP 请求必须用 `urllib.parse.quote` 编码 URL 参数，不要直接把中文字符拼进 URL——会报 `ascii codec can't encode` 错误：\n");
+    prompt.push_str("```python\nfrom urllib.parse import quote\nurl = f\"http://localhost:8899/api/v1/heritage/search?city={quote('北京')}&page=1\"\n```\n");
     prompt.push_str("4. 脚本要可复用：把可变参数（如城市名、文件名、数量）写成 `{{参数名}}` 占位符，参数名必须与任务描述里出现的字段名完全一致（例如描述里的“城市名”就用 `{{城市名}}`），脚本中不要写死具体取值；同一类任务下次会复用这段脚本并按新描述自动填参。\n");
     prompt.push_str("5. 尽量在一个脚本内完成全部步骤（find 找文件 → cat 读取 → 计算 → 打印 FIELDS 与 ANSWER），不要分多轮试探；只有带 `ANSWER:` 标记的输出才会被当作答案提交。\n");
     prompt.push_str("6. `ANSWER:` 后面必须是真实结果（数字/字符串/JSON）。找不到文件或算不出来时，**不要**打印 ANSWER 行，也不要用 `xxx`、`failed_to_extract`、`TODO`、`unknown`、`N/A` 之类的占位符占位——那会被判错并浪费一整轮；直接把报错信息打印到 stderr 即可，脚本会带着错误重试。\n");
+    prompt.push_str("6a. 正确格式示例：\n");
+    prompt.push_str("```\necho \"FIELDS: city, total_count, world_heritage_count\"\necho \"SCHEMA: {\\\"city\\\":\\\"string\\\",\\\"total_count\\\":\\\"integer\\\",\\\"world_heritage_count\\\":\\\"integer\\\"}\"\necho \"ANSWER: {\\\"city\\\":\\\"北京\\\",\\\"total_count\\\":15,\\\"world_heritage_count\\\":7}\"\n```\n");
+    prompt.push_str("错误格式（绝对禁止）：\n");
+    prompt.push_str("- `ANSWER: {\"city\":\"北京\",\"total_count\":\"<总记录条数>\"}` — 占位符不是真实值\n");
+    prompt.push_str("- `ANSWER: {\"city\":\"北京\",\"total_count\":0,\"status\":\"ok\"}` — 多了 status 字段\n");
+    prompt.push_str("- `ANSWER: {\"city\":\"北京\"}` — 缺少 total_count, world_heritage_count\n");
+    prompt.push_str("- 脚本运行成功但没有 `echo \"ANSWER: ...\"` 行 — 等于 0 分\n");
     prompt.push_str("7. `ANSWER:` 后面**只放任务要的那个值**：是数字就只放数字（不要带单位、不要加解释），是 Markdown 标题、表格或说明文字都不算答案。多字段答案只写任务文件里点名的字段，不要自行增加 `status`、`note`、`task_id` 这类字段——判分按要求的字段逐个比对，多写一个字段会被判错。\n");
     prompt.push_str("8. 打印 ANSWER 前先自检一次：确认这个值确实由脚本从任务数据里算出来（而不是照着题面猜的或照抄示例），位数/单位/大小写与任务要求一致。\n");
     // 接口文档 §executeCmd: "判题器会在本回合执行，执行时长不得超过15秒，否则
@@ -660,6 +669,11 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
             "请严格按判题器原话修正：它点名缺哪个键就补哪个键（键名逐字照抄），说哪个键的值不符就只重算那一个值。判题器没有提到的字段一律保持原样，不要顺手增删。\n",
         );
     }
+    // 提交前自检清单（3 项最高频失败模式的直接对应）
+    prompt.push_str("\n提交前 3 项自检（任一不通过就不要打印 ANSWER，修正后再打印）：\n");
+    prompt.push_str("1. 脚本最后一行是否是 `echo \"ANSWER: ...\"`？没有 ANSWER 行 = 0 分。\n");
+    prompt.push_str("2. ANSWER 的值里有没有 `<...>` 占位符或中文描述（如「总记录条数」）？有 = 0 分。\n");
+    prompt.push_str("3. JSON 字段是否与 FIELDS 行完全一致？多一个或少一个都 = 0 分。\n");
     prompt
 }
 
