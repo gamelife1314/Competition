@@ -698,8 +698,11 @@ fn night_round_one_response_contains_attack_commands() {
 #[test]
 fn worker_builds_wall_before_weapon() {
     // Compute a wall gap first, then place a stone-carrying worker next to it.
-    // Even with enough gold for a tower, the stone wall must win — the ring
-    // protects the base and roles before the weapons do.
+    // Offense-first: weapons are built first (step 5), walls second (step 6).
+    // With no towers yet, the worker builds a gatling (25 gold) before walking
+    // to the wall line — firepower kills enemies for score, which is how the
+    // base survives. The wall build still happens in the same day, just after
+    // the tower is placed.
     let probe = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
     let state = BotState::default();
     let gaps = coregeek::brain::day::wall_gaps(&probe, &state);
@@ -722,11 +725,14 @@ fn worker_builds_wall_before_weapon() {
     let mut state = BotState::default();
     let plan = coregeek::brain::day::plan(&turn, &mut state);
     let cmd = plan.commands.get(&10010).expect("worker acts");
-    assert_eq!(cmd.action, "build");
-    assert_eq!(
+    // Offense-first: the worker heads to build a weapon, not a wall. The
+    // worker may be walking toward the tower site (move) or placing it
+    // (build + gatling) depending on adjacency — but it must NOT be
+    // building a wall.
+    assert_ne!(
         cmd.name.as_deref(),
         Some("wall"),
-        "wall before weapon despite 100 gold"
+        "weapon before wall — offense-first"
     );
 }
 

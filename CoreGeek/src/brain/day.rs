@@ -863,12 +863,51 @@ fn worker_day(
             }
         }
     }
-    // 5. Build walls (stone) BEFORE weapons: the wall ring protects the base
-    //    and the roles standing behind it. Capped to a minimal daily ring and
-    //    skipped by the dedicated economy worker, so the wall line never
-    //    monopolizes the whole day. Building also stops the moment any role
-    //    could no longer reach its night weapon — the gate stays open until
-    //    everyone has retreated inside, so we never wall ourselves out.
+    // 5. Build weapons (gold) FIRST — firepower is the priority. A tower costs
+    //    25 gold and takes one round to place. Offense-first: every tower is a
+    //    gun that kills NPCs for score, which is how the base survives.
+    //    Day 1 must build at least 2 towers so both workers have a weapon to
+    //    operate at night — a worker with no tower is dead weight during the
+    //    assault. The wall line (step 6 below) is secondary: 2 towers with no
+    //    walls beats 1 tower with a complete ring.
+    if economy::may_build_weapon(turn, state) {
+        // Dusk guard: after dusk, skip weapon building entirely. A weapon
+        // that isn't placed by dusk can wait until tomorrow — a worker
+        // stranded outside the ring at nightfall loses the gate seal and
+        // the night walks in (dusk_gate tests: role 10002 stuck at
+        // (13,23) building railgun every round R66-70 instead of going
+        // home).
+        let past_dusk = turn.in_day_round >= economy::DUSK_ROUND;
+        if !past_dusk {
+            for (site, kind) in tower_gaps {
+                if claimed.contains(site) {
+                    continue;
+                }
+                // Day 1: build up to 2 towers immediately (no ring wait). The
+                // third tower still waits for the ring to be mostly up.
+                if turn.day == 1 && turn.towers().len() >= 2 {
+                    let ring_open = wall_gaps.len() as i64;
+                    let ring_len = route::ring_cells(turn, 2).len() as i64;
+                    let ring_mostly_up = ring_open * 2 <= ring_len;
+                    if !ring_mostly_up {
+                        continue;
+                    }
+                }
+                if let Some(cmd) = build_or_walk(turn, role, *site, kind, claimed) {
+                    claimed.insert(*site);
+                    plan.push(role.id, cmd);
+                    return;
+                }
+            }
+        }
+    }
+    // 6. Build walls (stone) AFTER weapons: the wall ring is a nice-to-have
+    //    that protects the base, but firepower kills enemies for score.
+    //    Capped to a minimal daily ring and skipped by the dedicated economy
+    //    worker, so the wall line never monopolizes the whole day. Building
+    //    also stops the moment any role could no longer reach its night
+    //    weapon — the gate stays open until everyone has retreated inside,
+    //    so we never wall ourselves out.
     let on_wall_duty = (Some(role.id) != economy_id || shared_wall_duty)
         && (state.walled_cells_today.len() as i64)
             < wall_daily_cap(turn.day, state.ring_ever_complete);
@@ -985,70 +1024,6 @@ fn worker_day(
                     plan.push(role.id, cmd);
                     return;
                 }
-            }
-        }
-    }
-    // 6. Build weapons (gold) once the wall line is underway — but keep a
-    //    gold reserve so the main weapon's level-2 upgrade is never starved
-    //    (see economy::may_build_weapon).
-    //
-    //    P0-4 墙环在建时不折返建塔：第 1 天墙线还有缺口（= `shared_wall_duty`）
-    //    且首塔已经立起来时，跳过第 2/3 塔，等环成型再建。首塔 gatling 豁免
-    //    ——环需要石头，石头需要采矿，而采矿需要一个能守住矿点的开局。
-    //
-    //    没有这道闸，P0-2 的 `may_build_weapon` 会在 R3（墙环一砖未砌时）就
-    //    把第 3 座塔放上去，当天的走路预算随即在"塔位 ↔ 石矿 ↔ 墙线"之间翻
-    //    倍，`day1_sim` 的墙优先用例整组转红（实测：3 塔 0 墙）。有闸之后第
-    //    2/3 塔等环成型——分析 §4 要的正是这条顺序。
-    //
-    //    闸门看的是"塔已经存在"这个回合快照事实，不是"这个回合谁打算建塔"。
-    //    把队友本回合的建塔意向也算进来会更严格，实测会把"石头不可达"那种
-    //    整天砌不出墙的地图变成整天只有一门炮（`day1_sim` 的
-    //    stone_out_of_reach 板：远矿行军 + 收入冻结，issue #17 原样复发），
-    //    因此按分析 §4 的原文只认已存在的塔；该图第 2/3 塔顺延到 D2，是分析
-    //    已经接受的权衡。
-    //
-    //    P1-B 复核（2026-09-14 b 批）：这道闸**没有**拦住第 2 塔——两个工人同一
-    //    回合各占一个塔位，判据看到的 `towers` 还是空的，于是 gatling 和 railgun
-    //    都在 R2 立起来，**早于第一块墙（R16）**。它真正顺延的是第 3 塔：实测
-    //    R132 = 第 2 天第 2 回合，第 1 夜（R71–R130）因此是两门炮打三个角色。
-    //    但把第 3 塔提到第 1 天实测的代价是**环上留一个洞**（19/20，
-    //    `ring_ever_complete` 不置位 → 第 2 天补墙预算掉回 6 格 = issue #21 的
-    //    死法），所以这一批**保持原样**，没有动这道闸。缺的那一块证据是对手的
-    //    建塔节奏，见 WORKFLOW_REQUEST §13（表 7）。
-    //
-    // P0-5 复核（2026-09-14 c 批，观测 3）：这道闸原来的判据是"环上还有任何一个
-    // 缺口"，对**第 3 塔**来说比 `day1_sim::the_wall_ring_is_up_before_the_third_tower`
-    // 要求的严：那条测试只要求"第 3 塔立起来时环已经过半"（`walls_then * 2 >= ring`）。
-    // 按旧判据，第 1 天只要环没合拢（实测 R62 才合拢，而已过 DUSK_ROUND=55），第 3 塔
-    // 整天的窗口都被关死；环合拢之后工人立刻进入黄昏占位（step 4），再也走不到 step 6。
-    // 于是金币从 R2 起就停在 25（够建塔），第 3 塔却顺延到 R132 = 第 2 天第 2 回合，
-    // 第 1 夜（R71-130）是两门炮打三个角色——而那个没有炮的角色连黄昏岗位都没有。
-    //
-    // 放宽只针对第 3 塔。第 2 塔的红线原样保留：`tests/wall_first_p0.rs` 的
-    // `one_open_ring_cell_is_enough_to_hold_the_second_weapon_back` 与
-    // `no_second_weapon_while_the_day_one_ring_is_still_open` 钉的是"环上哪怕只差
-    // 一格，第 2 门炮也得等"——那是对的，第 1/2 门炮是开局，它们守住矿点和基地，
-    // 而环是当天唯一的产物。第 3 塔不同：它买的是**金币和工人的回合**，不占用环上的
-    // 石头，而且它是第 1 夜里唯一能让第三个角色有岗位的东西。所以判据是"前两门已在
-    // 位 且 环已过半"——过半之后剩下的缺口由墙队继续收口，与分析里"墙优先 = 先形成
-    // 最小可承伤闭环"的定义一致，也正是那条测试自己写的通过条件。
-    let ring_open = wall_gaps.len() as i64;
-    let ring_len = route::ring_cells(turn, 2).len() as i64;
-    let ring_mostly_up = ring_open * 2 <= ring_len;
-    let ring_still_forming = turn.day == 1
-        && shared_wall_duty
-        && !turn.towers().is_empty()
-        && (turn.towers().len() < 2 || !ring_mostly_up);
-    if economy::may_build_weapon(turn, state) && !ring_still_forming {
-        for (site, kind) in tower_gaps {
-            if claimed.contains(site) {
-                continue;
-            }
-            if let Some(cmd) = build_or_walk(turn, role, *site, kind, claimed) {
-                claimed.insert(*site);
-                plan.push(role.id, cmd);
-                return;
             }
         }
     }
@@ -1339,7 +1314,15 @@ fn pioneer_day(
                 // the ring and keeps the gate seal from ever completing.
                 let stands = tower_stand_cells(turn, tower.pos);
                 let stands = gate_clear_stands(turn, state, stands);
-                if !stands.iter().any(|stand| *stand == pioneer.pos) {
+                // If the pioneer is already inside the ring (dist <= 1 from
+                // the station), hold there — walking to a stand cell that
+                // `gate_clear_stands` filtered to the outer ring would take
+                // it back outside, breaking the dusk latch.
+                let station = turn.station();
+                let inside = station.map_or(false, |s| {
+                    footprint_distance(pioneer.pos, &s.footprint()) <= 1
+                });
+                if !inside && !stands.iter().any(|stand| *stand == pioneer.pos) {
                     let walked = walk_toward(turn, pioneer, &stands, claimed);
                     if let Some(cmd) = walked {
                         plan.push(pioneer.id, cmd);
@@ -1352,7 +1335,7 @@ fn pioneer_day(
                         return;
                     }
                 }
-                // Already at the post (or no walkable step to one): hold there.
+                // Already at the post (or inside the ring): hold there.
                 return;
             }
         }

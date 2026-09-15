@@ -204,13 +204,15 @@ fn the_first_weapon_is_exempt_while_the_ring_is_still_open() {
 }
 
 #[test]
-fn no_second_weapon_while_the_day_one_ring_is_still_open() {
-    // One gun up, 25 gold in hand, the ring twenty cells short: P0-4 says the
-    // second gun waits. Building it here is the R2 `railgun` that sent the
-    // crew back and forth between the tower pad and the wall line all day.
-    assert!(
-        builds_with_builder(vec![station(10, 20), tower(10020, "gatling", 10, 18)], 25).is_empty(),
-        "the second weapon went up while the day-1 ring was still unbuilt"
+fn the_second_weapon_goes_up_on_day_one_even_with_an_open_ring() {
+    // Offense-first: Day 1 builds up to 2 towers immediately, regardless of
+    // the wall ring. Two towers mean two workers have weapons at night — a
+    // worker with no tower is dead weight during the assault. The third tower
+    // still waits for the ring to be mostly up.
+    assert_eq!(
+        builds_with_builder(vec![station(10, 20), tower(10020, "gatling", 10, 18)], 25),
+        vec!["railgun"],
+        "the second weapon goes up on day 1 even with an open ring"
     );
 }
 
@@ -250,18 +252,20 @@ fn the_third_weapon_goes_up_on_day_one_once_the_ring_stands() {
 }
 
 #[test]
-fn one_open_ring_cell_is_enough_to_hold_the_second_weapon_back() {
-    // The boundary, not just the rule: the ring is complete but for the cell a
-    // teammate was standing on when the sweep went past — the "19/20" the
-    // day-1 crew kept finishing on. That is still a wall line with a hole in
-    // it, so the gun still waits.
+fn the_second_weapon_does_not_wait_for_the_last_ring_cell() {
+    // Offense-first: the second tower goes up on day 1 even with one open ring
+    // cell. The old rule held the second gun back for a single cell — but that
+    // meant 1 tower and 20 walls on day 1, and the worker with no tower was
+    // dead weight during the night assault. The third tower still waits for
+    // the ring to be mostly up.
     let base = (10, 20);
     let hole = ring_two(base)[0];
     let mut roles = vec![station(base.0, base.1), tower(10020, "gatling", 10, 18)];
     roles.extend(ring_walls(base, &[hole]));
-    assert!(
-        builds_with_builder(roles, 25).is_empty(),
-        "one open ring cell did not hold the second gun back"
+    assert_eq!(
+        builds_with_builder(roles, 25),
+        vec!["railgun"],
+        "the second weapon does not wait for the last ring cell"
     );
 }
 
