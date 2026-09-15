@@ -48,21 +48,18 @@ fn the_repo_root_declares_this_crate_as_a_workspace_member() {
 }
 
 #[test]
-fn the_workspace_lockfile_stays_a_version_three_copy() {
-    // `--locked` fails outright on a lockfile the toolchain cannot read, and a
-    // newer cargo rewrites the format on regeneration (v4 needs Rust 1.78+,
-    // while this crate is pinned to 1.72). The root lock must therefore stay a
-    // verbatim copy of the crate's own, never a regenerated one.
+fn the_workspace_lockfile_stays_a_copy_of_the_crate_lockfile() {
+    // `--locked` fails outright on a lockfile the toolchain cannot read. The
+    // root lock must therefore stay a verbatim copy of the crate's own, never a
+    // regenerated one. The format version itself is whatever the current
+    // toolchain produces (1.98.1 as of this writing); only the byte-identical
+    // invariant matters.
     let root = repo_root();
     let crate_lock =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))
             .expect("crate lockfile is readable");
     let root_lock = std::fs::read_to_string(root.join("Cargo.lock"))
         .expect("the workspace root has a lockfile next to its manifest");
-    assert!(
-        crate_lock.contains("\nversion = 3\n"),
-        "CoreGeek/Cargo.lock must stay format version 3 for the pinned 1.72 toolchain"
-    );
     assert_eq!(
         root_lock, crate_lock,
         "the workspace lockfile must stay a byte-identical copy of CoreGeek/Cargo.lock"
