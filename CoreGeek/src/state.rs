@@ -68,6 +68,11 @@ pub struct TaskSession {
     pub timeout_round: i64,
     pub point: Option<Pos>,
     pub task_type: String,
+    /// Which of the task book's three lanes this session is (P1-4). Fixed at
+    /// accept time from `taskType` and never revised: the log line that says
+    /// why a session was worth its rounds has to name the same lane the
+    /// ordering used to pick it.
+    pub kind: crate::brain::task::TaskKind,
     pub description: String,
     pub description_round: i64,
     pub stage: TaskStage,
@@ -435,6 +440,10 @@ pub struct BotState {
     /// day -> folk legend text (dedup)
     pub legend_seen: HashMap<i64, String>,
     pub outages: Vec<Outage>,
+    /// Expected price moves read off the official news (P1-1). Kept beside the
+    /// outages because the two are the same text read twice: the outage is what
+    /// the ore does, the outlook is what the market does about it.
+    pub outlooks: Vec<news::Outlook>,
     /// lowest vendor price ever seen per ore (baseline)
     pub base_prices: HashMap<String, i64>,
 
@@ -674,6 +683,28 @@ impl BotState {
                     self.outages.push(outage);
                 }
             }
+            // The other half of the same text: which way it points each ore's
+            // price. Logged per reading, because "the miner walked past the
+            // copper" is only answerable next to "the news said copper was
+            // about to get cheap".
+            for outlook in news::price_outlook(turn.day, &turn.official_news) {
+                if self.outlooks.iter().any(|old| *old == outlook) {
+                    continue;
+                }
+                crate::log::event(
+                    "news_outlook",
+                    serde_json::json!({
+                        "ore": outlook.ore,
+                        "direction": match outlook.direction {
+                            news::Direction::Rise => "rise",
+                            news::Direction::Fall => "fall",
+                        },
+                        "confidence": outlook.confidence,
+                        "day": outlook.day,
+                    }),
+                );
+                self.outlooks.push(outlook);
+            }
         }
         if !turn.folk_legends.is_empty()
             && self.legend_seen.get(&turn.day).map(String::as_str)
@@ -697,6 +728,21 @@ impl BotState {
         self.outages
             .iter()
             .any(|outage| outage.ore == ore && day >= outage.from_day && day <= outage.to_day)
+    }
+
+    /// The price outlook for this ore in force on `day`: the most recent
+    /// reading published on or before it, and the loudest one if a single day
+    /// carried several.
+    ///
+    /// A reading never expires. The news that a mine is shut for two days is
+    /// still the reason the ore is dear on the second of them, and the day the
+    /// outage ends is the day the price is highest — waiting for the outage to
+    /// pass before acting on it is the mistake the outlook exists to avoid.
+    pub fn price_outlook(&self, ore: &str, day: i64) -> Option<&news::Outlook> {
+        self.outlooks
+            .iter()
+            .filter(|outlook| outlook.ore == ore && outlook.day <= day)
+            .max_by_key(|outlook| (outlook.day, outlook.confidence))
     }
 
     fn absorb_failures(&mut self, turn: &Turn) {
@@ -1085,6 +1131,7 @@ impl BotState {
                 "task_ended",
                 serde_json::json!({
                     "session": self.task.session_id,
+                    "task_kind": self.task.kind.as_str(),
                     "success": success,
                     "reason": reason,
                     "wrongAnswers": self.task.wrong_answers,

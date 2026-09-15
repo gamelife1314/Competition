@@ -416,11 +416,21 @@ fn ring_cycle(turn: &Turn, radius: i32) -> Vec<Pos> {
 /// and the carriers come and go through the entrance all afternoon — building
 /// the near side first puts the head of the order where the crew already
 /// stands, building the far side first sends the first carriers across the
-/// base. So the walk starts on the side the day's errands weigh more: the two
-/// shoulders of the entrance are scored by the same `Σ w_e · chebyshev` the
-/// entrance itself was chosen with, and the cheaper shoulder is step one. The
-/// tie breaks on coordinates, which is what keeps a board with no errands
-/// deterministic.
+/// base. So among walks the enemy bearing cannot separate, the walk starts on
+/// the side the day's errands weigh more: the two shoulders of the entrance are
+/// scored by the same `Σ w_e · chebyshev` the entrance itself was chosen with,
+/// and the cheaper shoulder is step one. The tie breaks on coordinates, which
+/// is what keeps a board with no errands deterministic.
+///
+/// The enemy bearing comes FIRST, and it is the one thing here that is not an
+/// economic question (issue #206 §6). The ring exists to stop robots, robots
+/// come from the enemy base, and a day can be cut short by dusk or by stone
+/// before the last cell is laid — so of the two ways round the shell the crew
+/// takes the one that puts the enemy-facing edges up first and leaves the edge
+/// furthest from the enemy for last. The entrance itself stays where the
+/// economy put it: it is the door the crew walks in and out of all afternoon,
+/// and moving it to the enemy side would be a highway into the base, not a
+/// defence.
 ///
 /// The entrance itself is index 0 and is never in the build list: it is the
 /// hole the day keeps, and the dusk seal is what closes it.
@@ -455,9 +465,27 @@ pub fn build_order(turn: &Turn, state: &BotState, entrance: Pos) -> Vec<Pos> {
             .map(|errand| errand.trips * chebyshev(cell, errand.pos) as i64)
             .sum()
     };
-    let key = |order: &[Pos]| -> (i64, i32, i32) {
+    // How well a walk faces the enemy, scored as Σ (index × distance to the
+    // enemy): a cell far from the enemy weighs more the later it is built, so
+    // the walk with the LARGER sum is the one that buries the far edge deepest
+    // in the order and puts the enemy-facing edges up first. Negated so that
+    // "smaller key wins" keeps holding for the whole tuple. A board with no
+    // enemy base on it scores 0 either way — that tie is what leaves the
+    // errand direction of every enemy-free board exactly as it was.
+    let enemy = turn.enemy_station().map(|station| station.pos);
+    let facing = |order: &[Pos]| -> i64 {
+        let Some(enemy) = enemy else {
+            return 0;
+        };
+        order
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| index as i64 * chebyshev(*cell, enemy) as i64)
+            .sum()
+    };
+    let key = |order: &[Pos]| -> (i64, i64, i32, i32) {
         let head = order.get(1).copied().unwrap_or(entrance);
-        (score(head), head.x, head.y)
+        (-facing(order), score(head), head.x, head.y)
     };
     let mut order = if key(&forward) <= key(&backward) {
         forward

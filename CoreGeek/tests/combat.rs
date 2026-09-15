@@ -751,7 +751,7 @@ fn choose_mine_prefers_nearest_not_most_valuable() {
     let mine = coregeek::brain::economy::choose_mine(
         &turn,
         &state,
-        Pos { x: 5, y: 5 },
+        turn.role_by_id(10010).unwrap(),
         0,
         &std::collections::HashSet::new(),
     );
@@ -780,7 +780,7 @@ fn choose_mine_prefers_stone_when_walls_needed() {
     let mine = coregeek::brain::economy::choose_mine(
         &turn,
         &state,
-        Pos { x: 10, y: 10 },
+        turn.role_by_id(10010).unwrap(),
         5,
         &std::collections::HashSet::new(),
     );
@@ -1835,18 +1835,32 @@ fn worker_prepositions_to_tower_before_dusk() {
 }
 
 #[test]
-fn rocket_and_railgun_are_built_before_gatling() {
-    // Rocket has the longest range and engages enemies earliest with splash
-    // damage. Railgun pierces lined-up waves. Gatling holds the near lane
-    // as the last line of defense. Build order: rocket → railgun → gatling.
+fn the_tower_line_is_the_configured_one() {
+    // Issue #206 §5: the build order is a positional line read from
+    // `coregeek::config::TOWER_BUILD_ORDER`, not the per-kind `have[]` counting
+    // that could only ever raise one of each and forced a gatling into the
+    // third slot. Reading the expected value off the config rather than
+    // restating it is what makes this fail when the semantics are reverted
+    // instead of merely when the default line is edited.
     let turn = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
     let state = BotState::default();
     let gaps = coregeek::brain::day::tower_gaps(&turn, &state);
     let kinds: Vec<&str> = gaps.iter().map(|(_, kind)| kind.as_str()).collect();
     assert_eq!(
         kinds,
-        vec!["rocket", "railgun", "gatling"],
-        "tower build order is rocket → railgun → gatling"
+        coregeek::config::TOWER_BUILD_ORDER,
+        "the tower line is not the configured one"
+    );
+    // Deliberately no assertion about WHICH kinds the line holds: the owner
+    // edits `config.rs` and repacks, so pinning `["rocket", "railgun"]` here
+    // would break their own switch. What is pinned is the semantics — the kinds
+    // are the configured line, in order, repeats included — plus the one thing
+    // repeats must never do: share a cell.
+    let cells: std::collections::HashSet<Pos> = gaps.iter().map(|(pos, _)| *pos).collect();
+    assert_eq!(
+        cells.len(),
+        gaps.len(),
+        "two slots stacked on one cell: {gaps:?}"
     );
 }
 
@@ -3511,7 +3525,7 @@ fn a_sellable_vein_beats_the_nearer_stone() {
     let pick = coregeek::brain::economy::choose_sellable_mine(
         &turn,
         &state,
-        role.pos,
+        role,
         &std::collections::HashSet::new(),
     );
     assert_eq!(
@@ -3532,7 +3546,7 @@ fn a_sellable_vein_beats_the_nearer_stone() {
     let pick = coregeek::brain::economy::choose_sellable_mine(
         &stone_only,
         &state,
-        stone_only.role_by_id(10011).unwrap().pos,
+        stone_only.role_by_id(10011).unwrap(),
         &std::collections::HashSet::new(),
     );
     assert_eq!(pick, Some((Pos { x: 5, y: 6 }, "stone".to_string())));
@@ -3622,5 +3636,161 @@ fn a_bomb_or_dizzy_impact_is_decided_by_the_robots_alone() {
     assert!(
         with_west.enemy.iter().all(|unit| unit.pos != bomb && unit.pos != dizzy),
         "an enemy role cell must never be picked as an impact"
+    );
+}
+
+/// A worker with a real backpack: `capacity` slots, `carried` of them used.
+///
+/// Every other test in this file builds workers with `backPackCapability: 100`
+/// — the value the ROI call sites used to hard-code — which is exactly why the
+/// capacity term could be a lie for a whole release without a test noticing.
+fn sized_worker(id: i64, x: i32, y: i32, capacity: i64, carried: usize) -> Value {
+    json!({
+        "id": id, "pos": {"x": x, "y": y}, "roleType": "worker",
+        "health": 220, "attackPower": 0, "attackRange": 0,
+        "backPackCapability": capacity,
+        "backpack": vec!["iron"; carried],
+    })
+}
+
+/// Iron close by at 8 gold, copper a couple of steps further at 12: on
+/// gold-per-round the copper wins, on distance the iron does. Which one the
+/// worker should take is the whole question.
+///
+/// The prices have to be in `vendorShopList` — `day_world_at` leaves it empty,
+/// which prices every ore at the 1-gold fallback and turns the pick back into
+/// a pure distance question. Asserted below rather than assumed, because that
+/// is exactly how a "copper is more valuable" test can pass for years on a
+/// board where copper is worth no more than anything else.
+fn near_iron_and_far_copper(carried: usize, capacity: i64) -> Turn {
+    let turn = turn_from(json!({
+        "roundNo": 5,
+        "mapInfo": {"width": 41, "height": 32, "zones": [
+            zone(5, 9, "iron"), zone(8, 10, "copper")
+        ]},
+        "teamOur": {
+            "type": "challenger", "goldNum": 0, "totalScore": 0, "playerTasks": [],
+            "roles": [sized_worker(10010, 5, 5, capacity, carried)],
+        },
+        "teamEnemy": {"roles": []},
+        "robot": {"roles": []},
+        "vendorShopList": [
+            {"name": "stone", "price": 2},
+            {"name": "iron", "price": 8},
+            {"name": "copper", "price": 12},
+        ],
+        "weaponShopList": [],
+    }));
+    assert_eq!(
+        (
+            turn.vendor_prices.get("iron").copied(),
+            turn.vendor_prices.get("copper").copied()
+        ),
+        (Some(8), Some(12)),
+        "test setup: the board does not price the two ores apart"
+    );
+    turn
+}
+
+#[test]
+fn a_full_pack_has_no_load_to_price_so_the_shortest_walk_wins() {
+    // P1-2. The ROI call sites all passed a literal `100` for the worker's free
+    // slots, so a worker carrying a full pack was priced as if it had a hundred
+    // empty ones and was sent to the richer vein — a walk it could not pay for,
+    // because it would arrive with nowhere to put anything. With the real free
+    // count every vein prices at zero, the ranking stops discriminating, and
+    // the tie-break hands over the nearest vein.
+    let empty = near_iron_and_far_copper(0, 4);
+    let pick = coregeek::brain::economy::choose_mine(
+        &empty,
+        &BotState::default(),
+        empty.role_by_id(10010).unwrap(),
+        0,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        pick.map(|(pos, ore)| (pos, ore)),
+        Some((Pos { x: 8, y: 10 }, "copper".to_string())),
+        "test setup: with room to carry a load, the richer far vein should win"
+    );
+
+    let full = near_iron_and_far_copper(4, 4);
+    assert_eq!(
+        coregeek::brain::economy::free_slots(full.role_by_id(10010).unwrap()),
+        0,
+        "test setup: the pack is not actually full"
+    );
+    let pick = coregeek::brain::economy::choose_mine(
+        &full,
+        &BotState::default(),
+        full.role_by_id(10010).unwrap(),
+        0,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        pick.map(|(pos, _)| pos),
+        Some(Pos { x: 5, y: 9 }),
+        "a full pack was sent past the near vein to the richer one"
+    );
+}
+
+#[test]
+fn the_miner_prefers_the_vein_the_news_says_is_about_to_be_dear() {
+    // P1-1, at the level the decision is actually made. The board is a tie
+    // broken by price: copper out-earns iron per round, so with no news the
+    // worker takes the copper. The official news is then the only thing that
+    // can move it — a shortage of iron makes the iron worth the shorter walk,
+    // and a resumption of copper takes the copper out of the running.
+    use coregeek::brain::news::{Direction, Outlook};
+
+    // `day_offset` is counted in game days from today, not rounds: an outlook
+    // is stamped with the day the news ran.
+    let current = |outlook: Option<(&str, Direction, i64)>| {
+        let turn = near_iron_and_far_copper(0, 4);
+        let mut state = BotState::default();
+        if let Some((ore, direction, day_offset)) = outlook {
+            state.outlooks = vec![Outlook {
+                ore: ore.to_string(),
+                direction,
+                confidence: 95,
+                day: turn.day + day_offset,
+            }];
+        }
+        coregeek::brain::economy::choose_mine(
+            &turn,
+            &state,
+            turn.role_by_id(10010).unwrap(),
+            0,
+            &std::collections::HashSet::new(),
+        )
+        .map(|(_, ore)| ore)
+    };
+
+    assert_eq!(
+        current(None),
+        Some("copper".to_string()),
+        "test setup: the copper does not already out-earn the iron"
+    );
+    assert_eq!(
+        current(Some(("iron", Direction::Rise, 0))),
+        Some("iron".to_string()),
+        "the news put iron up and the miner still walked past it"
+    );
+    assert_eq!(
+        current(Some(("copper", Direction::Fall, 0))),
+        Some("iron".to_string()),
+        "the news put copper down and the miner still crossed to it"
+    );
+    // A reading published tomorrow is not evidence about today, and an ore the
+    // text never named gets no reading at all.
+    assert_eq!(
+        current(Some(("iron", Direction::Rise, 1))),
+        Some("copper".to_string()),
+        "an outlook from a later day was applied early"
+    );
+    assert_eq!(
+        current(Some(("stone", Direction::Rise, 0))),
+        Some("copper".to_string()),
+        "an outlook for an ore nobody is mining changed the pick"
     );
 }

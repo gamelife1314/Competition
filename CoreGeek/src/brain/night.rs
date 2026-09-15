@@ -108,18 +108,74 @@ pub fn withdrawing(turn: &Turn, role: &Unit) -> bool {
 /// afterwards. Preferring a reachable tower fixes the cause instead of the
 /// symptom. When no controller can reach the gun the nearest one is still
 /// taken, so the pairing is never worse than the distance-only one.
-pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
-    let mut towers = turn.towers();
-    towers.sort_by_cached_key(|tower| std::cmp::Reverse(combat::threat_load(turn, tower)));
-    let mut controllers: Vec<&Unit> = turn
-        .controllable()
+/// The controllers a pairing may draw from, in one place.
+///
+/// Every reader of "how many controllers are there" has to agree with this
+/// list, or the count answers a different question from the one the pairing
+/// asks. It did not, and the disagreement is what made `tower_unpaired` report
+/// `pairing_invariant` — "enough controllers existed, yet a tower went
+/// unmanned" — on boards where a controller was simply in the withdrawal
+/// holdout: `night::plan` counted `turn.controllable()` minus a task-busy
+/// pioneer, and `pairing` then refused the held-out controller as well, so the
+/// tally said three controllers for three guns while only two were usable. The
+/// label sent the reader looking for an ordering bug that did not exist and hid
+/// the real one (a gun with nobody to hold it). Both now read this list.
+pub fn pairing_controllers<'a>(turn: &'a Turn, state: &BotState) -> Vec<&'a Unit> {
+    turn.controllable()
         .into_iter()
         .filter(|role| !(state.task.active && role.kind == UnitKind::Pioneer))
         // P1-4 hysteresis: a controller in withdrawal holdout mans nothing —
         // it shelters and heals as a spare instead of pacing between the gun
         // and the threat radius all night.
         .filter(|role| !state.withdraw_holdout.contains(&role.id))
-        .collect();
+        .collect()
+}
+
+/// Why no controller is holding a gun, as a partition over the three ways it
+/// can happen. The same string the `tower_unpaired` log event carries.
+///
+/// `pairing_invariant` is the assertion, not a diagnosis: `pairing` hands out
+/// `min(towers, controllers)` guns, so once the two counts are read off the
+/// same list it can never be true. It survives as a label so that a future
+/// regression that reintroduces a disagreement is visible in the log instead of
+/// silently relabelled.
+fn unpair_reason(turn: &Turn, state: &BotState) -> &'static str {
+    if state.task.active && turn.pioneer().is_some() {
+        "pioneer_task_occupied"
+    } else if pairing_controllers(turn, state).len() < turn.towers().len() {
+        "no_live_controller"
+    } else {
+        "pairing_invariant"
+    }
+}
+
+/// Every tower no controller is holding, with the reason, in tower order.
+///
+/// The question the `tower_unpaired` event exists to answer, asked of the same
+/// pairing the night actually uses — so a test can assert on it directly
+/// instead of grepping a captured match.
+pub fn unpaired_towers(turn: &Turn, state: &BotState) -> Vec<(i64, &'static str)> {
+    let pairs = pairing(turn, state);
+    unpaired_of(turn, state, &pairs)
+}
+
+/// [`unpaired_towers`] against a pairing that has already been computed (the
+/// night planner uses the cached one, so that the log describes the pairing
+/// that actually fired).
+pub fn unpaired_of(turn: &Turn, state: &BotState, pairs: &[(i64, i64)]) -> Vec<(i64, &'static str)> {
+    let paired: HashSet<i64> = pairs.iter().map(|(_, tower)| *tower).collect();
+    let reason = unpair_reason(turn, state);
+    turn.towers()
+        .iter()
+        .filter(|tower| !paired.contains(&tower.id))
+        .map(|tower| (tower.id, reason))
+        .collect()
+}
+
+pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
+    let mut towers = turn.towers();
+    towers.sort_by_cached_key(|tower| std::cmp::Reverse(combat::threat_load(turn, tower)));
+    let mut controllers: Vec<&Unit> = pairing_controllers(turn, state);
     let mut pairs: Vec<(i64, i64)> = Vec::new();
     for tower in towers {
         if controllers.is_empty() {
@@ -252,7 +308,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     if state.task.active && defense_needs_pioneer(turn) {
         crate::log::event(
             "task_defense_abort",
-            serde_json::json!({"round": turn.round_no, "session": state.task.session_id, "reason": "unmanned_tower_under_threat"}),
+            serde_json::json!({"round": turn.round_no, "session": state.task.session_id, "task_kind": state.task.kind.as_str(), "reason": "unmanned_tower_under_threat"}),
         );
         state.finish_task(false, "night_defense");
     }
@@ -272,26 +328,15 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         std::cmp::Reverse(load)
     });
     let mut paired: HashSet<i64> = HashSet::new();
-    let paired_towers: HashSet<i64> = pairs.iter().map(|(_, tower)| *tower).collect();
-    let available = turn
-        .controllable()
-        .iter()
-        .filter(|role| !(state.task.active && role.kind == UnitKind::Pioneer))
-        .count();
-    for tower in turn.towers() {
-        if !paired_towers.contains(&tower.id) {
-            let reason = if state.task.active && turn.pioneer().is_some() {
-                "pioneer_task_occupied"
-            } else if available < turn.towers().len() {
-                "no_live_controller"
-            } else {
-                "pairing_invariant"
-            };
-            crate::log::event(
-                "tower_unpaired",
-                serde_json::json!({"round": turn.round_no, "tower": tower.id, "reason": reason}),
-            );
-        }
+    // The unpaired report is derived, not re-counted: `unpaired_of` asks the
+    // same question the pairing does, so the reason a tower is dark cannot
+    // disagree with the reason the pairing refused to hand it out (see
+    // `pairing_controllers`).
+    for (tower, reason) in unpaired_of(turn, state, &pairs) {
+        crate::log::event(
+            "tower_unpaired",
+            serde_json::json!({"round": turn.round_no, "tower": tower, "reason": reason}),
+        );
     }
     let mut sim = combat::init_sim(turn);
     // Snapshot the coach's policy once: the tower loop below borrows `state`

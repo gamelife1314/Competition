@@ -190,26 +190,43 @@ fn builds_with_builder(roles: Vec<Value>, gold: i64) -> Vec<String> {
     build_with_builder_at(roles, gold, 5)
 }
 
+/// The kind a slot is allowed to build, read off the configured line.
+///
+/// The three tests below used to hard-code `["rocket", "railgun", "gatling"]`
+/// and each slot's kind with it. Issue #206 §5 replaced that per-kind enum with
+/// a positional line the owner edits in `coregeek::config`, so the expectation
+/// has to come from there: a literal restated here would either break the
+/// owner's switch or stop guarding the semantics (see
+/// `the_weapon_line_is_positional_not_per_kind`).
+fn line(slot: usize) -> String {
+    coregeek::config::TOWER_BUILD_ORDER
+        .get(slot)
+        .unwrap_or_else(|| panic!("the configured line has no slot {slot}"))
+        .to_string()
+}
+
 #[test]
 fn the_first_weapon_is_exempt_while_the_ring_is_still_open() {
     // No gun at all, 25 gold, an untouched day-1 ring. The first weapon is
-    // a rocket — longest range, engages enemies earliest. The ring is built
-    // from stone, and a base with no gun loses the first night outright.
+    // exempt from the ring-first rule: the ring is built from stone, and a base
+    // with no gun loses the first night outright.
     assert_eq!(
         builds_with_builder(vec![station(10, 20)], 25),
-        vec!["rocket"],
+        vec![line(0)],
         "the first weapon was held back for a ring that is not built yet"
     );
 }
 
 #[test]
 fn the_second_weapon_goes_up_on_day_one_even_with_an_open_ring() {
-    // Offense-first: Day 1 builds all 3 towers immediately, regardless of
-    // the wall ring. Every worker needs a weapon to operate at night.
-    // Build order: rocket → railgun → gatling.
+    // Offense-first: Day 1 builds the configured line immediately, regardless
+    // of the wall ring. Every worker needs a weapon to operate at night.
+    // One rocket stands, so the gap list starts at the HEAD of the line again
+    // (slots are counted from the towers standing now — issue #206 §5) and the
+    // builder lays slot 0 first.
     assert_eq!(
         builds_with_builder(vec![station(10, 20), tower(10020, "rocket", 10, 18)], 25),
-        vec!["railgun"],
+        vec![line(0)],
         "the second weapon goes up on day 1 even with an open ring"
     );
 }
@@ -222,25 +239,81 @@ fn the_ring_being_closed_releases_the_second_weapon() {
     roles.extend(closed_ring((10, 20)));
     assert_eq!(
         builds_with_builder(roles, 25),
-        vec!["railgun"],
+        vec![line(0)],
         "a closed ring did not release the next weapon"
     );
 }
 
 #[test]
 fn the_third_weapon_goes_up_on_day_one_once_the_ring_stands() {
-    // All three guns on day 1: rocket and railgun are already up, gatling
-    // is the third slot (close defense). 25 gold is the third slot's price.
+    // Issue #206 §5 retired the third slot's gatling. What the ring being
+    // closed releases is the next entry of the configured line — and with two
+    // towers standing that is the line's THIRD entry, which the owner's
+    // two-entry line does not have. So this asserts the new rule in both
+    // directions: the kind built is `TOWER_BUILD_ORDER[2]` when the line has
+    // one, and nothing at all when it does not. The old assertion demanded a
+    // gatling here and is exactly the per-kind behaviour #206 overturned.
     let mut roles = vec![
         station(10, 20),
         tower(10020, "rocket", 9, 18),
         tower(10030, "railgun", 12, 21),
     ];
     roles.extend(closed_ring((10, 20)));
+    let expected: Vec<String> = coregeek::config::TOWER_BUILD_ORDER
+        .get(2)
+        .map(|kind| vec![kind.to_string()])
+        .unwrap_or_default();
     assert_eq!(
         builds_with_builder(roles, 25),
-        vec!["gatling"],
-        "the third weapon did not go up on day 1 with the ring closed"
+        expected,
+        "the third slot did not take slot 2 of the configured line"
+    );
+}
+
+#[test]
+fn the_weapon_line_is_positional_not_per_kind() {
+    // The guard for issue #206 §5 itself, on the one board where the two rules
+    // disagree and neither is a judgement call: ONE railgun stands, and the
+    // line's head is a different kind.
+    //
+    //  * positional (what the owner asked for): the free slot is slot 0, so the
+    //    head of the line is planned again — a repeat is legal;
+    //  * per-kind `have[]` counting (what this replaces): the railgun is
+    //    "already built", so the head is skipped and the list starts at the
+    //    next kind — and a line whose head repeats can never produce the
+    //    repeat the owner asked for ("2 missiles + 1 railgun").
+    //
+    // The expectation is READ OFF the config, so this stays honest if the owner
+    // edits the line: it fails only when the semantics change.
+    let first = line(0);
+    let mut roles = vec![station(10, 20)];
+    if first == "railgun" {
+        // Choose a standing tower whose kind is NOT the head of the line, so
+        // the two rules are guaranteed to disagree on this board too.
+        roles.push(tower(10020, "rocket", 10, 18));
+    } else {
+        roles.push(tower(10020, "railgun", 10, 18));
+    }
+    let standing = roles
+        .iter()
+        .find(|role| role["roleType"] == "railgun" || role["roleType"] == "rocket")
+        .and_then(|role| role["roleType"].as_str())
+        .expect("a tower stands")
+        .to_string();
+    assert_ne!(
+        standing, first,
+        "test setup: the standing kind must differ from the head of the line"
+    );
+
+    let turn = turn_from(board(roles, 25, 5));
+    let kinds: Vec<String> = tower_gaps(&turn, &BotState::default())
+        .into_iter()
+        .map(|(_, kind)| kind)
+        .collect();
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some(first.as_str()),
+        "a standing {standing} consumed its slot: slots are positional"
     );
 }
 
@@ -253,9 +326,13 @@ fn the_second_weapon_does_not_wait_for_the_last_ring_cell() {
     let hole = ring_two(base)[0];
     let mut roles = vec![station(base.0, base.1), tower(10020, "rocket", 10, 18)];
     roles.extend(ring_walls(base, &[hole]));
+    // The KIND is the head of the configured line, not a hard-coded railgun:
+    // issue #206 §5 made slots positional, so one standing rocket frees slot 0
+    // again. What this test is about — that the weapon goes up NOW rather than
+    // waiting for the last ring cell — is unchanged.
     assert_eq!(
         builds_with_builder(roles, 25),
-        vec!["railgun"],
+        vec![line(0)],
         "the second weapon does not wait for the last ring cell"
     );
 }
@@ -269,10 +346,11 @@ fn a_later_day_never_waits_for_the_ring() {
     let mut roles = vec![station(base.0, base.1), tower(10020, "rocket", 10, 22)];
     roles.extend(ring_walls(base, &[hole]));
     // Round 135 is day 2, in-day round 4 — nowhere near the dusk lock-in, and
-    // with a ring cell deliberately missing.
+    // with a ring cell deliberately missing. The kind is the head of the
+    // configured line (issue #206 §5); the assertion is about the TIMING.
     assert_eq!(
         build_with_builder_at(roles, 25, 135),
-        vec!["railgun"],
+        vec![line(0)],
         "day 2 held a weapon back for a wall gap"
     );
 }

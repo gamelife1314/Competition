@@ -188,10 +188,22 @@ fn the_three_tower_sites_sit_on_the_inner_ring_from_every_base() {
 
         let gaps = tower_gaps(&turn, &state);
         let kinds: Vec<&str> = gaps.iter().map(|(_, kind)| kind.as_str()).collect();
-        // Offense-first: rocket first (longest range), then railgun, then gatling.
-        assert_eq!(kinds, vec!["rocket", "railgun", "gatling"], "{name}");
+        // Issue #206 §5 replaced the per-kind build order with a positional
+        // line: slot i of the empty-slot list builds `TOWER_BUILD_ORDER[i]`, so
+        // the kinds are the configured line, read off the config rather than
+        // restated here. Reverting to per-kind `have[]` counting makes this red
+        // (`gatling` reappears / repeats disappear).
+        assert_eq!(
+            kinds,
+            coregeek::config::TOWER_BUILD_ORDER,
+            "{name}: the tower line is not the configured one"
+        );
         let unique: HashSet<Pos> = gaps.iter().map(|(pos, _)| *pos).collect();
-        assert_eq!(unique.len(), 3, "{name} stacked two towers on one cell");
+        assert_eq!(
+            unique.len(),
+            kinds.len(),
+            "{name} stacked two towers on one cell"
+        );
         for (pos, _) in &gaps {
             assert!(
                 turn.is_land(*pos),
@@ -204,6 +216,47 @@ fn the_three_tower_sites_sit_on_the_inner_ring_from_every_base() {
             );
         }
     }
+}
+
+#[test]
+fn a_standing_tower_does_not_consume_its_kind_from_the_line() {
+    // The whole point of issue #206 §5's positional slots. Slots are counted
+    // from the towers standing RIGHT NOW, so a rocket on the board frees the
+    // head of the line rather than vetoing it: with one rocket up, the next
+    // empty slot is slot 0 again and the day plans the head of the line plus
+    // the next entry. Per-kind `have[]` counting — the behaviour this replaces
+    // — skipped every kind it already had and could never repeat one, so it
+    // returned just `["railgun"]` here and the owner's "2 missiles + 1 railgun"
+    // was unreachable.
+    let line = coregeek::config::TOWER_BUILD_ORDER;
+    assert!(!line.is_empty(), "test setup: the configured line is empty");
+    let base = (10, 24);
+    let mut roles = vec![station(10001, base.0, base.1)];
+    roles.push(json!({
+        "id": 10020, "pos": {"x": 12, "y": 24}, "roleType": "rocket",
+        "health": 1000, "attackPower": 20, "attackRange": 10,
+        "level": 1, "backPackCapability": 0, "backpack": []
+    }));
+    roles.push(worker(10002, 20, 15));
+    let mut payload = world(base);
+    payload["teamOur"]["roles"] = Value::Array(roles);
+    let turn = turn_from(payload);
+
+    let kinds: Vec<String> = tower_gaps(&turn, &BotState::default())
+        .into_iter()
+        .map(|(_, kind)| kind)
+        .collect();
+    // One tower stands, so the empty-slot count is CAP - 1 and slot 0 is the
+    // head of the line again; the line simply runs out one entry earlier.
+    let expected: Vec<String> = line
+        .iter()
+        .take(coregeek::config::TOWER_CAP - 1)
+        .map(|kind| kind.to_string())
+        .collect();
+    assert_eq!(
+        kinds, expected,
+        "the free slot did not take the head of the line: {kinds:?}"
+    );
 }
 
 #[test]

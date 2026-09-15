@@ -975,7 +975,7 @@ fn worker_day(
         // with a full pack instead
         // (tests/combat.rs::worker_builds_wall_before_weapon).
         let more_stone_available =
-            economy::choose_mine(turn, state, role.pos, stone_demand, &mut HashSet::new())
+            economy::choose_mine(turn, state, role, stone_demand, &mut HashSet::new())
                 .is_some();
         // A carrier with nowhere left to dig is not waiting for anything: the
         // stone it holds is the only stone there is, and holding it back means
@@ -1192,13 +1192,27 @@ fn worker_day(
     }
     // 10. Mine the nearest ore (stone first while walls are wanted). Mining
     //    pauses during dusk so the ore we hold is converted to gold instead.
-    if turn.in_day_round < economy::DUSK_ROUND && !role.backpack_full() {
+    //
+    //    9c. Which is also why the pack-full branch is here and not beside the
+    //    sale: a full pack is a role that cannot dig, and step 9 has just
+    //    declined to sell it. `economy::discard_command` owns what may leave —
+    //    only the cheapest ore carried, only when a vein worth more is still
+    //    within reach of the afternoon, and never stone the ring is holding
+    //    back — and it runs inside the same dusk guard, because the cash-out
+    //    window converts ore to gold rather than throwing it away. With nothing
+    //    worth dropping it returns None and the role is exactly as it was.
+    if turn.in_day_round < economy::DUSK_ROUND {
         // The dedicated economy worker keeps the collect→sell→buy loop funded
         // once the ring's own build-out is over: outside day 1 it digs ore the
         // vendor buys, never the stone the wall line is holding back. See
         // `economy::choose_sellable_mine`.
         let keep_gold_loop = Some(role.id) == economy_id && !shared_wall_duty;
-        if let Some(cmd) = mine_flow(
+        if role.backpack_full() {
+            if let Some(cmd) = economy::discard_command(turn, state, role, stone_demand) {
+                plan.push(role.id, cmd);
+                return;
+            }
+        } else if let Some(cmd) = mine_flow(
             turn,
             state,
             role,
@@ -1270,6 +1284,7 @@ fn pioneer_day(
             serde_json::json!({
                 "round": turn.round_no,
                 "session": state.task.session_id,
+                "task_kind": state.task.kind.as_str(),
                 "dayRound": turn.in_day_round,
                 "reason": "sterile",
             }),
@@ -1282,6 +1297,7 @@ fn pioneer_day(
             serde_json::json!({
                 "round": turn.round_no,
                 "session": state.task.session_id,
+                "task_kind": state.task.kind.as_str(),
                 "dayRound": turn.in_day_round,
                 "reason": "dusk_recall",
             }),
@@ -1467,7 +1483,20 @@ impl BotState {
                     .get(&task.pos)
                     .map_or(false, |until| turn.round_no <= *until)
             })
-            .min_by_key(|task| chebyshev(pioneer.pos, task.pos))?;
+            // P1-4: the kind outranks the distance. 推理 + 传闻 first, 自进化
+            // next, everything else last; distance only decides inside a lane.
+            // Until this existed the pioneer took whatever point was nearest,
+            // which on a board carrying two kinds is a coin toss between the
+            // day's reasoning and its sandbox. The kind is also stamped on the
+            // session, so the log says which lane the rounds went to.
+            .min_by_key(|task| {
+                (
+                    crate::brain::task::classify(&task.task_type).rank(),
+                    chebyshev(pioneer.pos, task.pos),
+                    task.pos.x,
+                    task.pos.y,
+                )
+            })?;
         if chebyshev(pioneer.pos, candidate.pos) <= 1 {
             // The clock gates the ACCEPT, never the approach: a point accepted
             // with fewer rounds left than a session needs is a point sold for
@@ -1495,9 +1524,17 @@ impl BotState {
             };
             self.task_session_seq = self.task_session_seq.saturating_add(1);
             let session_id = self.task_session_seq;
+            let kind = crate::brain::task::classify(&candidate.task_type);
             crate::log::event(
                 "task_accept",
-                serde_json::json!({"round": turn.round_no, "session": session_id, "point": candidate.pos, "taskType": candidate.task_type}),
+                serde_json::json!({
+                    "round": turn.round_no,
+                    "session": session_id,
+                    "point": candidate.pos,
+                    "taskType": candidate.task_type,
+                    "task_kind": kind.as_str(),
+                    "kindRank": kind.rank(),
+                }),
             );
             self.task = TaskSession {
                 active: true,
@@ -1506,6 +1543,7 @@ impl BotState {
                 timeout_round: turn.round_no + timeout,
                 point: Some(candidate.pos),
                 task_type: candidate.task_type.clone(),
+                kind,
                 ..Default::default()
             };
             return Some(RoleCommand::accept_task());
@@ -2489,12 +2527,12 @@ fn mine_flow(
         && stone_demand > 0
         && economy::team_ores(turn, STONE) < stone_demand;
     let pick = if keep_gold_loop {
-        economy::choose_sellable_mine(turn, state, role.pos, claimed)?
+        economy::choose_sellable_mine(turn, state, role, claimed)?
     } else {
         economy::choose_mine(
             turn,
             state,
-            role.pos,
+            role,
             if want_stone { stone_demand } else { 0 },
             claimed,
         )?
@@ -2505,7 +2543,7 @@ fn mine_flow(
     // the day is worth more spent on ore that sells (issue #17's frozen purse).
     let stone_errand = want_stone && pick.1 == STONE;
     let (mine, ore) = if stone_errand && !stone_trip_fits(turn, role, pairs, pick.0, wall_gaps) {
-        economy::choose_mine(turn, state, role.pos, 0, claimed)?
+        economy::choose_mine(turn, state, role, 0, claimed)?
     } else {
         pick
     };
@@ -2694,10 +2732,23 @@ fn nearest_adjacent_mine(
 /// Desired tower cells (ring at distance 1 from the station footprint),
 /// paired with the weapon kind that should stand there. Cells already
 /// holding one of our towers, blacklisted cells and non-land are excluded.
+///
+/// One entry per EMPTY tower slot, in line order: slot `i` of the empty-slot
+/// list builds `config::TOWER_BUILD_ORDER[i]`. The list is therefore at most
+/// `config::TOWER_CAP - towers standing` long and may be shorter when the
+/// configured line runs out (issue #206 §5).
 pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
-    if turn.towers().len() >= 3 {
+    // Positional slots, one per EMPTY tower slot (issue #206 §5). The old
+    // per-kind `have[]` counting could never express the owner's line: it built
+    // each kind at most once, so "two missiles" and "all missiles" were both
+    // unreachable, and the gatling was forced into the third slot. Now slot i
+    // of the empty-slot list builds `config::TOWER_BUILD_ORDER[i]`, so repeats
+    // mean what they say and a line shorter than the slot count simply stops.
+    let existing = turn.towers().len();
+    if existing >= crate::config::TOWER_CAP {
         return Vec::new();
     }
+    let empty_slots = crate::config::TOWER_CAP - existing;
     let Some(station) = turn.station() else {
         return Vec::new();
     };
@@ -2714,21 +2765,6 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
         .collect();
     cells.sort_by_key(|pos| (chebyshev(*pos, center), pos.x, pos.y));
 
-    let mut have = [0i32; 3]; // gatling, railgun, rocket
-    for tower in turn.towers() {
-        match tower.kind {
-            crate::model::UnitKind::Gatling => have[0] += 1,
-            crate::model::UnitKind::Railgun => have[1] += 1,
-            crate::model::UnitKind::Rocket => have[2] += 1,
-            _ => {}
-        }
-    }
-    // Build order: rocket first (longest range, engages enemies earliest),
-    // then railgun (lined-up wave penetration), then gatling (close defense).
-    // The rocket's splash damage is the opening weapon — it softens waves
-    // before they reach the ring. Railgun exploits the survivors, and
-    // gatling holds the near lane as the last line.
-    let build_order: [(usize, &str); 3] = [(2, "rocket"), (1, "railgun"), (0, "gatling")];
     // Cells that a standing weapon must be able to be OPERATED from. Three guns
     // packed onto adjacent ring cells steal each other's only standing room —
     // the middle one then has no adjacent free cell at all, and a weapon nobody
@@ -2766,10 +2802,13 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
     let gate = wall_gate(turn, state);
     let mut gaps: Vec<(Pos, String)> = Vec::new();
     let mut used: HashSet<Pos> = HashSet::new();
-    for (have_idx, kind) in build_order {
-        if have[have_idx] > 0 {
-            continue;
-        }
+    for slot in 0..empty_slots {
+        // The line ran out before the slots did: build what the line names and
+        // stop. Deliberately not an error — `["rocket", "railgun"]` with three
+        // empty slots is two towers, which is the owner's line.
+        let Some(&kind) = crate::config::TOWER_BUILD_ORDER.get(slot) else {
+            break;
+        };
         let mut taken = permanent.clone();
         taken.extend(used.iter().copied());
         taken.extend(reserved.iter().copied());
@@ -2780,8 +2819,9 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
         // cells or nothing" test then rejects the third site outright — the
         // base ends the day with two guns while the third slot waits for a
         // cell that will never free up. A gun with a single standing cell still
-        // fires; a gun that was never built never does, and `gatling -> railgun
-        // -> rocket` is a hard requirement. So the strict search runs first and
+        // fires; a gun that was never built never does, and the line in
+        // `config::TOWER_BUILD_ORDER` only ever gets built by this function. So
+        // the strict search runs first and
         // the fallback is exactly the pre-existing test: any free, non-
         // blacklisted ring cell. The fallback can therefore never site FEWER
         // guns than the plain search did.

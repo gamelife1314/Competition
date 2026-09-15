@@ -5,6 +5,7 @@
 
 pub mod abreport;
 pub mod brain;
+pub mod config;
 pub mod log;
 pub mod model;
 pub mod path;

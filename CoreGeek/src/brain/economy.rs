@@ -1111,24 +1111,24 @@ pub fn sell_command(
 pub fn choose_sellable_mine(
     turn: &Turn,
     state: &BotState,
-    role_pos: Pos,
+    role: &Unit,
     claimed: &HashSet<Pos>,
 ) -> Option<(Pos, String)> {
     // ROI-based selection — same metric as `choose_mine`, but excludes stone
     // (structural reserve, not for sale). A time-budget filter rejects mines
     // whose round-trip would strand the worker outside the ring at nightfall.
     let budget = (DUSK_ROUND - turn.in_day_round).max(0) - DUSK_TRIP_MARGIN;
+    let free = free_slots(role);
     let mut best: Option<(f64, i64, i32, i32, Pos, String)> = None;
     for (pos, ore) in turn.all_mines() {
         if ore == STONE || state.ore_on_outage(&ore, turn.day) || claimed.contains(&pos) {
             continue;
         }
-        let trip = crate::brain::route::trip_rounds(turn, role_pos, pos);
+        let trip = crate::brain::route::trip_rounds(turn, role.pos, pos);
         if budget > 0 && trip > budget {
             continue;
         }
-        let price = turn.vendor_prices.get(&ore).copied().unwrap_or(1);
-        let roi = mine_roi(price, trip, 100);
+        let roi = mine_roi(priced(turn, state, &ore), trip, free);
         let key = (roi, trip, pos.x, pos.y, pos, ore);
         // Maximize ROI; tiebreak by shorter trip, then coordinates.
         let is_better = best.as_ref().map(|current| {
@@ -1145,7 +1145,7 @@ pub fn choose_sellable_mine(
     if let Some((_, _, _, _, pos, ore)) = best {
         return Some((pos, ore));
     }
-    choose_mine(turn, state, role_pos, 0, claimed)
+    choose_mine(turn, state, role, 0, claimed)
 }
 
 /// Gold per round for a mining trip — the decision metric that replaced the
@@ -1166,6 +1166,135 @@ fn mine_roi(price: i64, trip_rounds: i64, free_capacity: i64) -> f64 {
     (price as f64 * free_capacity as f64) / trip_rounds as f64
 }
 
+/// Slots this trip can actually fill: the backpack's remaining room, never the
+/// raw maximum.
+///
+/// All three ROI call sites passed a literal `100` here, so the capacity term
+/// was a constant and the metric degenerated to `price / rounds` — the very
+/// thing it replaced. Free slots, not `unit.capacity`, is the number the ROI
+/// has to be priced on.
+///
+/// What it can and cannot change, since the plan expected more of it than it
+/// can deliver and the next reader deserves the arithmetic: `price × free /
+/// rounds` multiplies EVERY candidate by the same `free`, so it cancels out of
+/// the ranking — the vein this picks is the vein `price / rounds` picks, for any
+/// pack. No choice of factor can make a half-full pack change which vein wins,
+/// and a "trip has to pay for itself" floor on top of it cannot either, since
+/// the vein that wins on gold-per-round is exactly the vein that clears the
+/// floor.
+///
+/// Where the count does decide something is the degenerate end: at `free == 0`
+/// every vein's ROI is 0, the ranking stops discriminating, and the tie-break
+/// hands the worker the NEAREST vein. That is the right answer for a full pack
+/// and it is what this fixes — the old constant priced a full pack as a hundred
+/// free slots and sent the worker across the map for the richest vein it had no
+/// room to carry (`tests/combat.rs::
+/// a_full_pack_has_no_load_to_price_so_the_shortest_walk_wins`).
+pub fn free_slots(role: &Unit) -> i64 {
+    (role.capacity - role.backpack.len() as i64).max(0)
+}
+
+/// What this ore is worth *per ore* to the mine pick: today's vendor price,
+/// moved by whatever the official news said about it (P1-1).
+///
+/// The plan needs a comparison price, not a forecast: a vein is chosen before
+/// the worker walks, and the only question is which of two veins pays better
+/// over the same afternoon. Current price is the fallback and stays the answer
+/// on every day with no news, which is most of them.
+fn priced(turn: &Turn, state: &BotState, ore: &str) -> i64 {
+    let current = turn.vendor_prices.get(ore).copied().unwrap_or(1);
+    crate::brain::news::expected_price(current, state.price_outlook(ore, turn.day))
+}
+
+/// The cheapest thing in the pack that the role may throw away, and what it is
+/// worth, for [`discard_command`].
+///
+/// Two exclusions, both of them the wall line's:
+///
+/// - Stone the ring is still holding back. `stone_surplus` is the same
+///   arithmetic `sellable_ores` uses — the stone above the day's demand and
+///   buffer — so an ore that is not droppable here is an ore the vendor would
+///   not have bought either, and one the ring still intends to build with.
+///   Issues #12-#17 all opened with a ring that never closed; the miner does
+///   not get to spend that material on a coin.
+/// - Non-ore items (a WallFixer, a Medicine, a voucher). They are not ore, they
+///   cost gold, and they are worth more than the slot they occupy.
+fn cheapest_droppable(
+    turn: &Turn,
+    state: &BotState,
+    role: &Unit,
+    stone_demand: i64,
+) -> Option<(String, i64)> {
+    // One stone, not a stack: the test is on the TEAM's surplus, because a
+    // stack is fungible and what matters is whether the pool can spare a unit.
+    let stone_surplus = team_ores(turn, STONE) - stone_demand - STONE_BUFFER;
+    let mut best: Option<(String, i64)> = None;
+    for ore in ORES {
+        let count = role.count_item(ore);
+        if count == 0 || (ore == STONE && stone_surplus <= 0) {
+            continue;
+        }
+        let value = priced(turn, state, ore);
+        if best.as_ref().map(|(_, held)| value < *held).unwrap_or(true) {
+            best = Some((ore.to_string(), value));
+        }
+    }
+    best
+}
+
+/// Make room in a full pack: drop the cheapest ore the role carries, when a
+/// vein worth strictly more than it is still within reach of the afternoon.
+///
+/// Issue #206 §5 item 8 wired `RoleCommand::drop_item` up — it had been defined
+/// since the first day and called by nothing. This is its caller, and the rule
+/// is the plan's: the pack is full AND a more valuable vein exists → drop the
+/// least valuable ore.
+///
+/// The comparison is per ORE and deliberately not `choose_mine`'s. That metric
+/// is `value × free / rounds`, and a full pack is `free == 0`, so it prices
+/// every vein on the board at zero and cannot see the difference this decision
+/// is about. What is being bought here is one slot; a slot is worth whatever
+/// fills it.
+///
+/// This runs only after the sale has had its turn and produced nothing, which
+/// leaves exactly two boards: a load the vendor will not take (all of it stone
+/// the ring is holding back — and then nothing is droppable, see
+/// [`cheapest_droppable`], so nothing is dropped), and a load the role could
+/// not walk to the vendor. On the second the alternative is standing still for
+/// the rest of the day, so a strictly richer vein is worth one cheap ore.
+pub fn discard_command(
+    turn: &Turn,
+    state: &BotState,
+    role: &Unit,
+    stone_demand: i64,
+) -> Option<RoleCommand> {
+    if !role.backpack_full() {
+        return None;
+    }
+    let (cheapest, held_value) = cheapest_droppable(turn, state, role, stone_demand)?;
+    let budget = (DUSK_ROUND - turn.in_day_round).max(0) - DUSK_TRIP_MARGIN;
+    let better = turn.all_mines().iter().any(|(pos, ore)| {
+        ore != &cheapest
+            && !state.ore_on_outage(ore, turn.day)
+            && (budget <= 0 || crate::brain::route::trip_rounds(turn, role.pos, *pos) <= budget)
+            && priced(turn, state, ore) > held_value
+    });
+    if !better {
+        return None;
+    }
+    crate::log::event(
+        "pack_discard",
+        serde_json::json!({
+            "round": turn.round_no,
+            "role": role.id,
+            "drop": cheapest,
+            "value": held_value,
+            "pack": role.backpack.len(),
+        }),
+    );
+    Some(RoleCommand::drop_item(&cheapest))
+}
+
 /// Pick the mine for this worker: stones first while wall demand is unmet,
 /// otherwise the mine with the best gold-per-round ROI.
 ///
@@ -1183,7 +1312,7 @@ fn mine_roi(price: i64, trip_rounds: i64, free_capacity: i64) -> f64 {
 pub fn choose_mine(
     turn: &Turn,
     state: &BotState,
-    role_pos: Pos,
+    role: &Unit,
     stone_demand: i64,
     claimed: &HashSet<Pos>,
 ) -> Option<(Pos, String)> {
@@ -1200,7 +1329,7 @@ pub fn choose_mine(
     if options.is_empty() {
         return None;
     }
-    let walk = |pos: Pos| crate::brain::route::trip_rounds(turn, role_pos, pos);
+    let walk = |pos: Pos| crate::brain::route::trip_rounds(turn, role.pos, pos);
     // Stones for the wall line: nearest stone mine wins. Stone is a structural
     // demand, not an economic choice — ROI doesn't apply.
     if stone_demand > 0 {
@@ -1216,18 +1345,17 @@ pub fn choose_mine(
     // A time-budget filter rejects mines whose round-trip would strand the
     // worker outside the ring at nightfall.
     let budget = (DUSK_ROUND - turn.in_day_round).max(0) - DUSK_TRIP_MARGIN;
-    let viable: Vec<(Pos, String)> = options
+    let within_budget: Vec<(Pos, String)> = options
         .into_iter()
         .filter(|(pos, _)| budget <= 0 || walk(*pos) <= budget)
         .collect();
-    if viable.is_empty() {
+    if within_budget.is_empty() {
         return None;
     }
-    viable.into_iter().max_by(|(pos_a, ore_a), (pos_b, ore_b)| {
-        let price_a = turn.vendor_prices.get(ore_a).copied().unwrap_or(1);
-        let price_b = turn.vendor_prices.get(ore_b).copied().unwrap_or(1);
-        let roi_a = mine_roi(price_a, walk(*pos_a), 100);
-        let roi_b = mine_roi(price_b, walk(*pos_b), 100);
+    let free = free_slots(role);
+    within_budget.into_iter().max_by(|(pos_a, ore_a), (pos_b, ore_b)| {
+        let roi_a = mine_roi(priced(turn, state, ore_a), walk(*pos_a), free);
+        let roi_b = mine_roi(priced(turn, state, ore_b), walk(*pos_b), free);
         roi_a
             .partial_cmp(&roi_b)
             .unwrap_or(std::cmp::Ordering::Equal)

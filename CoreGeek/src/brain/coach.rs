@@ -7,7 +7,7 @@
 //! 因为反向证据移回来。
 //!
 //! 教练只碰三个**已经存在**的开关，别的什么都不碰（D1 墙体优先、`shared_wall_duty`、
-//! gatling→railgun→rocket 建造顺序、三塔上限、不覆盖现有塔、金币储备、collect→sell→buy
+//! `config::TOWER_BUILD_ORDER` 的造塔顺序、三塔上限、不覆盖现有塔、金币储备、collect→sell→buy
 //! 循环、夜间召回、黄昏预定位全部原样保留）：
 //!
 //! | 开关 | 承诺默认 | 收紧（保守） | 放松（激进） |

@@ -266,7 +266,10 @@ impl RoleCommand {
             ..Default::default()
         }
     }
-    #[allow(dead_code)] // reserved for backpack management tactics
+    /// Throw one item away (任务书 §4.5.1: 丢弃(drop)). The only way to make
+    /// room in a full pack — a purchase fails outright when there is no space
+    /// for it, and `collect` fills one slot per round — so it is the economy's
+    /// last resort, owned by `economy::discard_command`.
     pub fn drop_item(name: &str) -> Self {
         Self {
             action: "drop".into(),

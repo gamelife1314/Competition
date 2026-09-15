@@ -12,6 +12,69 @@ use crate::state::{BotState, DiscoveredSchema, TaskStage};
 /// Consecutive "`executeCmd` is not available" verdicts that end a session.
 const MAX_WINDOW_ERRORS: i32 = 2;
 
+/// Which of the task book's three lanes a session belongs to.
+///
+/// 任务书 §5 splits the task line in three, and the split is not cosmetic: the
+/// three are fed by three different sources and are worth three different
+/// things. 推理类 arrives with the world news and is answered by reasoning about
+/// it; 传闻类 is the folk legends and is answered by hunting the altar treasure;
+/// 自进化类 is what the pioneer walks to a task point and accepts. Issue #206
+/// §5 item 4a found the line had no such split at all — every accept went to the
+/// same queue in whatever order the points happened to be in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TaskKind {
+    /// 推理类 — from the day's official news.
+    Reasoning,
+    /// 传闻类 — from the folk legends, answered by the treasure hunt.
+    Rumor,
+    /// 自进化类 — accepted at a task point, run in the sandbox.
+    SelfEvolution,
+    /// Anything the book does not name. Sorted last: an unknown kind is not a
+    /// reason to skip the day's known work.
+    #[default]
+    Other,
+}
+
+impl TaskKind {
+    /// The priority the plan's ordering gives it: 推理 + 传闻 → 自进化 → 其余.
+    pub fn rank(self) -> i32 {
+        match self {
+            TaskKind::Reasoning | TaskKind::Rumor => 0,
+            TaskKind::SelfEvolution => 1,
+            TaskKind::Other => 2,
+        }
+    }
+
+    /// The name the log carries. Stable strings, because they are read by an
+    /// analysis agent that has to group by them.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskKind::Reasoning => "reasoning",
+            TaskKind::Rumor => "rumor",
+            TaskKind::SelfEvolution => "self_evolution",
+            TaskKind::Other => "other",
+        }
+    }
+}
+
+/// Which lane a task type belongs to.
+///
+/// The judger names the type in `taskType` (接口文档: 自进化类1 / 自进化类2), and
+/// the book names the other two the same way, so the classifier is a keyword
+/// scan over that string — no state, no guessing from a description, and the
+/// same type always lands in the same lane.
+pub fn classify(task_type: &str) -> TaskKind {
+    if task_type.contains("自进化") {
+        TaskKind::SelfEvolution
+    } else if task_type.contains("推理") {
+        TaskKind::Reasoning
+    } else if task_type.contains("传闻") {
+        TaskKind::Rumor
+    } else {
+        TaskKind::Other
+    }
+}
+
 /// The last `roundNo` of the day `round_no` falls in.
 pub(crate) fn turn_end_of_day(round_no: i64) -> i64 {
     let round_no = round_no.max(1);
@@ -454,6 +517,7 @@ pub fn plan_pioneer(
                 "task_answer_submit",
                 serde_json::json!({
                     "session": state.task.session_id,
+                    "task_kind": state.task.kind.as_str(),
                     "round": turn.round_no,
                     "answer": logged,
                     "chars": chars,
