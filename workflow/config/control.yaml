@@ -1,0 +1,82 @@
+# CoreGeek 自动化对战工作流 — 控制配置
+#
+# 修改后下次 cron 触发（每 5 分钟）自动生效，无需重启。
+# 只在 PULLCODE 阶段（工作流入口）检查 paused，已启动的循环不受影响。
+
+# ==================== 工作流开关 ====================
+
+# 暂停开关：1 = 暂停整个工作流（PULLCODE 阶段直接返回，不拉代码不推进）
+#           0 = 正常运行
+# 使用场景：人工想让工作流停下来等代码修复完，不用删除定时任务
+paused: 1
+
+# 强制对战开关：1 = 无代码更新时，N 个周期后强制发起对战
+#               0 = 只有代码有更新才发起对战
+force_battle: 0
+
+# ISSUESUBMIT 开关：1 = 分析后提交 GitHub Issue（人工审查改进）
+#                   0 = 跳过 Issue 提交（默认关闭，由 IMPROVE 自动改进）
+issue_submit_enabled: 0
+
+# IMPROVE 开关：1 = ANALYZE 后自动优化代码、编译、提交、发起挑战（默认打开）
+#              0 = 跳过自动改进，走 ISSUESUBMIT 流程
+improve_enabled: 1
+
+# ==================== PULLCODE 阶段 ====================
+
+# force_battle=1 时，无更新多少个周期后强制发起对战（1 周期 = 5 分钟 cron）
+no_update_force_threshold: 3
+
+# ==================== WAIT_BATTLE 阶段 ====================
+
+# 等待对战全部完成的最大超时时间（秒）。超时后强制收集已完成的对战。
+# 2100 秒 = 35 分钟 = 7 个 cron 周期
+battle_wait_timeout: 2100
+
+# ==================== GOBATTLE 阶段 ====================
+
+# 白天单次发起对战上限（挑战排名前 N 名队伍）
+max_battles_per_round: 16
+
+# 夜间单次发起对战上限（夜间可以多发起）
+max_battles_per_round_night: 48
+
+# 对战夜间时段（24 小时制，含起点不含终点，支持跨午夜）
+# 例如 20 ~ 10 表示 20:00 到次日 10:00 为夜间
+battle_night_start_hour: 23
+battle_night_end_hour: 09
+
+# processing 对战达到此数则不再发起新对战
+max_processing_battles: 50
+
+# GOBATTLE 失败重试次数，超过则退回 PULLCODE
+gobattle_max_retries: 3
+
+# ==================== IMPROVE 阶段 ====================
+
+# CodeAgent 调用超时（秒）。1800 秒 = 30 分钟
+improve_timeout: 1800
+
+# ==================== 通用 ====================
+
+# API 请求间隔（秒），用于控制调用频率避免触发反爬
+sleep_interval: 3
+
+# 单次下载对战日志上限
+max_download_per_batch: 200
+
+# 分析阶段最多等待时间（秒）。2400 秒 = 40 分钟
+analysis_wait_timeout: 2400
+
+# ==================== ISSUESUBMIT 阶段 ====================
+
+# 白天单批最大 issue 提交数（按对手排名取前 N）
+max_issues_per_batch: 5
+
+# 夜间单批最大 issue 提交数（夜间模型价格低，可多提交多分析）
+max_issues_per_batch_night: 15
+
+# Issue 夜间时段（24 小时制，含起点不含终点，支持跨午夜）
+# 例如 22 ~ 8 表示 22:00 到次日 08:00 为夜间
+issue_night_start_hour: 18
+issue_night_end_hour: 8
