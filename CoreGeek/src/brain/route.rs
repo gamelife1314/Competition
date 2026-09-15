@@ -255,11 +255,34 @@ pub fn entrance(turn: &Turn, state: &BotState, stone_demand: i64) -> Option<Pos>
     // are a step further than the face centres, which is the (small) reason the
     // entrance prefers the middle of a side to a corner.
     let inside_leg = |cell: Pos| chebyshev(station.pos, cell) as i64;
+    // Enemy direction tiebreak: prefer cells on the side AWAY from the enemy
+    // base. Robots spawn from the enemy side, so an entrance facing them is a
+    // highway into our station. This is a TIEBREAK only — errand cost still
+    // dominates, so the gate stays on the economically efficient side. But
+    // when two cells are close in errand cost, the one further from the enemy
+    // wins. The penalty is small enough that it never overrides a meaningfully
+    // shorter errand walk, but large enough to break ties consistently.
+    let enemy_pos = turn.enemy_station().map(|e| e.pos);
     let score = |cell: Pos| -> i64 {
-        errands
+        let errand_cost: i64 = errands
             .iter()
             .map(|errand| errand.trips * (inside_leg(cell) + 1 + chebyshev(cell, errand.pos) as i64))
-            .sum()
+            .sum();
+        // Tiebreak: add a small penalty for cells closer to the enemy.
+        // At most 30 points — less than one errand trip, so it only breaks ties.
+        let penalty = enemy_pos
+            .map(|ep| {
+                let dist_to_enemy = chebyshev(cell, ep) as i64;
+                let station_to_enemy = chebyshev(station.pos, ep) as i64;
+                // Penalize cells on the enemy-facing half of the ring.
+                if dist_to_enemy < station_to_enemy {
+                    30 - (dist_to_enemy - station_to_enemy / 2).max(0)
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        errand_cost + penalty
     };
     let mut best: Option<(i64, i32, i32, Pos)> = None;
     for cell in ring_cells(turn, 2) {

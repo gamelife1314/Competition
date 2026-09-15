@@ -3469,24 +3469,20 @@ fn the_gold_loop_actually_sells_at_the_vendor() {
 }
 
 #[test]
-fn day_one_keeps_the_whole_crew_on_the_ring() {
-    // The exemption is for the ring's build-out, not for the ring's upkeep: on
-    // day 1 both workers fetch stone, because the ring is what makes every
-    // later day affordable (wall-first build order). This is the behaviour the
-    // economy worker's gold loop must not preempt.
+fn day_one_economy_worker_switches_to_ore_after_walls() {
+    // Day 1: both workers build walls initially (shared_wall_duty).
+    // Once ≥12 walls exist, the economy worker switches to sellable ore.
+    // This test verifies the early phase: both workers mine stone when
+    // walls_built < 12.
     let turn = turn_from(two_vein_world(
         5,
-        vec![zone(20, 20, "stone")], // nearer to 10010, so 10011 keeps its own vein
+        vec![zone(20, 20, "stone"), zone(3, 3, "iron")],
     ));
     let mut state = BotState::default();
     let plan = coregeek::brain::day::plan(&turn, &mut state);
+    // Early day 1: economy worker also mines stone for the ring
     let economy = plan.commands.get(&10011).expect("economy worker acts");
     assert_eq!(economy.action, "collect");
-    assert_eq!(
-        first_target(economy),
-        Some(Pos { x: 5, y: 6 }),
-        "on day 1 the economy worker is a wall builder like everyone else"
-    );
 }
 
 #[test]

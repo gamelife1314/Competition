@@ -335,7 +335,14 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // no time for errands, so the old same-role fallback holds; with one worker
     // alive it holds too.
     let workers = turn.workers();
-    let shared_wall_duty = turn.day == 1 && !wall_gaps.is_empty();
+    // Day 1: both workers build walls until the ring is nearly closed, then the
+    // economy worker switches to mining sellable ore. We need gold for towers
+    // AND upgrade vouchers — both workers on stone all day = zero income.
+    // The economy worker is released only when ≤4 gaps remain (the first worker
+    // can close 4 gaps in ~8 rounds, well within the dusk deadline).
+    let shared_wall_duty = turn.day == 1
+        && wall_gaps.len() > 4
+        && workers.len() >= 2;
     let wall_work_done = wall_gaps.is_empty() && !shared_wall_duty;
     let buyer_id: Option<i64> = if budget.intent.is_empty() {
         None
@@ -904,11 +911,21 @@ fn worker_day(
     let on_wall_duty = (Some(role.id) != economy_id || shared_wall_duty)
         && (state.walled_cells_today.len() as i64)
             < wall_daily_cap(turn.day, state.ring_ever_complete);
+    // Economy worker carrying stone when released from wall duty on Day 1:
+    // let it place the stone it's carrying before switching to mining. A
+    // worker with a pack full of stone can't mine ore, and standing idle
+    // with stone is the exact freeze issue #12 describes. Day 2+ the economy
+    // worker sells/ shops instead — wall repair is the first worker's job.
+    let economy_unload_stone = Some(role.id) == economy_id
+        && !shared_wall_duty
+        && turn.day == 1
+        && role.count_item(STONE) > 0
+        && !wall_gaps.is_empty();
     // (shared_wall_duty is passed in from `plan`: day 1 keeps both workers on
     // the ring until it closes — see the comment there.)
     if role.count_item(STONE) > 0
         && !wall_gaps.is_empty()
-        && on_wall_duty
+        && (on_wall_duty || economy_unload_stone)
         && roles_can_reach(turn, pairs)
     {
         let batch = stone_batch(turn, wall_gaps.len());
