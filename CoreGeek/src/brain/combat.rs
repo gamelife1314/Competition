@@ -324,13 +324,23 @@ pub fn win_value_with(weights: &Weights, turn: &Turn, robot: &Robot) -> i64 {
 /// Expected value of `dmg` damage on `robot`: progress toward removing it,
 /// paid in full when the damage is lethal (the whole win value lands) and at a
 /// quarter rate while it is only being softened.
+///
+/// Overkill — damage beyond what the robot's HP absorbs — is penalized at the
+/// same rate as useful damage is rewarded (`damage_weight`). A 30-damage volley
+/// on a 10 HP robot earns `10*damage_weight + win - 20*damage_weight`, not
+/// `10*damage_weight + win`. This makes the tower prefer targets that absorb
+/// more of its damage when both would die: killing a 25 HP robot with 30 damage
+/// (5 overkill) beats killing a 10 HP robot with 30 damage (20 overkill),
+/// because the 15 saved damage could have been another tower's kill.
 fn hit_value(turn: &Turn, robot: &Robot, hp_before: i64, dmg: i64) -> i64 {
     let weights = weights();
     let dealt = dmg.min(hp_before).max(0);
+    let overkill = (dmg - hp_before).max(0);
     let mut value = dealt * weights.damage_weight;
     let win = win_value(turn, robot);
     if dealt >= hp_before {
         value += win;
+        value -= overkill * weights.damage_weight;
     } else if hp_before > 0 {
         value += win * dealt / hp_before / 4;
     }

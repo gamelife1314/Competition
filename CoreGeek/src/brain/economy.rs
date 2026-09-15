@@ -33,6 +33,11 @@ pub const STONE_BUFFER: i64 = 2;
 /// ore is converted to gold so the night is spent upgrading, not digging.
 pub const DUSK_ROUND: i64 = 55;
 
+/// Safety margin: a mining trip must return this many rounds before dusk so
+/// the worker has time to walk through the gate and reach its post. A trip
+/// that arrives at R55 is a worker stuck outside the ring at nightfall.
+const DUSK_TRIP_MARGIN: i64 = 5;
+
 /// Shop price of WeaponUpgradeVoucher1 — the funding goal of the main weapon.
 pub const WEAPON_VOUCHER1_PRICE: i64 = 100;
 
@@ -993,27 +998,31 @@ pub fn choose_sellable_mine(
     role_pos: Pos,
     claimed: &HashSet<Pos>,
 ) -> Option<(Pos, String)> {
-    // Nearest first, equal distance broken by higher vendor value — the same
-    // rule `choose_mine` uses once it has no stone to fetch.
-    let mut best: Option<(i64, std::cmp::Reverse<i64>, i32, i32, Pos, String)> = None;
+    // ROI-based selection — same metric as `choose_mine`, but excludes stone
+    // (structural reserve, not for sale). A time-budget filter rejects mines
+    // whose round-trip would strand the worker outside the ring at nightfall.
+    let budget = (DUSK_ROUND - turn.in_day_round).max(0) - DUSK_TRIP_MARGIN;
+    let mut best: Option<(f64, i64, i32, i32, Pos, String)> = None;
     for (pos, ore) in turn.all_mines() {
         if ore == STONE || state.ore_on_outage(&ore, turn.day) || claimed.contains(&pos) {
             continue;
         }
+        let trip = crate::brain::route::trip_rounds(turn, role_pos, pos);
+        if budget > 0 && trip > budget {
+            continue;
+        }
         let price = turn.vendor_prices.get(&ore).copied().unwrap_or(1);
-        let key = (
-            // Through the day's entrance, exactly as `choose_mine` measures it:
-            // the two selectors feed the same trip, and pricing them differently
-            // made the economy worker and the wall crew disagree about which
-            // vein was near.
-            crate::brain::route::trip_rounds(turn, role_pos, pos),
-            std::cmp::Reverse(price),
-            pos.x,
-            pos.y,
-            pos,
-            ore,
-        );
-        if best.as_ref().map(|current| key < *current).unwrap_or(true) {
+        let roi = mine_roi(price, trip, 100);
+        let key = (roi, trip, pos.x, pos.y, pos, ore);
+        // Maximize ROI; tiebreak by shorter trip, then coordinates.
+        let is_better = best.as_ref().map(|current| {
+            key.0.partial_cmp(&current.0).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| current.1.cmp(&key.1)) // nearer wins on tie
+                .then_with(|| key.3.cmp(&current.3))
+                .then_with(|| key.4.y.cmp(&current.4.y))
+                .is_gt()
+        }).unwrap_or(true);
+        if is_better {
             best = Some(key);
         }
     }
@@ -1023,22 +1032,38 @@ pub fn choose_sellable_mine(
     choose_mine(turn, state, role_pos, 0, claimed)
 }
 
+/// Gold per round for a mining trip — the decision metric that replaced the
+/// old "distance first, price as tiebreak" tuple. A vein 15 rounds away at
+/// 12 gold/ore earns `12*capacity/15 = 80` gold/round; a vein 5 rounds away at
+/// 8 gold earns `8*capacity/5 = 160`. The near vein still wins there, but when
+/// the distant vein is copper (12) and the near one is stone (2), the ROI
+/// ratio flips and the worker goes for copper — which the old tuple never did,
+/// because distance strictly dominated price.
+///
+/// `capacity` is the worker's free backpack slots (not the raw max — a half-full
+/// pack mines half as much per trip, halving the ROI). `trip_rounds` is the
+/// ring-aware round-trip cost from `route::trip_rounds`.
+fn mine_roi(price: i64, trip_rounds: i64, free_capacity: i64) -> f64 {
+    if trip_rounds <= 0 || free_capacity <= 0 {
+        return 0.0;
+    }
+    (price as f64 * free_capacity as f64) / trip_rounds as f64
+}
+
 /// Pick the mine for this worker: stones first while wall demand is unmet,
-/// otherwise the closest mine of any ore.
+/// otherwise the mine with the best gold-per-round ROI.
 ///
 /// **Distance is measured through the ring, not across it** (joint route/order
 /// planner). `chebyshev(role_pos, mine)` is the straight line, and once the
 /// shell is up that line goes through a wall: a vein three cells east of the
 /// base is three rounds away only if the day's entrance happens to be on the
-/// east side, and fifteen if it is on the west. The old metric therefore sent
-/// the crew to the geometrically nearest vein and paid for it in the walk home
-/// — the owner's *"如果朝哪个地方采矿，朝这个方向给开个口方便他进来，减少回合
-/// 浪费"*, read from the other end. `route::trip_rounds` is that same walk with
-/// the opening priced in, so the pick and the entrance agree by construction.
+/// east side, and fifteen if it is on the west. `route::trip_rounds` is that
+/// same walk with the opening priced in, so the pick and the entrance agree
+/// by construction.
 ///
-/// Distance still beats value — a short walk keeps the build loop moving faster
-/// than a high-value ore on the far side of the map — but it is the real
-/// distance now.
+/// ROI — `price × capacity / trip_rounds` — is the decision metric. A distant
+/// high-value vein can beat a near low-value one when the gold-per-round
+/// favors it. Ties break to the nearer mine (less exposure on the road).
 pub fn choose_mine(
     turn: &Turn,
     state: &BotState,
@@ -1060,10 +1085,8 @@ pub fn choose_mine(
         return None;
     }
     let walk = |pos: Pos| crate::brain::route::trip_rounds(turn, role_pos, pos);
-    // Stones for the wall line: nearest stone mine wins (coordinate tiebreak
-    // keeps the pick deterministic across HashMap iteration order). When no
-    // stone is reachable, fall back to the nearest mine of any ore rather
-    // than idling.
+    // Stones for the wall line: nearest stone mine wins. Stone is a structural
+    // demand, not an economic choice — ROI doesn't apply.
     if stone_demand > 0 {
         if let Some((pos, ore)) = options
             .iter()
@@ -1073,9 +1096,27 @@ pub fn choose_mine(
             return Some((*pos, ore.clone()));
         }
     }
-    // Nearest mine first; equal distance broken by higher vendor value.
-    options.into_iter().min_by_key(|(pos, ore)| {
-        let price = turn.vendor_prices.get(ore).copied().unwrap_or(1);
-        (walk(*pos), std::cmp::Reverse(price), pos.x, pos.y)
+    // ROI-based selection: maximize gold per round, tiebreak by shorter trip.
+    // A time-budget filter rejects mines whose round-trip would strand the
+    // worker outside the ring at nightfall.
+    let budget = (DUSK_ROUND - turn.in_day_round).max(0) - DUSK_TRIP_MARGIN;
+    let viable: Vec<(Pos, String)> = options
+        .into_iter()
+        .filter(|(pos, _)| budget <= 0 || walk(*pos) <= budget)
+        .collect();
+    if viable.is_empty() {
+        return None;
+    }
+    viable.into_iter().max_by(|(pos_a, ore_a), (pos_b, ore_b)| {
+        let price_a = turn.vendor_prices.get(ore_a).copied().unwrap_or(1);
+        let price_b = turn.vendor_prices.get(ore_b).copied().unwrap_or(1);
+        let roi_a = mine_roi(price_a, walk(*pos_a), 100);
+        let roi_b = mine_roi(price_b, walk(*pos_b), 100);
+        roi_a
+            .partial_cmp(&roi_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| walk(*pos_b).cmp(&walk(*pos_a))) // tiebreak: nearer
+            .then_with(|| pos_a.x.cmp(&pos_b.x))
+            .then_with(|| pos_a.y.cmp(&pos_b.y))
     })
 }
