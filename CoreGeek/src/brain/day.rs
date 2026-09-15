@@ -304,6 +304,14 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     if guard {
         build_reserve = build_reserve.max(WEAPON_BUILD_COST);
     }
+    // Dusk cash-out (issues #201-#205): once dusk arrives, drop the build
+    // reserve so every remaining gold is spendable on weapon upgrades and
+    // towers. Hoarding gold past DUSK_ROUND buys nothing — the night is spent
+    // fighting, not shopping — so the reserve that protected the third-tower
+    // fund all afternoon is released the moment that fund's window closes.
+    if turn.in_day_round >= economy::DUSK_ROUND {
+        build_reserve = 0;
+    }
     // P2-2 宝藏线的献祭金：祭坛坐标、献祭物品、开启日、4 次上限全都实现了，却一次
     // 也跑不起来——因为购物单会把金币全部花在升级券上，开拓者走到商店时钱包是空
     // 的，只能站在柜台前等，等到开启日过去。这里把"下一件献祭物的钱"从购物单里
@@ -1080,6 +1088,30 @@ fn worker_day(
     //    role outside the ring for the whole dusk window in the measurement
     //    behind `dusk_recall_round`. It sells what it carries and goes in.
     if committed {
+        // Dusk cash-out (issues #201-#205): the buyer gets one last weapon
+        // purchase through the dusk seal window. Gold left unspent at dusk is
+        // gold that buys nothing all night — the reserve is already 0, so any
+        // affordable weapon upgrade voucher in the shopping list is spent now
+        // rather than hoarded. The trip must still fit inside the seal grace
+        // (DUSK_ROUND + SEAL_GRACE) so the buyer is back before nightfall.
+        if buyer_id == Some(role.id) && !budget.shopping.is_empty() {
+            let weapon_affordable = budget.shopping.iter().any(|need| {
+                need.name.starts_with("WeaponUpgradeVoucher")
+                    || need.name.starts_with("StationUpgradeVoucher")
+            });
+            if weapon_affordable
+                && shop_round_trip(turn, role, pairs)
+                    .map(|trip| {
+                        turn.in_day_round + trip <= economy::DUSK_ROUND + SEAL_GRACE
+                    })
+                    .unwrap_or(false)
+            {
+                if let Some(cmd) = buyer_flow(turn, role, &budget.shopping, pairs, claimed) {
+                    plan.push(role.id, cmd);
+                    return;
+                }
+            }
+        }
         // fall through: steps 8 and 9 still run, everything below them is
         // replaced by the lock-in.
     } else if buyer_id == Some(role.id)
