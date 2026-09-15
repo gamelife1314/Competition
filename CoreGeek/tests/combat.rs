@@ -442,14 +442,13 @@ fn day_world_at(
 }
 
 #[test]
-fn shopping_list_prioritizes_the_station_voucher_over_the_weapon_voucher() {
-    // REPLACES `shopping_list_prioritizes_weapon_upgrade_voucher`, which
-    // asserted the opposite. The old order was commissioned when the guns were
-    // killing nothing; issues #161-#170 measure the reverse (kill 70-424) and
-    // the cost of the old order exactly: ten matches, ten opponents, not one
-    // `StationUpgradeVoucher1` bought in any of them (表 2a), nine bases lost,
-    // `scoreAttr.survival` 0-30 against a 应得 of 10-100 (表 8). See
-    // `economy::intent_list`'s station block and `tests/station_upgrade.rs`.
+fn shopping_list_prioritizes_the_weapon_voucher_over_the_station_voucher() {
+    // Offense-first (issues #201-#205): with fewer than 3 towers or any tower
+    // still at level 1, the weapon upgrade voucher outranks the station voucher
+    // — firepower kills enemies for score, which is how the base survives
+    // long-term. The base upgrade only leads once weapons are maxed (3 towers,
+    // all L2). See `economy::intent_list`'s station block and
+    // `tests/station_upgrade.rs`.
     //
     // The coverage the old test carried is kept in both directions: (a) an
     // UPGRADE voucher buys through the build reserve — the head here costs 50
@@ -475,13 +474,13 @@ fn shopping_list_prioritizes_the_station_voucher_over_the_weapon_voucher() {
     let list = coregeek::brain::economy::shopping_list(&turn, &state, reserve);
     assert_eq!(
         list.first().map(|need| need.name.as_str()),
-        Some("StationUpgradeVoucher1"),
-        "the base outranks the gun on the survival ranking, and buys through \
-         the build reserve (75 gold, 50 reserved, a 50-gold voucher)"
+        Some("WeaponUpgradeVoucher1"),
+        "the gun outranks the base while firepower is still being built, and \
+         buys through the build reserve (75 gold, 50 reserved, a 50-gold voucher)"
     );
     assert!(
-        !list.iter().any(|need| need.name == "WeaponUpgradeVoucher1"),
-        "and it consumes the purse, so the gun waits for the next sale: {:?}",
+        !list.iter().any(|need| need.name == "StationUpgradeVoucher1"),
+        "and it consumes the purse, so the base waits for the next sale: {:?}",
         list.iter().map(|need| need.name.as_str()).collect::<Vec<_>>()
     );
 }

@@ -113,24 +113,23 @@ fn board(gold: i64, walls: usize) -> Value {
 }
 
 #[test]
-fn a_purse_that_covers_one_voucher_buys_the_base_not_the_gun() {
-    // 130 gold is the measured peak in every one of the ten reports (表 2c:
-    // 130/146, 66, 146, 66, 155, 120, 142) and issue #166 spent exactly this
-    // purse on `WeaponUpgradeVoucher1` at round 37. Both vouchers cost 100, so
-    // the round buys one of them. The base is the loss condition and the only
-    // asset with no repair item; a level-2 station is 3000 HP instead of 1500.
+fn a_purse_that_covers_one_voucher_buys_the_gun_not_the_base() {
+    // Offense-first (issues #201-#205): with fewer than 3 towers or any tower
+    // still at level 1, the weapon upgrade voucher wins the tie — firepower
+    // kills enemies for score, which is how the base survives long-term.
+    // 130 gold covers one 100-gold voucher; the weapon voucher is bought first.
     let turn = turn_from(board(130, 0));
     let list = shopping_list(&turn, &BotState::default(), 0);
     let names = bought(&list);
 
     assert!(
-        names.contains(&"StationUpgradeVoucher1"),
-        "the base upgrade is affordable and must be bought: {names:?}"
+        names.contains(&"WeaponUpgradeVoucher1"),
+        "the weapon upgrade is affordable and prioritized over the base: {names:?}"
     );
     assert!(
-        !names.contains(&"WeaponUpgradeVoucher1"),
-        "the purse covers one 100-gold voucher, and the base outranks the gun \
-         on the survival ranking the code already computes: {names:?}"
+        !names.contains(&"StationUpgradeVoucher1"),
+        "the purse covers one 100-gold voucher, and the gun outranks the base \
+         while firepower is still being built: {names:?}"
     );
 }
 
@@ -173,8 +172,24 @@ fn the_station_is_upgraded_at_level_two_and_not_again_at_three() {
     // The ladder is per level: level 2 asks for `StationUpgradeVoucher2`
     // (150 gold, 3000 -> 4500 HP), and a level-3 station is the cap
     // (任务书 4.6.3: "到达最高等级后再次使用升级券不会生效").
+    //
+    // Offense-first: the station voucher only wins once weapons are maxed
+    // (3 towers, all L2). The board below adds two more L2 towers so the
+    // tie-breaker falls to the station.
     let mut payload = board(200, 0);
     payload["teamOur"]["roles"][0]["level"] = json!(2);
+    // Add 2 more L2 towers so weapons_maxed = true
+    payload["teamOur"]["roles"].as_array_mut().unwrap().push(json!({
+        "id": 10021, "pos": {"x": 12, "y": 22}, "roleType": "railgun",
+        "health": 1000, "attackPower": 10, "attackRange": 6, "level": 2,
+        "backPackCapability": 0, "backpack": []
+    }));
+    payload["teamOur"]["roles"].as_array_mut().unwrap().push(json!({
+        "id": 10022, "pos": {"x": 11, "y": 22}, "roleType": "rocket",
+        "health": 1000, "attackPower": 20, "attackRange": 10, "level": 2,
+        "backPackCapability": 0, "backpack": []
+    }));
+    payload["teamOur"]["roles"].as_array_mut().unwrap()[1]["level"] = json!(2); // gatling L2
     payload["weaponShopList"]
         .as_array_mut()
         .unwrap()
@@ -184,7 +199,7 @@ fn the_station_is_upgraded_at_level_two_and_not_again_at_three() {
     let names = bought(&list);
     assert!(
         names.contains(&"StationUpgradeVoucher2"),
-        "a level-2 base buys the level-3 voucher: {names:?}"
+        "a level-2 base buys the level-3 voucher once weapons are maxed: {names:?}"
     );
     assert!(
         !names.contains(&"StationUpgradeVoucher1"),

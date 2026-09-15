@@ -146,10 +146,13 @@ fn the_gap_no_voucher_can_close_leaves_the_station_at_the_front() {
     let mut needs = intent_list(&turn, &state, 0);
     assert!(priority_of(&needs, "StationUpgradeVoucher1").is_some());
     clear_gap_order_with(true, &turn, &mut needs);
+    // Offense-first: station starts at priority 2 (behind weapon 0 and walls 1)
+    // when weapons aren't maxed. clear_gap_order_with does NOT demote it further
+    // because the gap is too large for one voucher to close.
     assert_eq!(
         priority_of(&needs, "StationUpgradeVoucher1"),
-        Some(0),
-        "a wave no single voucher can cover is not a reason to leave the base at 1500"
+        Some(2),
+        "station stays at its offense-first priority (2) when the gap is too large for one voucher"
     );
     assert_eq!(priority_of(&needs, "WeaponUpgradeVoucher1"), Some(0));
     // The harassment suppression is deliberately unchanged: it still keys on the
@@ -158,11 +161,9 @@ fn the_gap_no_voucher_can_close_leaves_the_station_at_the_front() {
     // what one voucher buys.
     assert!(priority_of(&needs, "BossRobotSummonOrder").is_none());
 
-    // And the outcome, not the tier: with exactly one voucher's worth of gold on
-    // this board, the voucher that gets bought is the base's. This is the
-    // assertion that fails when the demotion is reinstated — under it the
-    // station drops to priority 5, the weapon voucher takes the whole 100, and
-    // §19.4's acceptance criterion ("只买得起一张券时应当是基地券") does not hold.
+    // And the outcome: with exactly one voucher's worth of gold on this board,
+    // offense-first (issues #201-#205) means the weapon voucher is bought —
+    // firepower kills enemies for score, which is how the base survives.
     let mut poor = board;
     poor["teamOur"]["goldNum"] = json!(100);
     let turn = turn_from(poor);
@@ -172,32 +173,25 @@ fn the_gap_no_voucher_can_close_leaves_the_station_at_the_front() {
         .collect();
     assert_eq!(
         bought,
-        vec!["StationUpgradeVoucher1".to_string()],
-        "the only affordable voucher must be the one that doubles the base"
+        vec!["WeaponUpgradeVoucher1".to_string()],
+        "the only affordable voucher must be the weapon upgrade — offense-first"
     );
 }
 
 #[test]
 fn the_committed_order_stands_when_the_dial_is_off_or_the_gap_is_closed() {
-    // The dial-off order IS the committed order, and it now puts the station
-    // voucher in the same tier as the weapon voucher (priority 0, decided by
-    // `survival_value`). This assertion used to read `Some(1)`: issues
-    // #161-#170 overturn that, and the evidence is in `tests/station_upgrade.rs`
-    // and in the block comment in `economy::intent_list` — ten matches, ten
-    // opponents, not one `StationUpgradeVoucher1` bought (表 2a), nine bases
-    // lost, `scoreAttr.survival` 0-30 against a 应得 of 10-100. The tier was set
-    // when the guns were killing nothing (the batches behind `clear_gap_order_with`
-    // read kill=0); this batch reads kill 70-424, so firepower is no longer the
-    // binding constraint and the base is.
+    // Offense-first (issues #201-#205): with 3×L1 towers, weapons are NOT maxed,
+    // so the station voucher sits at priority 2 (behind weapon 0 and walls 1).
+    // clear_gap_order_with(dial=false) does nothing, so it stays at 2.
     let turn = turn_from(rich_board(1));
     let state = BotState::default();
     let mut needs = intent_list(&turn, &state, 0);
     clear_gap_order_with(false, &turn, &mut needs);
-    assert_eq!(priority_of(&needs, "StationUpgradeVoucher1"), Some(0));
+    assert_eq!(priority_of(&needs, "StationUpgradeVoucher1"), Some(2));
     assert!(priority_of(&needs, "BossRobotSummonOrder").is_some());
 
-    // 3×L3 towers: capacity 80×60 = 4800 ≥ the 4050 estimate — no gap, and
-    // even a switched-on dial changes nothing.
+    // 3×L3 towers: weapons are maxed, so station is at priority 0. No gap,
+    // and even a switched-on dial changes nothing.
     let turn = turn_from(rich_board(3));
     let mut needs = intent_list(&turn, &state, 0);
     clear_gap_order_with(true, &turn, &mut needs);
