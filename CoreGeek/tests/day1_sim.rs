@@ -730,15 +730,16 @@ fn the_day_one_ring_is_sealed_before_the_night() {
 
 #[test]
 fn all_three_towers_go_up_on_day_one() {
-    // Offense-first: Day 1 prioritizes building all 3 towers so every worker
-    // has a weapon to operate at night. Build order: rocket → railgun →
-    // gatling. The wall ring is secondary — firepower kills enemies for
-    // score, which is how the base survives.
+    // Station-fund guard (issues #201-#205): Day 1 builds 2 towers (50g) and
+    // reserves the remaining gold for the 100g StationUpgradeVoucher1. The
+    // third tower is deferred until the voucher is bought or the purse can
+    // afford both (≥125g). Two towers give enough firepower for the first
+    // night while the base gets upgraded to L2 (3000 HP).
     let world = run_day_one();
     let tower_count = world.tower_builds.len();
     assert!(
-        tower_count >= 3,
-        "only {tower_count} towers were built on day 1 — offense-first requires all 3"
+        tower_count >= 2,
+        "only {tower_count} towers were built on day 1 — need at least 2 for the first night"
     );
 }
 
@@ -944,7 +945,16 @@ fn a_door_cut_in_the_morning_is_resealed_before_night() {
     // budget may already be spent — so the door was a robot-sized hole until
     // the next morning (v1 §5.5). With the door now counted in the day's stone
     // demand, a carrier keeps a stone back and walls the cell from dusk.
-    let mut world = run_day_one();
+    //
+    // A StationUpgradeVoucher1 is seeded into the starting backpack so the
+    // Day 1 station-fund guard (issues #201-#205) does not defer the third
+    // tower — this test is about the door-sealing mechanism, not the tower
+    // budget, and the 3-tower state is what the Day 2 economy was tuned for.
+    let mut world = World::new();
+    world.units.iter_mut().find(|u| u.id == 10002).unwrap().backpack.push("StationUpgradeVoucher1".into());
+    while world.round <= DAY_END {
+        world.step();
+    }
     let ring = world.ring().len();
     assert!(
         world.wall_count() >= ring - 1,

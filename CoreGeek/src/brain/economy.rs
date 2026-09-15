@@ -610,7 +610,16 @@ pub fn clear_gap_order_with(drive: bool, turn: &Turn, needs: &mut Vec<Need>) {
     // statement about the wave, not about what one voucher buys, and leaving it
     // where it was keeps this change to the single decision the evidence
     // overturns.
-    if gap <= crate::brain::combat::best_weapon_step_gain(turn) {
+    // L1 base guard: a 1500-HP base is the loss condition itself (任务书 ch.7)
+    // and the only source of Survival score. Upgrading to L2 (3000 HP) is the
+    // single most impactful survival purchase. Never demote the station voucher
+    // while the base is still L1 and no voucher has been bought — even if the
+    // firepower gap is small enough that one weapon step could close it, the
+    // station upgrade is the better 100g when the base is at its lowest.
+    let station_l1 = turn.station().map_or(false, |s| s.level == 1)
+        && stock_of(turn, "StationUpgradeVoucher1") == 0;
+
+    if gap <= crate::brain::combat::best_weapon_step_gain(turn) && !station_l1 {
         for need in needs.iter_mut() {
             if matches!(
                 need.name.as_str(),
@@ -687,8 +696,16 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         // Medicine that saves a controller is worth more than 25 gold kept for
         // a tower that cannot be built after dark.
         let wall_voucher = need.name.starts_with("WallUpgradeVoucher");
+        // Day 1 base-protection: when the station is L1 and no upgrade voucher
+        // has been bought, consumables (Medicine/WallFixer) must not bypass the
+        // reserve — every gold coin spent on a bandage is a coin that delays
+        // the 100g StationUpgradeVoucher1, and the base falling on Day 2 costs
+        // far more than one un-bought Medicine.
+        let station_fund_guard = turn.day == 1
+            && turn.station().map_or(false, |s| s.level == 1)
+            && stock_of(turn, "StationUpgradeVoucher1") == 0;
         let floor = if (is_upgrade(&need.name) && !wall_voucher)
-            || (urgent && is_night_readiness(&need.name))
+            || (urgent && is_night_readiness(&need.name) && !station_fund_guard)
             || (cashout && need.combat_per_gold > 0.0 && !wall_voucher)
         {
             0
@@ -873,7 +890,27 @@ fn funding_next_weapon(turn: &Turn, role: &Unit) -> bool {
 /// the 1-2 tower fund, so the voucher is bought the moment the collect→sell→buy
 /// loop can pay for it. What it no longer gets is a veto over the third gun.
 pub fn may_build_weapon(turn: &Turn, _state: &BotState) -> bool {
-    turn.towers().len() < 3 && turn.gold >= WEAPON_BUILD_COST
+    if turn.towers().len() >= 3 || turn.gold < WEAPON_BUILD_COST {
+        return false;
+    }
+    // Day 1 base-protection: when the station is still L1 and no upgrade
+    // voucher has been bought, block the THIRD tower early in the day so the
+    // 25g can go toward the 100g StationUpgradeVoucher1. Two towers are always
+    // allowed — the first night needs firepower. The block lifts at the
+    // fallback window (`DUSK_ROUND - FALLBACK_LEAD`): by then the voucher is
+    // either bought or out of reach tonight, and the 25g is better spent on a
+    // third gun for tonight's defense than held for a purchase that cannot
+    // happen before dark (issues #201-#205 vs. P0-2's two-gun matches).
+    if turn.day == 1
+        && turn.towers().len() >= 2
+        && turn.station().map_or(false, |s| s.level == 1)
+        && stock_of(turn, "StationUpgradeVoucher1") == 0
+        && turn.gold - WEAPON_BUILD_COST < WEAPON_VOUCHER1_PRICE
+        && turn.in_day_round < DUSK_ROUND - FALLBACK_LEAD - GUARD_LEAD
+    {
+        return false;
+    }
+    true
 }
 
 /// Can the team still put 100 gold together before dusk? A carried voucher

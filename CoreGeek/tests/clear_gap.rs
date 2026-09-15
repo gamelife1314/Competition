@@ -36,9 +36,14 @@ fn turn_from(payload: Value) -> Turn {
 /// A rich day-2 board: three towers of the given level, station L1, 8 walls,
 /// 600 gold — everything intent_list could possibly queue is queued.
 fn rich_board_with(tower_level: i64, kinds: [&str; 3]) -> Value {
+    rich_board_with_station(tower_level, 1, kinds)
+}
+
+fn rich_board_with_station(tower_level: i64, station_level: i64, kinds: [&str; 3]) -> Value {
+    let station_hp = if station_level >= 2 { 3000 } else { 1500 };
     let mut roles = vec![
         json!({"id": 10001, "pos": {"x": 10, "y": 24}, "roleType": "station",
-             "health": 1500, "level": 1, "backPackCapability": 0, "backpack": []}),
+             "health": station_hp, "level": station_level, "backPackCapability": 0, "backpack": []}),
         json!({"id": 10002, "pos": {"x": 13, "y": 24}, "roleType": "worker",
              "health": 220, "attackPower": 0, "attackRange": 0,
              "backPackCapability": 100, "backpack": []}),
@@ -98,18 +103,20 @@ fn priority_of(needs: &[coregeek::brain::economy::Need], name: &str) -> Option<i
 
 #[test]
 fn a_gap_one_voucher_can_close_still_demotes_the_station() {
-    // 3×L2 gatlings on day 2: capacity 3600 against the 4050 estimate — a gap of
-    // 450, and one more weapon level is worth 600. A single voucher covers it,
-    // so tonight IS a firepower problem and the guns keep the front of the queue.
-    let turn = turn_from(rich_board_with(2, ["gatling", "gatling", "gatling"]));
+    // 3×L2 gatlings on day 2 with station already L2: capacity 3600 against the
+    // 4050 estimate — a gap of 450, and one more weapon level is worth 600. A
+    // single voucher covers it, so tonight IS a firepower problem and the guns
+    // keep the front of the queue. The station is already L2 so the L1 guard
+    // does not protect it from demotion.
+    let turn = turn_from(rich_board_with_station(2, 2, ["gatling", "gatling", "gatling"]));
     let state = BotState::default();
     let mut needs = intent_list(&turn, &state, 0);
-    assert!(priority_of(&needs, "StationUpgradeVoucher1").is_some());
+    assert!(priority_of(&needs, "StationUpgradeVoucher2").is_some());
     assert!(priority_of(&needs, "BossRobotSummonOrder").is_some());
 
     clear_gap_order_with(true, &turn, &mut needs);
     assert_eq!(
-        priority_of(&needs, "StationUpgradeVoucher1"),
+        priority_of(&needs, "StationUpgradeVoucher2"),
         Some(5),
         "a bigger base behind guns one voucher from covering the wave waits"
     );
@@ -121,6 +128,31 @@ fn a_gap_one_voucher_can_close_still_demotes_the_station() {
         priority_of(&needs, "WeaponUpgradeVoucher2"),
         Some(0),
         "firepower keeps the front of the queue"
+    );
+}
+
+#[test]
+fn l1_station_is_never_demoted_without_a_voucher() {
+    // L1 base protection (issues #201-#205): a 1500-HP base is the loss
+    // condition itself. Even when the gap is small enough for one weapon
+    // voucher to close, the station upgrade to L2 (3000 HP) is the better
+    // 100g when the base is at its lowest and no voucher has been bought.
+    let turn = turn_from(rich_board_with(2, ["gatling", "gatling", "gatling"]));
+    let state = BotState::default();
+    let mut needs = intent_list(&turn, &state, 0);
+    let before = priority_of(&needs, "StationUpgradeVoucher1");
+    assert!(before.is_some());
+
+    clear_gap_order_with(true, &turn, &mut needs);
+    assert_eq!(
+        priority_of(&needs, "StationUpgradeVoucher1"),
+        before,
+        "L1 station without a voucher is never demoted — survival first"
+    );
+    // Harassment is still suppressed regardless of the L1 guard.
+    assert!(
+        priority_of(&needs, "BossRobotSummonOrder").is_none(),
+        "harassment is still silenced while the gap is positive"
     );
 }
 

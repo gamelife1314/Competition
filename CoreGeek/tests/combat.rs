@@ -1429,15 +1429,19 @@ fn the_third_weapon_is_gated_by_the_purse_and_the_three_tower_cap() {
         coregeek::brain::economy::may_build_weapon(&towers(25, 1, 1), &state),
         "second weapon builds with 25g"
     );
-    // The third slot is no longer hostage to the level-2 voucher: 25 gold in
-    // hand and no level-2 gun is exactly the board the analysis was about.
+    // Day 1 station-fund guard (issues #201-#205): the third tower is blocked
+    // when the station is L1, no upgrade voucher has been bought, and the purse
+    // cannot afford both the 25g tower and the 100g voucher. Building all three
+    // towers on Day 1 drained the budget and the base never left 1500 HP.
     assert!(
-        coregeek::brain::economy::may_build_weapon(&towers(25, 2, 1), &state),
-        "the third weapon is bought with 25g, not with 125"
+        !coregeek::brain::economy::may_build_weapon(&towers(25, 2, 1), &state),
+        "third tower on Day 1 with L1 station and no voucher is blocked — station fund first"
     );
+    // With 125g the third tower is allowed: 125 - 25 = 100, exactly the voucher
+    // price. The team can build the tower AND buy the station upgrade.
     assert!(
-        coregeek::brain::economy::may_build_weapon(&towers(25, 2, 2), &state),
-        "…and an already-upgraded main gun does not change that"
+        coregeek::brain::economy::may_build_weapon(&towers(125, 2, 1), &state),
+        "third tower is allowed when the purse covers both the tower and the voucher"
     );
     // The two doors that remain. One gold short is one gold short — the gate is
     // the price, and a level-1 main gun does not lower it.
@@ -2809,7 +2813,8 @@ fn held_back_wall_stone_is_not_spending_power() {
                 "health": 220, "attackPower": 0, "attackRange": 0,
                 "backPackCapability": 100,
                 "backpack": ["stone", "stone", "stone", "stone", "stone",
-                             "stone", "stone", "stone", "stone", "stone"]
+                             "stone", "stone", "stone", "stone", "stone",
+                             "StationUpgradeVoucher1"]
             }),
         ],
         25,
@@ -3007,7 +3012,11 @@ fn the_third_weapon_no_longer_waits_for_the_upgrade_voucher() {
                 station(10, 20, 1),
                 gatling(10020, 10, 10, 1),
                 railgun(10030, 12, 10, 1),
-                worker(10010, 3, 3),
+                json!({
+                    "id": 10010, "pos": {"x": 3, "y": 3}, "roleType": "worker",
+                    "health": 220, "attackPower": 0, "attackRange": 0,
+                    "backPackCapability": 100, "backpack": ["StationUpgradeVoucher1"]
+                }),
             ],
             gold,
             vec![voucher("WeaponUpgradeVoucher1", 100)],
@@ -3063,7 +3072,7 @@ fn the_third_weapon_no_longer_waits_for_the_upgrade_voucher() {
     carried.push(json!({
         "id": 10010, "pos": {"x": 3, "y": 3}, "roleType": "worker",
         "health": 220, "attackPower": 0, "attackRange": 0,
-        "backPackCapability": 100, "backpack": ["WeaponUpgradeVoucher1"]
+        "backPackCapability": 100, "backpack": ["WeaponUpgradeVoucher1", "StationUpgradeVoucher1"]
     }));
     let held = turn_from(day_world_at(
         day_round(coregeek::brain::economy::DUSK_ROUND - 15),
