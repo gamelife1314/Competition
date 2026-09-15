@@ -32,10 +32,14 @@ fn station() -> Value {
 }
 
 fn tower(id: i64, kind: &str, dx: i32, dy: i32) -> Value {
+    tower_with_level(id, kind, dx, dy, 2)
+}
+
+fn tower_with_level(id: i64, kind: &str, dx: i32, dy: i32, level: i64) -> Value {
     json!({
         "id": id, "pos": {"x": BASE.0 + dx, "y": BASE.1 + dy}, "roleType": kind,
         "health": 1000, "attackPower": 10, "attackRange": 3,
-        "level": 1, "backPackCapability": 0, "backpack": []
+        "level": level, "backPackCapability": 0, "backpack": []
     })
 }
 

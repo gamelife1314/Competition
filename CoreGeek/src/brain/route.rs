@@ -194,6 +194,16 @@ pub fn errands(turn: &Turn, state: &BotState, stone_demand: i64) -> Vec<Errand> 
     for shop in turn.weapon_shops() {
         push(shop, 8, &mut list);
     }
+    // Gate faces the direction workers are heading: their current positions
+    // also influence the entrance, so a crew clustered on one side of the base
+    // doesn't have to walk through the opposite side to get out. Only matters
+    // when there are actual errands — if the list is empty, the planner has
+    // no evidence and falls back to the legacy corner.
+    if !list.is_empty() {
+        for worker in turn.workers() {
+            push(worker.pos, 5, &mut list);
+        }
+    }
     // Deterministic, with a total order: two points of equal weight and equal
     // distance must not make the entrance flicker with hash iteration order.
     list.sort_by_key(|errand| {

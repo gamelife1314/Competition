@@ -3101,6 +3101,16 @@ fn second_layer_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
     if turn.day < SECOND_LAYER_MIN_DAY || turn.towers().len() < 3 {
         return Vec::new();
     }
+    // Offense-first: don't build a second wall layer until weapons are maxed.
+    // Every stone and gold spent on an outer wall while the guns are still
+    // level 1 is a round the crew walks away from the mine→sell→upgrade loop
+    // that actually closes the firepower gap. The first ring is the minimum
+    // viable defense; the second layer is a luxury we can afford once the
+    // towers are level 2.
+    let weapons_maxed = turn.towers().iter().all(|t| t.level >= 2);
+    if !weapons_maxed {
+        return Vec::new();
+    }
     let sectors = state.threatened_sectors();
     if sectors.is_empty() {
         return Vec::new();

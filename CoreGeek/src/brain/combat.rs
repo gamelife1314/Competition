@@ -446,11 +446,32 @@ pub fn choose_attack_kind_with(
             return Some((targets, TargetKind::Robots));
         }
     }
-    // Fallback: fire at the opponent's assets. The tower has no NPC robot in
-    // range (robot targeting returned empty above), so firing at enemy units
-    // for kill points does not split our defense — this tower was going to
-    // sit idle anyway. Offense-first: every idle volley into the enemy is
-    // permanent progress toward the win condition (issues #201-#205).
+    // Offense-first: when no NPC robot is threatening us, check for enemy
+    // summoned robots. After our robots are cleared, the opponent's summoned
+    // units are still marching — rockets with splash damage can eliminate them
+    // for kill points and reduce enemy pressure.
+    if tower.kind == UnitKind::Rocket {
+        let enemy_robots: Vec<&Robot> = turn
+            .robots
+            .iter()
+            .filter(|robot| {
+                robot.target_team != turn.team_type
+                    && sim.get(&robot.id).copied().unwrap_or(0) > 0
+                    && in_range(tower, robot.pos)
+            })
+            .collect();
+        if !enemy_robots.is_empty() {
+            if let Some(targets) = choose_rocket(turn, tower, &enemy_robots, projectiles, sim) {
+                if !targets.is_empty() {
+                    sim.fired.insert(tower.id);
+                    return Some((targets, TargetKind::Robots));
+                }
+            }
+        }
+    }
+    // Offense-first: fire at the opponent's assets when nothing else is in
+    // range. This tower was going to sit idle anyway — every idle volley into
+    // the enemy is permanent progress toward the win condition (issues #201-#205).
     let targets = choose_enemy_targets_with(policy, turn, tower, projectiles, sim);
     targets.map(|targets| {
         sim.fired.insert(tower.id);
