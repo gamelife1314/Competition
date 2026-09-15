@@ -5,8 +5,8 @@
 use std::collections::HashSet;
 
 use crate::brain::{
-    economy, night, route, stand_cells, task, tower_stand_cells, treasure, walk_or_remove_wall,
-    walk_toward, Plan,
+    economy, news, night, route, stand_cells, task, tower_stand_cells, treasure,
+    walk_or_remove_wall, walk_toward, Plan,
 };
 use crate::model::{
     chebyshev, footprint_distance, station_footprint, Turn, Unit, STONE, WEAPON_BUILD_COST,
@@ -1248,6 +1248,22 @@ fn pioneer_day(
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
 ) {
+    // The day's news goes to the model before anything else may ask for the
+    // round's prompt (P1-1).
+    //
+    // POSITION IS THE PRIORITY. `plan.prompt` is one slot per round and the
+    // first writer owns the call, so the owner's ranking is enforced twice: here,
+    // where the news asks before the task line (step 1) and the treasure (step
+    // 6) can get to it, and in `BotState::request_prompt`, where a lower purpose
+    // is refused while the news still has an ask to make today. The owner's
+    // words: 「价格趋势直接决定了我们采集哪些矿，至关重要」, 「自进化任务可以晚点
+    // 接」.
+    //
+    // It sits above the recall on purpose: the news read is a team-level channel,
+    // not a role command, so it costs the pioneer no movement — a day whose
+    // pioneer is recalled at dawn is still a day whose mining is priced.
+    news::plan_prompt(turn, state, plan);
+
     // 0. Dusk recall. The gate seal waits for EVERY role to be inside the ring,
     //    and the pioneer is the one role whose work — task points, treasure,
     //    the shop — is always outside it. Issue #15: `wall_gate_open` for

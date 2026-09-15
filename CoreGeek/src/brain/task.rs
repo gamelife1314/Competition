@@ -7,7 +7,7 @@
 use crate::brain::Plan;
 use crate::model::{Turn, Unit};
 use crate::protocol::RoleCommand;
-use crate::state::{BotState, DiscoveredSchema, TaskStage};
+use crate::state::{BotState, DiscoveredSchema, PromptPurpose, TaskStage};
 
 /// Consecutive "`executeCmd` is not available" verdicts that end a session.
 const MAX_WINDOW_ERRORS: i32 = 2;
@@ -371,9 +371,13 @@ pub fn plan_pioneer(
                     return plan_pioneer(turn, state, pioneer, plan);
                 }
             }
-            if plan.prompt.is_none() {
+            if plan.prompt.is_none() && state.request_prompt(PromptPurpose::Task, turn) {
                 // LLM calls during an active task are free (do not count
-                // toward the 3/day budget), per the interface doc.
+                // toward the 3/day budget), per the interface doc — which is why
+                // this is granted on every round the line asks for it, and why
+                // the task line is the purpose that loses least by being ranked
+                // last: what a refusal costs it is the round the news read took,
+                // and the news read asks once a day.
                 state.task.llm_request_round = Some(turn.round_no);
                 plan.prompt = Some(build_prompt(state, turn));
             }

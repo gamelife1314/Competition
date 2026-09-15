@@ -367,6 +367,18 @@ pub fn param_value(description: &str, name: &str) -> Option<String> {
     }
 }
 
+/// Who is asking for the round's LLM prompt. Ranked highest first; see
+/// [`BotState::request_prompt`] for the ordering and the reason for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptPurpose {
+    /// The day's official news → the price trend.
+    News,
+    /// The folk legends → the treasure.
+    Treasure,
+    /// The task line: self-evolution and the reasoning lanes.
+    Task,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum TreasurePhase {
     #[default]
@@ -497,6 +509,9 @@ pub struct BotState {
     pub task_session_seq: u64,
     pub sop_cache: Vec<SopEntry>,
     pub treasure: TreasureState,
+    /// The day's news read: the official news goes to the model once, and the
+    /// keyword scan stands until — and unless — it answers (P1-1).
+    pub news: news::NewsRead,
 
     /// Dedup strings for non-task one-shot channels. Task LLM/command responses
     /// are deduped by (session_id, request_round) inside TaskSession.
@@ -630,6 +645,10 @@ impl BotState {
             self.gate_cell = None;
             // Every dusk commitment was discharged by last night's recall.
             self.dusk_home.clear();
+            // A new day's news is a new question, and the day's read starts over
+            // with it — including the attempt count, so one bad answer on
+            // Monday does not cost the read on Tuesday.
+            self.news = news::NewsRead::default();
         }
         self.last_round = turn.round_no;
 
@@ -702,23 +721,29 @@ impl BotState {
             // price. Logged per reading, because "the miner walked past the
             // copper" is only answerable next to "the news said copper was
             // about to get cheap".
-            for outlook in news::price_outlook(turn.day, &turn.official_news) {
-                if self.outlooks.iter().any(|old| *old == outlook) {
-                    continue;
+            // A day the model has already read for is the model's: the scan
+            // does not get to write over a reading it was the fallback for.
+            // (A re-announcement of the same day's news is still "the same
+            // day", so this also stops a second publication of one day's news
+            // from re-pricing it from the words alone.)
+            if self.news.read_day != Some(turn.day) {
+                for outlook in news::price_outlook(turn.day, &turn.official_news) {
+                    if self.outlooks.iter().any(|old| *old == outlook) {
+                        continue;
+                    }
+                    crate::log::event(
+                        "news_outlook",
+                        serde_json::json!({
+                            "ore": outlook.ore,
+                            "direction": news::direction_word(outlook.direction),
+                            "confidence": outlook.confidence,
+                            "days": outlook.days,
+                            "day": outlook.day,
+                            "source": "keyword",
+                        }),
+                    );
+                    self.outlooks.push(outlook);
                 }
-                crate::log::event(
-                    "news_outlook",
-                    serde_json::json!({
-                        "ore": outlook.ore,
-                        "direction": match outlook.direction {
-                            news::Direction::Rise => "rise",
-                            news::Direction::Fall => "fall",
-                        },
-                        "confidence": outlook.confidence,
-                        "day": outlook.day,
-                    }),
-                );
-                self.outlooks.push(outlook);
             }
         }
         if !turn.folk_legends.is_empty()
@@ -749,14 +774,23 @@ impl BotState {
     /// reading published on or before it, and the loudest one if a single day
     /// carried several.
     ///
-    /// A reading never expires. The news that a mine is shut for two days is
-    /// still the reason the ore is dear on the second of them, and the day the
-    /// outage ends is the day the price is highest — waiting for the outage to
-    /// pass before acting on it is the mistake the outlook exists to avoid.
+    /// A reading with no horizon never expires: the news that a mine is shut for
+    /// two days is still the reason the ore is dear on the second of them, and
+    /// the day the outage ends is the day the price is highest — waiting for the
+    /// outage to pass before acting on it is the mistake the outlook exists to
+    /// avoid. That is every keyword reading, and it is the reading the miner
+    /// used before the model was asked. A reading that claims a horizon expires
+    /// at the end of it ([`news::Outlook::days`]): the model that said "iron is
+    /// dear for the next two days" has not said anything about the fifth, and
+    /// pricing the fifth off it is the miner acting on a claim nobody made.
     pub fn price_outlook(&self, ore: &str, day: i64) -> Option<&news::Outlook> {
         self.outlooks
             .iter()
-            .filter(|outlook| outlook.ore == ore && outlook.day <= day)
+            .filter(|outlook| {
+                outlook.ore == ore
+                    && outlook.day <= day
+                    && (outlook.days == 0 || day < outlook.day + outlook.days)
+            })
             .max_by_key(|outlook| (outlook.day, outlook.confidence))
     }
 
@@ -787,6 +821,28 @@ impl BotState {
     }
 
     fn absorb_llm_and_cmd(&mut self, turn: &Turn) {
+        // The news read first, and by SHAPE rather than by seniority.
+        //
+        // Three consumers share one response field, and the news is the only one
+        // whose answer is a price reading — a task's answer is a shell script
+        // and a treasure's is `{"pos":…}`, so neither can be mistaken for this.
+        // Claiming it on the shape is what keeps the ranking from having to
+        // serialise the channel: a script that arrives while the news read is
+        // waiting falls through to the task branch below, unread and unclaimed,
+        // which is exactly where it belongs.
+        if self.news.awaits_response()
+            && !turn.llm_resp.is_empty()
+            && turn.llm_resp != self.seen_llm_resp
+            && news::parse_outlook(turn.day, &turn.llm_resp).is_some()
+        {
+            self.seen_llm_resp = turn.llm_resp.clone();
+            crate::log::event(
+                "llm_resp",
+                serde_json::json!({"channel": "news", "chars": turn.llm_resp.len()}),
+            );
+            news::on_llm_resp(self, turn.day, &turn.llm_resp);
+            return;
+        }
         if self.task.active {
             // Task responses are one-shot per (session, request round), not per
             // response string. Identical legitimate output in a later session
@@ -1471,6 +1527,65 @@ impl BotState {
 
     pub fn consume_prompt_budget(&mut self) {
         self.llm_used_today = self.llm_used_today.saturating_add(1);
+    }
+
+    /// Whether the day's news read has not been asked for yet, and today's news
+    /// is on the board.
+    ///
+    /// One slot of the day's budget is held for that ask until it is made — the
+    /// owner's 「价格趋势……至关重要」 made mechanical. It is one slot and not a
+    /// standing reservation: the moment the ask goes out (`attempts` moves off
+    /// zero) the hold is released and the rest of the budget is the treasure's
+    /// and the task line's as before. A day with no official news reserves
+    /// nothing.
+    fn news_read_reserved(&self, turn: &Turn) -> bool {
+        self.news.attempts == 0
+            && self.news.phase == news::ReadPhase::Idle
+            && self.official_seen.contains_key(&turn.day)
+    }
+
+    /// Take the round's prompt on behalf of `purpose`, if it may have it.
+    ///
+    /// The ranking is the owner's, and each step is where it is for a reason
+    /// that is about the match rather than about the code:
+    ///
+    /// 1. **News** — 「价格趋势直接决定了我们采集哪些矿，至关重要」. The outlook
+    ///    is what prices every vein the crew may walk to this afternoon, so it
+    ///    is read first, and it holds a slot of the day's budget until it has
+    ///    been asked ([`Self::news_read_reserved`]).
+    /// 2. **Treasure** — 「民间传闻引发的宝藏任务」. A treasure pays gold and
+    ///    items, but it does not price the mining the team does every round, and
+    ///    it keeps the window it has always had: it asks only while no task is
+    ///    running (its planner is not reached otherwise), and a fresh news read
+    ///    is allowed to go first.
+    /// 3. **Task** — 「自进化任务可以晚点接」. The point pays its own reward and
+    ///    its session runs ten-plus rounds, so a round spent waiting costs least
+    ///    here. It is not starved: the news read is one ask per day, so what the
+    ///    task line loses to it is that ask and no more.
+    ///
+    /// Two things make the ranking bind. The position of `news::plan_prompt` in
+    /// `day::pioneer_day` — before the task line's planner and before the
+    /// treasure's — decides the round the ask is made in, because `plan.prompt`
+    /// is one slot and the first writer owns the call. This gate is what decides
+    /// the ARGUMENT: a lower purpose is refused while a higher one still has an
+    /// ask to make today.
+    ///
+    /// The budget itself is unchanged: 接口文档's three calls per game day, and
+    /// calls made while a self-evolution session is running are neither limited
+    /// nor counted — so a session's own request is always granted, exactly as
+    /// before, and nothing is scarce in that window.
+    pub fn request_prompt(&mut self, purpose: PromptPurpose, turn: &Turn) -> bool {
+        let free_window = self.task.active;
+        if !free_window && !self.is_prompt_free() {
+            return false;
+        }
+        if purpose != PromptPurpose::News && self.news_read_reserved(turn) {
+            return false;
+        }
+        if !free_window {
+            self.consume_prompt_budget();
+        }
+        true
     }
 
     pub fn consume_summon_order(&mut self) {

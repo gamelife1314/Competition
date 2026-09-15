@@ -3754,6 +3754,9 @@ fn the_miner_prefers_the_vein_the_news_says_is_about_to_be_dear() {
                 direction,
                 confidence: 95,
                 day: turn.day + day_offset,
+                // A keyword reading: no horizon, so it stands until a later one
+                // replaces it — which is what this test has always asserted.
+                days: 0,
             }];
         }
         coregeek::brain::economy::choose_mine(

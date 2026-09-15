@@ -9,7 +9,7 @@ use crate::brain::task::truncate;
 use crate::brain::Plan;
 use crate::model::{chebyshev, Turn, Unit};
 use crate::protocol::{Pos, RoleCommand};
-use crate::state::{BotState, TreasurePhase, TreasurePlan};
+use crate::state::{BotState, PromptPurpose, TreasurePhase, TreasurePlan};
 
 const ALL_ITEMS: [&str; 6] = [
     "AcientTablet",
@@ -238,9 +238,14 @@ pub fn plan_pioneer(
             // answer inferred from one more day of clues is an answer that
             // does not burn 15-gold sacrifices on a wrong guess (code 3).
             let enough = state.treasure.legends.len() >= 2 && turn.day >= 2;
-            if enough && state.is_prompt_free() && plan.prompt.is_none() {
+            // The budget and the ranking both live in `request_prompt`: this is
+            // where the treasure sits in 「民间传闻」 — second, behind the day's
+            // price trend and ahead of the task line, and unchanged from what it
+            // has always had otherwise (outside a task session it needs a free
+            // slot of the day's three; the window it asks in is the same one).
+            if enough && plan.prompt.is_none() && state.request_prompt(PromptPurpose::Treasure, turn)
+            {
                 plan.prompt = Some(build_prompt(state));
-                state.consume_prompt_budget();
                 state.treasure.time_feedback = false;
                 state.treasure.phase = TreasurePhase::AskedLlm {
                     round: turn.round_no,

@@ -1,8 +1,15 @@
 //! Official-news parsing: mine outages shift collection feasibility and vendor
-//! prices. Heuristic keyword scan (no regex dependency).
+//! prices.
+//!
+//! Two readers, in this order: the model ([`build_prompt`] / [`parse_outlook`])
+//! and the keyword scan ([`price_outlook`], no regex dependency). The scan is
+//! the fallback — it is what a day reads as when the model never answered — and
+//! a hint inside the prompt when it does. See the section comment above
+//! [`build_prompt`].
 
-use crate::model::{COPPER, IRON, STONE};
-use crate::state::Outage;
+use crate::brain::Plan;
+use crate::model::{Turn, COPPER, IRON, STONE};
+use crate::state::{BotState, Outage, PromptPurpose};
 
 const OUTAGE_WORDS: [&str; 9] = [
     "塌方", "停工", "停产", "关停", "封闭", "检修", "暂停", "事故", "管制",
@@ -50,10 +57,16 @@ pub fn parse_official(day: i64, text: &str) -> Vec<Outage> {
 }
 
 /// Which way the news points an ore's price.
+///
+/// `Flat` is only ever the model's: a keyword count cannot produce it (a text
+/// with no direction words has no reading at all), but "the news moves nothing"
+/// is a judgement about the news, and it has to be sayable — otherwise the only
+/// way for the model to contradict a keyword reading would be to invert it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     Rise,
     Fall,
+    Flat,
 }
 
 /// One ore's expected price move, as a day's official news reads it.
@@ -68,14 +81,26 @@ pub enum Direction {
 pub struct Outlook {
     pub ore: String,
     pub direction: Direction,
-    /// 0..=100. How many independent words in the text point the same way —
-    /// one signal is a rumour, three is a policy. Used to scale how far the
-    /// expected price is allowed to move off today's.
+    /// 0..=100. Two readings produce this field and they mean the same thing by
+    /// it: how far the expected price may move off today's. The keyword scan
+    /// counts the words that point one way (one signal is a rumour, three is a
+    /// policy); the model states its own confidence and is clamped to the same
+    /// range.
     pub confidence: i64,
     /// The day the news was published. A move is priced in from then on: the
     /// outage it describes may start tomorrow, but the market reads the
     /// announcement today, which is exactly why waiting costs gold.
     pub day: i64,
+    /// How many days the move lasts, counted from `day`. `0` is "no horizon":
+    /// the reading stands until a later one replaces it.
+    ///
+    /// That is what every keyword reading says, and it is what the keyword
+    /// readings did before the model was asked — so `0` keeps their behaviour
+    /// byte for byte. The model is asked for a horizon because the owner asked
+    /// for one (「接下来几天应该采集哪些矿」), and a claim about the next two
+    /// days that keeps pricing the vein on the fifth is a claim nothing can
+    /// falsify.
+    pub days: i64,
 }
 
 /// Words that mean the ore is about to get scarcer — or dearer to buy.
@@ -89,6 +114,10 @@ const FALL_WORDS: [&str; 12] = [
     "需求下降", "降价", "下跌",
 ];
 
+/// How long a keyword reading claims to last. `0` is "no horizon": the words
+/// in today's news are evidence about today's price until a later reading
+/// replaces them, and that is what they have always been. See [`Outlook::days`].
+const KEYWORD_HORIZON: i64 = 0;
 /// One signal is worth this much confidence, and each further one adds to it.
 const SIGNAL_STEP: i64 = 15;
 /// Confidence never reaches 100: the news is a claim about the future, and the
@@ -126,6 +155,7 @@ pub fn price_outlook(day: i64, text: &str) -> Vec<Outlook> {
             direction,
             confidence,
             day,
+            days: KEYWORD_HORIZON,
         });
     }
     out
@@ -159,11 +189,344 @@ pub fn expected_price(current: i64, outlook: Option<&Outlook>) -> i64 {
     let lift = match outlook.direction {
         Direction::Rise => outlook.confidence,
         Direction::Fall => -outlook.confidence,
+        // "Nothing moves" prices the ore at today's vendor price, which is also
+        // the answer with no reading at all — but it is an ANSWER, and it
+        // displaces the keyword reading it replaced.
+        Direction::Flat => 0,
     };
     // Half the confidence, so one keyword is a 7% move and a full-confidence
     // reading is 47% — enough to change which vein wins, not enough to invent a
     // price the vendor has never paid.
     (current * (100 + lift / 2) / 100).max(1)
+}
+
+// ---------------------------------------------------------------------------
+// The LLM read: the price trend is the model's call, the words are the assist
+// ---------------------------------------------------------------------------
+//
+// The owner, verbatim: 「推理类任务和世界新闻可以提交有大模型推测……先提交大模型
+// 推理矿的价格趋势，接下来几天应该采集哪些矿……都由大模型来判断，辅助关键词判断。
+// 价格趋势直接决定了我们采集哪些矿，至关重要。」
+//
+// `price_outlook` above counts words. It cannot read 恢复开采 as a fall when the
+// text also says 停工, it cannot price an ore the sentence implies but never
+// names, and it has no way to say "this announcement is about road repairs, not
+// about ore". The model is asked for that reading, and the keyword count keeps
+// two jobs: it is a hint inside the prompt (「辅助关键词判断」), and it is the
+// reading that stands whenever the model has not answered — a lost response, a
+// budget spent elsewhere, an answer in the wrong shape. The model can therefore
+// only ever REPLACE a reading it actually made.
+
+/// How many rounds to wait for an answer before the ask is treated as lost.
+/// Short on purpose: this reading prices the mining that is happening now.
+const NEWS_WAIT_ROUNDS: i64 = 2;
+/// Asks per day. After this the keyword scan has the day to itself.
+const NEWS_MAX_ATTEMPTS: i64 = 2;
+/// The horizon a reading gets when it does not name one. The owner's 「接下来
+/// 几天」 is two or three, and a reading with no stated horizon has to expire
+/// somewhere or it prices the vein for the rest of the match.
+const DEFAULT_HORIZON_DAYS: i64 = 2;
+/// An ore's price does not move for a week on one paragraph of news.
+const MAX_HORIZON_DAYS: i64 = 5;
+/// The confidence a reading gets when it does not name one: under the keyword
+/// scan's weakest reading (three signals), because a model that did not say how
+/// sure it is has not said anything the words did not.
+const DEFAULT_CONFIDENCE: i64 = 45;
+
+/// The prompt that hands the day's official news to the model.
+///
+/// Shaped like `treasure::build_prompt` — the task, the raw input, the
+/// vocabulary the answer has to use, what the last answer got wrong, and the
+/// exact JSON object wanted — with one addition: the keyword scan's own reading
+/// of the same text goes in as a hint. The model is free to disagree with it,
+/// and disagreeing is the reason it is asked.
+pub fn build_prompt(day: i64, text: &str, keyword: &[Outlook], correction: Option<&str>) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("以下是游戏世界中今天的官方新闻。请推理它对矿石价格走势的影响。\n");
+    prompt.push_str("矿石共三种：iron(铁)、stone(石)、copper(铜)。\n");
+    prompt.push_str(
+        "请对每种受影响的矿石给出：direction（rise 涨价 / fall 跌价 / flat 不变）、\
+         days（该走势预计持续几个游戏日，1-5）、confidence（0-100）。\n",
+    );
+    prompt.push_str(
+        "判据取自新闻本身：矿区停工、塌方、检修、减产、供应紧缺 → 涨；\
+         复产、复工、增产、供应充足、需求下降 → 跌。\n\
+         新闻与矿石价格无关时，outlooks 给空数组。\n",
+    );
+    prompt.push_str(&format!(
+        "\n新闻（第{day}天）：\n{}\n",
+        crate::log::brief(text, 600)
+    ));
+    if keyword.is_empty() {
+        prompt.push_str("\n关键词初判：这段文字里没有读出方向。\n");
+    } else {
+        prompt.push_str("\n关键词初判（仅供参考，你可以不同意）：\n");
+        for outlook in keyword {
+            prompt.push_str(&format!(
+                "  {} {} ({}%)\n",
+                outlook.ore,
+                direction_word(outlook.direction),
+                outlook.confidence
+            ));
+        }
+    }
+    if let Some(note) = correction {
+        prompt.push_str(&format!("\n注意：{note}\n"));
+    }
+    prompt.push_str(
+        "\n只输出一个 JSON 对象，不要输出其它内容，格式：\n\
+         {\"outlooks\":[{\"ore\":\"iron\",\"direction\":\"rise\",\"days\":3,\"confidence\":80}]}\n",
+    );
+    prompt
+}
+
+/// What the model answered, or `None` when the answer is not a price reading.
+///
+/// `None` is the fallback's trigger: the keyword scan's reading stands. An empty
+/// `outlooks` array is NOT `None` — it is the model saying the news moves
+/// nothing, which is an answer, and it replaces the keyword reading.
+pub fn parse_outlook(day: i64, resp: &str) -> Option<Vec<Outlook>> {
+    let start = resp.find('{')?;
+    let end = resp.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&resp[start..=end]).ok()?;
+    let list = value
+        .get("outlooks")
+        .or_else(|| value.get("prices"))
+        .or_else(|| value.get("trends"))?
+        .as_array()?;
+    let mut out: Vec<Outlook> = Vec::new();
+    for entry in list {
+        let Some(ore) = entry.get("ore").and_then(|v| v.as_str()).and_then(ore_of) else {
+            continue;
+        };
+        let Some(direction) = entry.get("direction").and_then(|v| v.as_str()).and_then(direction_of)
+        else {
+            continue;
+        };
+        // One reading per ore: the last one would win by `confidence` anyway,
+        // and two rows for the same ore in one answer is the model hedging.
+        if out.iter().any(|old| old.ore == ore) {
+            continue;
+        }
+        let confidence = entry
+            .get("confidence")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(DEFAULT_CONFIDENCE)
+            .clamp(0, 100);
+        let days = entry
+            .get("days")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(DEFAULT_HORIZON_DAYS)
+            .clamp(1, MAX_HORIZON_DAYS);
+        out.push(Outlook {
+            ore: ore.to_string(),
+            direction,
+            confidence,
+            day,
+            days,
+        });
+    }
+    Some(out)
+}
+
+/// `iron` / `IRON` / `铁` / `铁矿` … → the ore the rest of the code names.
+fn ore_of(name: &str) -> Option<&'static str> {
+    let lower = name.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "iron" | "fe" | "铁" | "铁矿" | "铁矿石" => Some(IRON),
+        "stone" | "rock" | "石" | "石矿" | "石头" | "石料" => Some(STONE),
+        "copper" | "cu" | "铜" | "铜矿" | "铜矿石" => Some(COPPER),
+        _ => None,
+    }
+}
+
+/// `rise` / `up` / `涨` … → the direction. Unknown words are not a reading, so
+/// the row is dropped rather than defaulted: `flat` and a missing answer are
+/// not the same claim.
+fn direction_of(word: &str) -> Option<Direction> {
+    let lower = word.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "rise" | "rising" | "up" | "increase" | "涨" | "上涨" | "涨价" | "看涨" => {
+            Some(Direction::Rise)
+        }
+        "fall" | "falling" | "down" | "decrease" | "跌" | "下跌" | "降价" | "看跌" => {
+            Some(Direction::Fall)
+        }
+        "flat" | "stable" | "unchanged" | "no_change" | "平" | "持平" | "不变" => {
+            Some(Direction::Flat)
+        }
+        _ => None,
+    }
+}
+
+/// The one spelling of a direction the log uses, for both readings' records.
+pub fn direction_word(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Rise => "rise",
+        Direction::Fall => "fall",
+        Direction::Flat => "flat",
+    }
+}
+
+/// Where the day's news read has got to. One read per day, and the day's news
+/// arrives once, so the phase is per day and reset at the day rollover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadPhase {
+    /// No ask is outstanding: the read is either not started or retrying.
+    #[default]
+    Idle,
+    /// The prompt went out at `round`; an answer is outstanding.
+    AskedLlm { round: i64 },
+    /// Answered, or given up on for today. The keyword scan has the day.
+    Done,
+}
+
+/// The state of one day's news read.
+#[derive(Debug, Clone, Default)]
+pub struct NewsRead {
+    pub phase: ReadPhase,
+    /// Asks made today. The read is retried once and then left to the scan:
+    /// the mining this reading prices is happening now.
+    pub attempts: i64,
+    /// The day the model answered for — the day whose keyword readings it
+    /// replaced, and the day the scan must not write over again.
+    pub read_day: Option<i64>,
+    /// What the last answer got wrong, handed back to the model in the retry's
+    /// prompt, exactly as `treasure::build_prompt` does with its corrections.
+    pub correction: Option<String>,
+}
+
+impl NewsRead {
+    /// An ask is out and unanswered.
+    pub fn awaits_response(&self) -> bool {
+        matches!(self.phase, ReadPhase::AskedLlm { .. })
+    }
+
+    /// The read still has an ask to make today.
+    pub fn wants_reading(&self) -> bool {
+        self.phase == ReadPhase::Idle
+    }
+
+    /// The ask was not answered. Retry, or leave the rest of the day to the
+    /// keyword scan.
+    fn note_lost(&mut self, note: &str) {
+        self.correction = Some(note.to_string());
+        self.phase = if self.attempts >= NEWS_MAX_ATTEMPTS {
+            ReadPhase::Done
+        } else {
+            ReadPhase::Idle
+        };
+    }
+
+    /// The day is read: the model answered and its readings are in force.
+    fn note_read(&mut self, day: i64) {
+        self.read_day = Some(day);
+        self.correction = None;
+        self.phase = ReadPhase::Done;
+    }
+}
+
+/// Take the model's answer: its readings REPLACE the keyword scan's for the day.
+///
+/// The model was shown the same text, so silence about an ore is a judgement
+/// about that ore rather than an omission to be filled in from the words — which
+/// is what 「都由大模型来判断」 asks for. A day the model never answered for is
+/// untouched, and there the scan's reading is the answer, exactly as before.
+pub fn on_llm_resp(state: &mut BotState, day: i64, resp: &str) {
+    if !state.news.awaits_response() {
+        return;
+    }
+    let Some(outlooks) = parse_outlook(day, resp) else {
+        crate::log::event(
+            "news_read_failed",
+            serde_json::json!({
+                "day": day,
+                "attempts": state.news.attempts,
+                "head": crate::log::headline(resp, 200),
+            }),
+        );
+        state.news.note_lost("上次的回答不是可解析的 JSON，请只输出规定的 JSON 对象。");
+        return;
+    };
+    let replaced = state
+        .outlooks
+        .iter()
+        .filter(|old| old.day == day)
+        .count();
+    state.outlooks.retain(|old| old.day != day);
+    for outlook in &outlooks {
+        crate::log::event(
+            "news_outlook",
+            serde_json::json!({
+                "ore": outlook.ore,
+                "direction": direction_word(outlook.direction),
+                "confidence": outlook.confidence,
+                "days": outlook.days,
+                "day": outlook.day,
+                "source": "llm",
+            }),
+        );
+    }
+    crate::log::event(
+        "news_read",
+        serde_json::json!({
+            "day": day,
+            "readings": outlooks.len(),
+            "replaced": replaced,
+        }),
+    );
+    state.outlooks.extend(outlooks);
+    state.news.note_read(day);
+}
+
+/// The pioneer's news step: ask the model about the day's official news.
+///
+/// Runs before every other consumer of the round's prompt — see
+/// `BotState::request_prompt` for the ranking and the day's budget.
+pub fn plan_prompt(turn: &Turn, state: &mut BotState, plan: &mut Plan) {
+    if plan.prompt.is_some() {
+        return;
+    }
+    // One day's news, read once. No official news today, nothing to ask about.
+    let Some(text) = state.official_seen.get(&turn.day).cloned() else {
+        return;
+    };
+    if let ReadPhase::AskedLlm { round } = state.news.phase {
+        if turn.round_no.saturating_sub(round) > NEWS_WAIT_ROUNDS {
+            state.news.note_lost("上次没有收到回答，请直接输出规定的 JSON 对象。");
+        }
+        return;
+    }
+    if !state.news.wants_reading() {
+        return;
+    }
+    if !state.request_prompt(PromptPurpose::News, turn) {
+        return;
+    }
+    let keyword = price_outlook(turn.day, &text);
+    let correction = state.news.correction.clone();
+    crate::log::event(
+        "news_read_ask",
+        serde_json::json!({
+            "day": turn.day,
+            "round": turn.round_no,
+            "attempt": state.news.attempts + 1,
+            "keyword": keyword.len(),
+        }),
+    );
+    plan.prompt = Some(build_prompt(
+        turn.day,
+        &text,
+        &keyword,
+        correction.as_deref(),
+    ));
+    state.news.attempts += 1;
+    state.news.phase = ReadPhase::AskedLlm {
+        round: turn.round_no,
+    };
 }
 
 /// Scan for "<number>天" duration hints ("需要2天左右", "停工三天").
@@ -283,6 +646,7 @@ mod tests {
             direction: Direction::Rise,
             confidence: 80,
             day: 1,
+            days: KEYWORD_HORIZON,
         };
         let fall = Outlook {
             direction: Direction::Fall,
@@ -302,5 +666,102 @@ mod tests {
             expected_price(current, Some(&rise)),
             expected_price(current, Some(&rise))
         );
+        // A reading that claims nothing moves prices the ore at today's
+        // number — the same answer as no reading, from an answer that is one.
+        let flat = Outlook {
+            ore: COPPER.to_string(),
+            direction: Direction::Flat,
+            confidence: 90,
+            day: 1,
+            days: 2,
+        };
+        assert_eq!(expected_price(current, Some(&flat)), current);
+    }
+
+    // -----------------------------------------------------------------------
+    // The model's answer
+    // -----------------------------------------------------------------------
+
+    /// Every row is a whole answer: text in, readings out. The shapes are the
+    /// ones a model actually produces — the asked-for object, the same thing in
+    /// Chinese, one row missing its optional fields, one row with a number the
+    /// range does not allow — plus the two texts that are NOT readings.
+    #[test]
+    fn parse_outlook_reads_the_shape_it_asked_for() {
+        let rows: [(&str, &str, &str, Option<(Direction, i64, i64)>); 7] = [
+            (
+                "the asked-for object",
+                r#"{"outlooks":[{"ore":"iron","direction":"rise","days":3,"confidence":80}]}"#,
+                IRON,
+                Some((Direction::Rise, 80, 3)),
+            ),
+            (
+                "the same answer in Chinese, wrapped in prose",
+                "我认为：\n{\"outlooks\":[{\"ore\":\"铜\",\"direction\":\"跌\",\"days\":2,\"confidence\":70}]}\n以上。",
+                COPPER,
+                Some((Direction::Fall, 70, 2)),
+            ),
+            (
+                "no horizon named",
+                r#"{"outlooks":[{"ore":"stone","direction":"flat","confidence":55}]}"#,
+                STONE,
+                Some((Direction::Flat, 55, DEFAULT_HORIZON_DAYS)),
+            ),
+            (
+                "numbers outside the range",
+                r#"{"outlooks":[{"ore":"iron","direction":"rise","days":99,"confidence":300}]}"#,
+                IRON,
+                Some((Direction::Rise, 100, MAX_HORIZON_DAYS)),
+            ),
+            (
+                "a negative confidence",
+                r#"{"outlooks":[{"ore":"iron","direction":"fall","days":1,"confidence":-40}]}"#,
+                IRON,
+                Some((Direction::Fall, 0, 1)),
+            ),
+            (
+                "an ore nobody mines",
+                r#"{"outlooks":[{"ore":"gold","direction":"rise","days":2,"confidence":90}]}"#,
+                IRON,
+                None,
+            ),
+            (
+                "a direction nobody defined",
+                r#"{"outlooks":[{"ore":"iron","direction":"maybe","days":2,"confidence":90}]}"#,
+                IRON,
+                None,
+            ),
+        ];
+        for (name, resp, ore, expected) in rows {
+            let readings = parse_outlook(1, resp).unwrap_or_else(|| panic!("{name}: not read"));
+            match expected {
+                None => assert!(
+                    readings.iter().all(|o| o.ore != ore),
+                    "{name}: {readings:?}"
+                ),
+                Some((direction, confidence, days)) => {
+                    assert_eq!(readings.len(), 1, "{name}: {readings:?}");
+                    let reading = &readings[0];
+                    assert_eq!(reading.ore, ore, "{name}: wrong ore");
+                    assert_eq!(reading.direction, direction, "{name}: wrong way");
+                    assert_eq!(reading.confidence, confidence, "{name}: wrong confidence");
+                    assert_eq!(reading.days, days, "{name}: wrong horizon");
+                    assert_eq!(reading.day, 1, "{name}: wrong day");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_that_is_not_a_reading_is_not_a_reading() {
+        // `None` is the fallback's trigger, and it has to stay narrow: prose
+        // with no object in it, and a JSON object that is about something else.
+        // Both are answers, and neither says what any ore will do.
+        assert!(parse_outlook(1, "根据新闻，铜价应该会下跌。").is_none());
+        assert!(parse_outlook(1, r#"{"city":"北京","total_count":15}"#).is_none());
+        assert!(parse_outlook(1, "").is_none());
+        // ...and the empty list is NOT one of them: it is the model saying the
+        // news moves nothing, which is an answer and replaces the words.
+        assert_eq!(parse_outlook(1, r#"{"outlooks":[]}"#), Some(Vec::new()));
     }
 }
