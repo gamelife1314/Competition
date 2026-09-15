@@ -50,6 +50,12 @@ pub const READINESS_LEAD: i64 = 25;
 /// Rounds before dusk at which a night consumable may dip into the tower build
 /// reserve — a night with no Medicine is where controllers die.
 const READINESS_URGENT: i64 = 10;
+/// Rounds before dusk at which the shopping list switches from fixed-priority
+/// to combat-per-gold ratio ordering — the "spend every coin" window. Inside
+/// this window, any affordable item that improves tonight's combat power can
+/// bypass the build reserve, and the list is ranked by marginal combat value
+/// per gold instead of by static priority buckets.
+const DUSK_CASHOUT_LEAD: i64 = 10;
 /// Rounds before dusk at which the third tower's fund comes under guard
 /// (issue #9: the rocket never arrived on the first night). With the ordering
 /// rule gone (P0-2) the guard is purely financial — it holds the 25 gold the
@@ -88,6 +94,10 @@ pub struct Need {
     /// Effective HP bought per 100 gold — the marginal-survival ranking used
     /// inside a priority bucket. 0 for consumables.
     pub value: i64,
+    /// Combat power contributed per gold spent — the universal ranking metric
+    /// for the dusk window. Higher = more bang per coin. See
+    /// `combat_per_gold`.
+    pub combat_per_gold: f64,
     /// Why the item is on the list (telemetry only).
     pub reason: &'static str,
 }
@@ -180,6 +190,46 @@ fn effective_hp(name: &str) -> i64 {
     }
 }
 
+/// Combat power contributed by purchasing one unit of `name`. This is the
+/// universal metric for the dusk cash-out window: every gold coin should buy
+/// the most combat power it can.
+///
+/// The values are marginal — what THIS purchase adds to tonight's defense:
+/// * Weapon upgrade vouchers: extra tower damage over 60 night rounds. A
+///   level-1→2 upgrade adds +10 damage/round (gatling 10→20 per bullet,
+///   railgun +10 energy, rocket +10 splash center) and +2 range. Over 60
+///   rounds that's ~600 extra damage potential.
+/// * Station upgrade: 1500 extra HP that the enemy must chew through, valued
+///   at 1.5× because a lost base is the loss condition itself.
+/// * Wall upgrade: 500 extra wall HP — the cheapest HP in the game, but walls
+///   are not direct firepower.
+/// * Medicine: a controller at 30% HP dies without it; a live controller
+///   mans a tower for ~60 rounds × tower DPS. Valued at the DPS it preserves.
+/// * WallFixer: 1000 HP wall repair for 10 gold — the cheapest structural HP,
+///   but only matters if walls are damaged.
+fn combat_power(name: &str) -> f64 {
+    match name {
+        "WeaponUpgradeVoucher1" => 600.0,
+        "WeaponUpgradeVoucher2" => 900.0,
+        "StationUpgradeVoucher1" | "StationUpgradeVoucher2" => 2250.0,
+        "WallUpgradeVoucher1" | "WallUpgradeVoucher2" => 500.0,
+        "Medicine" => 400.0,
+        "WallFixer" => 300.0,
+        "Bomb" => 200.0,
+        "DizzyWeapon" => 150.0,
+        "BossRobotSummonOrder" => 100.0,
+        _ => 0.0,
+    }
+}
+
+/// Combat power per gold spent — the dusk cash-out ranking metric.
+fn combat_per_gold(name: &str, price: i64) -> f64 {
+    if price <= 0 || price == i64::MAX {
+        return 0.0;
+    }
+    combat_power(name) / price as f64
+}
+
 /// Effective HP bought per 100 gold. 0 when the price is unknown.
 fn survival_value(name: &str, price: i64) -> i64 {
     let hp = effective_hp(name);
@@ -197,6 +247,7 @@ fn upgrade_need(turn: &Turn, name: &str, num: i64, priority: i32, latest_round: 
         priority,
         latest_round,
         value: survival_value(name, price),
+        combat_per_gold: combat_per_gold(name, price),
         reason: "upgrade",
     }
 }
@@ -306,6 +357,7 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             priority: 2,
             latest_round: latest(1),
             value: 0,
+            combat_per_gold: combat_per_gold("Medicine", turn.weapon_shop.get("Medicine").copied().unwrap_or(i64::MAX)),
             reason: "night_readiness",
         });
     }
@@ -360,6 +412,7 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             priority: if critical { 2 } else { 3 },
             latest_round: latest(0),
             value: 0,
+            combat_per_gold: combat_per_gold("WallFixer", turn.weapon_shop.get("WallFixer").copied().unwrap_or(i64::MAX)),
             reason: "wall_repair",
         });
     }
@@ -374,6 +427,7 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             priority: 4,
             latest_round: latest(0),
             value: 0,
+            combat_per_gold: combat_per_gold("Bomb", turn.weapon_shop.get("Bomb").copied().unwrap_or(i64::MAX)),
             reason: "night_item",
         });
     }
@@ -384,6 +438,7 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             priority: 4,
             latest_round: latest(0),
             value: 0,
+            combat_per_gold: combat_per_gold("DizzyWeapon", turn.weapon_shop.get("DizzyWeapon").copied().unwrap_or(i64::MAX)),
             reason: "night_item",
         });
     }
@@ -424,6 +479,7 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             priority: if suppression { 7 } else { 9 },
             latest_round: 0,
             value: 0,
+            combat_per_gold: combat_per_gold("BossRobotSummonOrder", turn.weapon_shop.get("BossRobotSummonOrder").copied().unwrap_or(i64::MAX)),
             reason: if suppression {
                 "boss_suppression"
             } else {
@@ -456,6 +512,7 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             priority: 8,
             latest_round: 0,
             value: 0,
+            combat_per_gold: combat_per_gold("BossRobotSummonOrder", turn.weapon_shop.get("BossRobotSummonOrder").copied().unwrap_or(i64::MAX)),
             reason: "harass_finisher",
         });
     }
@@ -573,19 +630,35 @@ pub fn clear_gap_order_with(drive: bool, turn: &Turn, needs: &mut Vec<Need>) {
 /// tower build-out never stalls — except in the last `READINESS_URGENT`
 /// rounds before dusk, when a night without medicine costs more than a tower
 /// slot. A need that only partly fits is bought partly, not skipped.
+///
+/// **Dusk cash-out window** (`DUSK_ROUND - DUSK_CASHOUT_LEAD` and later):
+/// the list switches from fixed-priority to combat-per-gold ratio ordering.
+/// Every affordable item that improves tonight's combat power can bypass the
+/// build reserve — gold left unspent at dusk buys nothing all night. The
+/// priority buckets are still respected as a tiebreak, so when two items have
+/// the same combat/gold ratio, the higher-priority one wins.
 pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     let mut intents = intent_list(turn, state, reserve);
-    // The station upgrade wins its ties. `value` alone leaves one: the level-2
-    // -> 3 station voucher (150 gold, `effective_hp` 2250) and the level-1
-    // Sort by (priority, Reverse(value)). The priority field now encodes the
-    // offense-first ordering: weapon voucher is 0, wall upgrades are 1, station
-    // voucher is 0 (weapons maxed) or 2 (firepower still being built).
-    intents.sort_by_key(|need| {
-        (
-            need.priority,
-            std::cmp::Reverse(need.value),
-        )
-    });
+    let cashout = turn.in_day_round >= DUSK_ROUND - DUSK_CASHOUT_LEAD;
+    if cashout {
+        // Dusk cash-out: rank by combat power per gold (descending), then by
+        // priority as a tiebreak. Every coin should buy the most combat it can.
+        intents.sort_by(|a, b| {
+            b.combat_per_gold
+                .partial_cmp(&a.combat_per_gold)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.priority.cmp(&b.priority))
+                .then(std::cmp::Reverse(a.value).cmp(&std::cmp::Reverse(b.value)))
+        });
+    } else {
+        // Normal window: fixed-priority ordering, value as tiebreak.
+        intents.sort_by_key(|need| {
+            (
+                need.priority,
+                std::cmp::Reverse(need.value),
+            )
+        });
+    }
     let urgent = turn.in_day_round >= DUSK_ROUND - READINESS_URGENT;
     let mut remaining = turn.gold;
     let mut out = Vec::new();
@@ -608,9 +681,15 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         // Weapon and station vouchers keep the free pass — a purse that
         // actually reaches 100 gold turns the guard off by itself
         // (`upgrade_reachable`), so they can never drain the guarded fund.
+        //
+        // During the dusk cash-out window, ANY combat-improving item bypasses
+        // the reserve: gold hoarded past dusk buys nothing, and a 10-gold
+        // Medicine that saves a controller is worth more than 25 gold kept for
+        // a tower that cannot be built after dark.
         let wall_voucher = need.name.starts_with("WallUpgradeVoucher");
         let floor = if (is_upgrade(&need.name) && !wall_voucher)
             || (urgent && is_night_readiness(&need.name))
+            || (cashout && need.combat_per_gold > 0.0 && !wall_voucher)
         {
             0
         } else {

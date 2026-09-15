@@ -1062,18 +1062,29 @@ fn worker_day(
         // affordable weapon upgrade voucher in the shopping list is spent now
         // rather than hoarded. The trip must still fit inside the seal grace
         // (DUSK_ROUND + SEAL_GRACE) so the buyer is back before nightfall.
-        if buyer_id == Some(role.id) && !budget.shopping.is_empty() {
-            let weapon_affordable = budget.shopping.iter().any(|need| {
-                need.name.starts_with("WeaponUpgradeVoucher")
-                    || need.name.starts_with("StationUpgradeVoucher")
-            });
-            if weapon_affordable
+        //
+        // Multi-worker dusk buy: during the cash-out window any worker — not
+        // just the dedicated buyer — that is already standing at a shop stand
+        // may purchase. The dedicated buyer still gets priority for the walk;
+        // this only fires for a worker that happens to be at the counter
+        // (e.g. the buyer itself returned, or another worker passed by).
+        // Gold sitting in the purse at nightfall is the failure mode this
+        // prevents.
+        let is_buyer = buyer_id == Some(role.id);
+        let at_shop = turn.weapon_shops().iter().any(|shop| {
+            chebyshev(role.pos, *shop) <= 1
+        });
+        if !budget.shopping.is_empty() && (is_buyer || at_shop) {
+            // The buyer may still walk to the shop; other workers only buy
+            // if already standing at the counter (no new walks for non-buyers
+            // — those workers need to get behind the ring for the seal).
+            let can_walk = is_buyer
                 && shop_round_trip(turn, role, pairs)
                     .map(|trip| {
                         turn.in_day_round + trip <= economy::DUSK_ROUND + SEAL_GRACE
                     })
-                    .unwrap_or(false)
-            {
+                    .unwrap_or(false);
+            if can_walk || at_shop {
                 if let Some(cmd) = buyer_flow(turn, role, &budget.shopping, pairs, claimed) {
                     plan.push(role.id, cmd);
                     return;
