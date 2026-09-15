@@ -23,6 +23,7 @@ CoreGeek 自动化对战工作流 - 单次运行脚本
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -1285,8 +1286,12 @@ Make the minimal effective change. Commit is not needed — the workflow will ha
     # --- 调用 codeagent CLI ---
     log("  调用 codeagent CLI 进行代码优化 ...")
     improve_timeout = int(get_config("improve_timeout", 1800))
-    cmd = ["codeagent", "--print", "--dangerously-skip-permissions", prompt]
-    log(f"  命令: codeagent (timeout={improve_timeout}s)")
+    # 查找 codeagent CLI：优先 PATH，回退到已知安装路径
+    codeagent_bin = shutil.which("codeagent") or str(
+        Path("D:/Program Files/CodeAgentCLI/codeagent")
+    )
+    cmd = [codeagent_bin, "--print", "--dangerously-skip-permissions", prompt]
+    log(f"  命令: {codeagent_bin} (timeout={improve_timeout}s)")
 
     try:
         proc = subprocess.run(
