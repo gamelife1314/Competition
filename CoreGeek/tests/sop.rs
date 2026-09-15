@@ -785,6 +785,14 @@ fn a_single_field_wrapper_is_unwrapped_before_submission() {
 fn the_submitted_payload_is_the_bare_value_the_judger_compares() {
     // The same thing one layer up: what reaches `submitAnswer` is the unwrapped
     // value, so the logged payload and the judged payload cannot disagree.
+    //
+    // The unwrap is unchanged. What changed is its notation on the wire: the
+    // bare text `fc1e78eb2a5a` is not a JSON document, and the judger's verdict
+    // for one that is not is `答案不是合法 JSON` — a syntax rejection before any
+    // field is compared, carried by 表 4b of all four of #201/#203/#204/#205
+    // against exactly this payload. The bare value the judger compares and the
+    // JSON string that carries it are the same value; see
+    // `answer_wire_payload`.
     let (turn, mut state) = task_at(6, "从沙箱中取出访问令牌", "{\"token\":\"fc1e78eb2a5a\"}");
     let pioneer = turn.role_by_id(10011).unwrap();
     let mut plan = Plan::default();
@@ -796,8 +804,8 @@ fn the_submitted_payload_is_the_bare_value_the_judger_compares() {
         .as_ref()
         .expect("submitAnswer carries the answer");
     assert_eq!(
-        payload, "fc1e78eb2a5a",
-        "the judger compares against the bare value, not our JSON wrapper"
+        payload, "\"fc1e78eb2a5a\"",
+        "the unwrapped value goes to the judger as JSON, not as bare text"
     );
 }
 
@@ -1318,7 +1326,19 @@ fn a_declared_single_field_schema_drives_the_unwrap() {
     let pioneer = turn.role_by_id(10011).unwrap();
     let mut plan = Plan::default();
     let cmd = plan_pioneer(&turn, &mut state, pioneer, &mut plan).expect("submitted");
-    assert_eq!(cmd.taskAnswer.as_deref(), Some("fc1e78eb2a5a"));
+    // The wrapper still comes off — the unwrap is what this test has always
+    // pinned, and it is unchanged. What the judger RECEIVES is now the JSON
+    // string rather than the bare text: a bare `fc1e78eb2a5a` is not JSON in
+    // any dialect the judger parses, and 表 4b of all four of
+    // #201/#203/#204/#205 answers exactly this submission with `答案不是合法
+    // JSON`, a syntax rejection before a single field is compared. See
+    // `answer_wire_payload`; the shape ladder's own output is still pinned byte
+    // for byte by `the_first_attempt_is_never_rewritten_into_a_new_shape`.
+    assert_eq!(
+        cmd.taskAnswer.as_deref(),
+        Some("\"fc1e78eb2a5a\""),
+        "the unwrapped scalar goes on the wire as JSON"
+    );
 
     // Two declared fields: the object is the answer's real shape. Untouched.
     let mut state = BotState::default();
@@ -1339,6 +1359,87 @@ fn a_declared_single_field_schema_drives_the_unwrap() {
     let mut plan = Plan::default();
     let cmd = plan_pioneer(&turn, &mut state, pioneer, &mut plan).expect("submitted");
     assert_eq!(cmd.taskAnswer.as_deref(), Some(object));
+}
+
+/// Whatever shape the ladder chose, what the judger is handed parses as JSON.
+///
+/// The judger's verdict for a submission that does not parse is
+/// `答案不是合法 JSON` — a syntax rejection before any field is compared — and
+/// 表 4b carries that line in all four of issues #201/#203/#204/#205, always
+/// against a submission 表 4a marks `unwrapped`: the ladder had reduced a
+/// one-key object to its bare value, which is a string in no language but the
+/// shell's. The ladder's own decision is not touched here (its two shapes are
+/// pinned by `a_declared_single_field_schema_drives_the_unwrap` and
+/// `the_first_attempt_is_never_rewritten_into_a_new_shape`); what is asserted
+/// is the LAST step, the bytes that leave `plan_pioneer` for `submitAnswer`.
+#[test]
+fn what_the_judger_receives_is_always_a_json_document() {
+    use coregeek::brain::task::plan_pioneer;
+    use serde_json::Value;
+
+    // (answer, schema fields, rejections, expected wire payload)
+    let rows: [(&str, &[&str], i32, &str); 4] = [
+        // #205 session 3, the batch's one non-trivial session: the unwrap of
+        // this object is `fc1e78eb2a5a` and that is what went out at r39. The
+        // judger answered r40 `答案不是合法 JSON` and the session's deadline
+        // was four rounds later.
+        (
+            r#"{"token":"fc1e78eb2a5a"}"#,
+            &["token"],
+            0,
+            r#""fc1e78eb2a5a""#,
+        ),
+        // The same object on a RETRY: any rejection flips the shape, so the
+        // wrapper stays on. Both shapes are now legal, which is the point.
+        (
+            r#"{"token":"fc1e78eb2a5a"}"#,
+            &["token"],
+            1,
+            r#"{"token":"fc1e78eb2a5a"}"#,
+        ),
+        // A bare scalar straight off the sandbox (`TOKEN: fc1e78eb2a5a`,
+        // #123's round-18 output). With one known field the wrapper is the
+        // only legal shape, so it goes out wrapped — issue #125's session 3
+        // submitted exactly this and was `confirmed_success`.
+        ("fc1e78eb2a5a", &["token"], 0, r#"{"token":"fc1e78eb2a5a"}"#),
+        // A payload that already parses — including the bare numbers the
+        // book's own examples answer with — is passed through byte for byte.
+        ("15", &["count"], 0, "15"),
+    ];
+
+    for (answer, fields, rejections, expected) in rows {
+        let mut state = BotState::default();
+        state.task.active = true;
+        state.task.session_id = 1;
+        state.task.accepted_round = 6;
+        state.task.timeout_round = 260;
+        state.task.task_type = "自进化类1".into();
+        state.task.description = "请阅读task_1.md，获取任务信息".into();
+        state.task.discovered_schema = Some(coregeek::state::DiscoveredSchema {
+            fields: fields.iter().map(|field| (*field).to_string()).collect(),
+            required: fields.iter().map(|field| (*field).to_string()).collect(),
+        });
+        state.task.rejections = rejections;
+        state.task.stage = TaskStage::HaveAnswer {
+            answer: answer.into(),
+        };
+
+        let turn = turn_from(task_world(6));
+        let pioneer = turn.role_by_id(10011).unwrap();
+        let mut plan = Plan::default();
+        let cmd = plan_pioneer(&turn, &mut state, pioneer, &mut plan).expect("submitted");
+        let sent = cmd.taskAnswer.expect("a submission carries a payload");
+
+        assert_eq!(
+            sent, expected,
+            "`{answer}` went to the judger as `{sent}`"
+        );
+        assert!(
+            serde_json::from_str::<Value>(&sent).is_ok(),
+            "`{sent}` is not a JSON document, so its verdict is a syntax \
+             rejection before any field is compared"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

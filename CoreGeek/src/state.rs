@@ -180,6 +180,21 @@ pub struct TaskSession {
     /// already done the reconnaissance" with a number in it instead of hoping
     /// the model notices on its own.
     pub no_answer_rounds: i32,
+    /// What the task point advertised when the session opened: its
+    /// `scoreReward` and `goldReward` (WORKFLOW_REQUEST §16.1).
+    ///
+    /// 任务书 ch.6 pays `任务积分奖励 × 通过率` (gold: `任务金币奖励 × 通过率`), so
+    /// `playerTasks[]`'s own pair is the CEILING of what this session can earn
+    /// and the only figure the log can honestly carry. It sat in the turn and
+    /// was read by nobody: a session worth 300 points and one worth 20 produced
+    /// identical records, which is exactly the pair of cases "the task line
+    /// earned nothing" has to be told apart from — one is a scoring failure,
+    /// the other is a scheduling one, and they call for opposite work. Held on
+    /// the session rather than re-read from the turn because the point can be
+    /// retired (`retire_dead_task_point`) before the record that reports it is
+    /// written.
+    pub score_reward: i64,
+    pub gold_reward: i64,
 }
 
 /// The answer schema a sandbox script read out of the task file and echoed on
@@ -866,7 +881,22 @@ impl BotState {
                 if self.task.wrong_answers >= MAX_WRONG_ANSWERS {
                     self.finish_task(false, "wrong_answers");
                 }
-            } else if self.task.submitted_round.is_some() && !turn.error_codes.is_empty() {
+            } else if self.task.submitted_round.is_some()
+                && turn.error_codes.iter().any(|code| *code != 1)
+            {
+                // The timeout code is not a verdict on the ANSWER. 接口文档 §1.3.2
+                // has the judger settle a timed-out task on "之前提交过的通过率最高
+                // 的答案" — the answer stands, the session's clock ran out — so
+                // `errorCode 1` (任务超时) is not the "we were told the answer was
+                // bad" evidence this flag exists to record. Measured: #205's r26
+                // carries code 1 in the round after the session's last rejection
+                // and r147/r161 carry it for sessions that never submitted at
+                // all; nothing in the batch turned on this, which is why it went
+                // unnoticed — but a code 1 landing in the same round as an
+                // unanswered submission would have marked the one settleable
+                // answer this line ever sees as a failure. The other four codes
+                // are unchanged: 2 is the rejection, 3/4/5 are the judger saying
+                // the round did not work.
                 self.task.post_submit_error = true;
             }
         } else {
@@ -920,11 +950,28 @@ impl BotState {
             self.task.description = turn.phase_task.clone();
             self.task.description_round = turn.round_no;
             self.task.stage = TaskStage::Planning;
+            // The session's CEILING (WORKFLOW_REQUEST §16.1). `playerTasks[]`
+            // has carried `scoreReward` / `goldReward` all along and our log
+            // never recorded them, so a session worth 300 points and one worth
+            // 20 read identically — and 任务书 ch.6 pays
+            // `任务积分奖励 × 通过率` (gold: `任务金币奖励 × 通过率`) at the task
+            // point's own price. Without the ceiling in the log, "the task line
+            // earned nothing" cannot be told from "the task line was never
+            // worth anything", and the two call for opposite work.
+            let reward = self
+                .task
+                .point
+                .and_then(|point| turn.player_tasks.iter().find(|task| task.pos == point));
+            self.task.score_reward = reward.map(|task| task.score_reward).unwrap_or(0);
+            self.task.gold_reward = reward.map(|task| task.gold_reward).unwrap_or(0);
             crate::log::event(
                 "task_started",
                 serde_json::json!({
                     "round": turn.round_no,
                     "timeout": self.task.timeout_round,
+                    "task_kind": self.task.kind.as_str(),
+                    "scoreReward": self.task.score_reward,
+                    "goldReward": self.task.gold_reward,
                     "head": crate::log::brief(&self.task.description, 200),
                 }),
             );
@@ -933,6 +980,21 @@ impl BotState {
             || turn.round_no >= self.task.timeout_round;
         if ended_by_timeout {
             self.retire_dead_task_point();
+            // AN ANSWER THAT WAS NEVER REJECTED IS AN ANSWER THE JUDGER SCORED.
+            // 任务书 ch.6 pays at the end of the task, and 接口文档 §timeoutRounds
+            // says a timed-out task is settled on "之前提交过的通过率最高的答案"
+            // — the session does not have to be confirmed by the closure probe
+            // to have earned. Measured across issues #201/#203/#204/#205: every
+            // session of every match ended `timeout` (表 3a, 7/7), usually one
+            // to two rounds after its last submission (#205 session 3 submitted
+            // at r42 and r43 and the judger never rejected either; the task's
+            // own timeout ended it at r44), while `taskGoldEarned` stayed 0 for
+            // the whole match because `bank_task_reward` hung off
+            // `confirmed_success` alone. The counter was therefore blind by
+            // construction on the only ending these sessions ever take.
+            if self.task.submitted_round.is_some() && !self.task.post_submit_error {
+                self.bank_task_reward(turn, "timeout_unrejected");
+            }
             self.finish_task(false, "timeout");
             return;
         }
@@ -972,7 +1034,7 @@ impl BotState {
                 }),
             );
             if confirmed {
-                self.bank_task_reward(turn);
+                self.bank_task_reward(turn, "confirmed_success");
                 self.clear_sop_strikes();
                 self.finish_task(true, "confirmed_success");
             }
@@ -988,7 +1050,7 @@ impl BotState {
     /// and lumps task gold in with everything else, so "did the task line earn
     /// anything this match" — the question every task fix is judged by — had no
     /// answer in the log at all.
-    fn bank_task_reward(&mut self, turn: &Turn) {
+    fn bank_task_reward(&mut self, turn: &Turn, via: &str) {
         let Some(point) = self.task.point else {
             return;
         };
@@ -1012,6 +1074,13 @@ impl BotState {
                 "point": point,
                 "goldReward": reward,
                 "taskGoldEarned": self.task_gold_earned,
+                // Which ending banked it. `confirmed_success` is the closure
+                // probe's three-signal confirmation; `timeout_unrejected` is a
+                // session the judger timed out with its last submission still
+                // un-answered — 接口文档 §timeoutRounds settles those on the best
+                // submitted answer, so the point's reward is the ceiling they
+                // were played for. Both are ceilings, not receipts.
+                "via": via,
             }),
         );
     }

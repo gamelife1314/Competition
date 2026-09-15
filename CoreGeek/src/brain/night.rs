@@ -586,8 +586,8 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         night_rows.push(row);
     }
     // Still one record every night round, deliberately: the count of rounds a
-    // tower spent `controller_withdrawn` IS the finding (Improve.kimi.md reads
-    // "35 次 controller_withdrawn, 塔全程沉默"), so a record that only appeared
+    // tower spent `controller_withdrawn` IS the finding (35 次
+    // controller_withdrawn, 塔全程沉默), so a record that only appeared
     // when the reason changed would delete the duration. What it no longer does
     // is repeat the positions and the pair count, which were the same every
     // round and were two thirds of the bytes.

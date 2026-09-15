@@ -77,7 +77,7 @@ pub struct Weights {
     /// Kill-gap-driven funding switch (P1-1): non-zero = `intent_list`
     /// reorders tonight's funding by [`firepower_gap`]; zero keeps the
     /// committed fixed priorities. Default OFF so the dial proves itself in
-    /// A/B before it owns behaviour (Improve.kimi.md §7, P1-1 row).
+    /// A/B before it owns behaviour.
     pub clear_gap_drive: i64,
     /// Wall-breach tactic (P1): what an enemy WALL is worth once
     /// [`wall_breach_with`] has opened the gate. `0` switches the tactic off
@@ -1028,7 +1028,7 @@ pub fn estimated_wave_hp(day: i64) -> i64 {
 /// assuming every tower is manned every round. The rocket's 3-round cooldown
 /// is amortised to a third of its volley; gatling bullets and railgun energy
 /// are per-round. This is the ceiling the wave estimate is compared against —
-/// the arithmetic of Improve.kimi.md §3.1: 2×L1 = 1200 < the D1 wave's 3150.
+/// the arithmetic: 2×L1 = 1200 < the D1 wave's 3150.
 pub fn night_fire_capacity(turn: &Turn) -> i64 {
     night_fire_capacity_with(turn, -1, 0)
 }

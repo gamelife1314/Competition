@@ -624,7 +624,7 @@ fn station_max_hp_follows_the_level_table() {
 
 #[test]
 fn two_level_one_guns_cannot_clear_even_the_day_one_wave() {
-    // The arithmetic of Improve.kimi.md §3.1: 2×L1 = 20 damage/round = 1200
+    // The arithmetic: 2×L1 = 20 damage/round = 1200
     // over the night, against an estimated D1 wave of 3150 HP (70 smalls,
     // issue #14). The gap is what forces firepower funding ahead of station
     // upgrades when the dial is on.

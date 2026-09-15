@@ -570,9 +570,9 @@ pub fn boss_suppression_window(turn: &Turn) -> bool {
 /// side of the same gap.
 ///
 /// Dial-gated (`CG_TUNE_CLEAR_GAP`, default OFF): the committed fixed order
-/// stands until the multi-opponent A/B report shows the reorder winning
-/// (Improve.kimi.md §7, P1-1 row). `drive` is taken explicitly so tests can
-/// exercise both branches without touching the process-wide dial.
+/// stands until the multi-opponent A/B report shows the reorder winning.
+/// `drive` is taken explicitly so tests can exercise both branches without
+/// touching the process-wide dial.
 pub fn clear_gap_order_with(drive: bool, turn: &Turn, needs: &mut Vec<Need>) {
     if !drive {
         return;

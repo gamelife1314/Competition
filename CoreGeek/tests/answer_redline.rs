@@ -183,6 +183,95 @@ fn a_blocked_answer_never_becomes_the_deadline_submission() {
     );
 }
 
+/// A template is not an answer — and it does not have to be all placeholders
+/// to be one (#201/#203/#204/#205).
+///
+/// All four matches submitted the task file's own EXAMPLE, verbatim, as one of
+/// their seven submissions, and #201's `task_ended.bestAnswer` spells it out
+/// character for character. Two things made it look like an answer: it is valid
+/// JSON, and half of it is filled in — `"city":"北京"` and a real `types` array
+/// sit beside the fields still in the task's angle brackets, so the
+/// all-leaves-are-sentinels rule above never saw it. 任务书 ch.6 scores
+/// `回答正确字段个数 / 全量字段个数`, so a template banks the fields that were
+/// already filled in and nothing else, while spending the round and the
+/// submission the session needed for the rest — and the task prompt's own
+/// pre-submit self-check already calls it zero ("ANSWER 的值里有没有 `<...>`
+/// 占位符…有 = 0 分").
+#[test]
+fn a_template_wearing_real_values_is_still_a_template() {
+    // #201's, from the issue: the task file's example answer for the Beijing
+    // heritage query, with `city` and `types` filled in and three fields left
+    // in brackets.
+    let template = concat!(
+        r#"{"city":"北京","oldest_era":"<年代最早的遗产名称>","#,
+        r#""total_count":"<总记录条数>","#,
+        r#""types":["古建筑","古墓葬","近现代重要史迹","石窟寺及石刻","其他"],"#,
+        r#""world_heritage_count":"<保护级别为\"世界遗产\"的数量>"}"#,
+    );
+    assert!(
+        is_failure_answer(template),
+        "the task file's own template was submitted as an answer: {template}"
+    );
+
+    for slot in [
+        // One bracketed field is enough: a single unfilled field is a field the
+        // judger counts as wrong, and 通过率 is scored per field.
+        r#"{"city":"北京","total_count":"<总记录条数>"}"#,
+        // The bare slot, as the sandbox prints it when a field was never read.
+        "<年代最早的遗产名称>",
+        "\"<总记录条数>\"",
+        "`<token>`",
+        // #205's r14-r43 submission was this: a field whose value the script
+        // echoed straight out of the task file's SCHEMA line.
+        r#"{"world_heritage_count":"<保护级别为\"世界遗产\"的数量>"}"#,
+    ] {
+        assert!(
+            is_failure_answer(slot),
+            "`{slot}` is a slot waiting to be filled, not a value"
+        );
+    }
+
+    // The other half, and the one that costs more when it is wrong: the SAME
+    // object with the slots filled is the answer the task wanted, and a `<>`
+    // that is not a slot — a comparison, an HTML fragment, a half-written one —
+    // is not a template.
+    for real in [
+        concat!(
+            r#"{"city":"北京","oldest_era":"明清","total_count":"15","#,
+            r#""types":["古建筑","古墓葬"],"world_heritage_count":"3"}"#,
+        ),
+        "a < b",
+        "<unclosed",
+        "closed>",
+        "<>",
+        r#"{"note": "count < 10"}"#,
+    ] {
+        assert!(
+            !is_failure_answer(real),
+            "`{real}` is a value and must survive the filter"
+        );
+    }
+}
+
+/// The template must not become the thing the deadline guard submits either:
+/// it was sitting in `best_answer` as the session's strongest result, which is
+/// exactly the value `partial_answer` falls back on.
+#[test]
+fn a_template_never_becomes_the_deadline_submission() {
+    let mut state = BotState::default();
+    state.task.best_answer =
+        r#"{"city":"北京","total_count":"<总记录条数>"}"#.into();
+    state.task.result_history = vec![
+        "[exitCode:0]\n=== Reading Task File ===\nANSWER: {\"city\":\"北京\",\"total_count\":\"<总记录条数>\"}"
+            .into(),
+    ];
+    assert_eq!(
+        partial_answer(&state),
+        None,
+        "the task file's template is not a partial answer"
+    );
+}
+
 /// The wrapper rule still does its job on the answers that survive: a
 /// single-key object around a field the task never named is our formatting,
 /// and issue #15 lost a task to it.

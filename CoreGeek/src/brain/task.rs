@@ -512,7 +512,12 @@ pub fn plan_pioneer(
                 flip,
                 &named,
             );
-            let (logged, chars) = answer_for_log(&payload);
+            // The shape ladder decides WHICH shape; this decides that the bytes
+            // are a shape the judger can read at all (see
+            // `answer_wire_payload`). `shape` below is still read off the
+            // ladder's output, so 表 4a keeps saying which direction it went.
+            let wire = answer_wire_payload(&payload);
+            let (logged, chars) = answer_for_log(&wire);
             crate::log::event(
                 "task_answer_submit",
                 serde_json::json!({
@@ -521,6 +526,7 @@ pub fn plan_pioneer(
                     "round": turn.round_no,
                     "answer": logged,
                     "chars": chars,
+                    "wire": wire != payload,
                     "rewritten": payload != answer,
                     "flipped": flip,
                     // Which direction the rewrite took, so 表 4a can say whether
@@ -556,7 +562,7 @@ pub fn plan_pioneer(
             state.task.point_closed_round = None;
             state.task.post_submit_error = false;
             state.task.stage = TaskStage::WaitingSubmit { attempts: 0 };
-            Some(RoleCommand::submit_answer(&payload))
+            Some(RoleCommand::submit_answer(&wire))
         }
         TaskStage::WaitingSubmit { attempts } => {
             // Do not re-plan merely because the success verdict is implicit.
@@ -1457,8 +1463,46 @@ pub fn is_failure_answer(answer: &str) -> bool {
         if !leaves.is_empty() && leaves.iter().all(|leaf| is_sentinel(leaf)) {
             return true;
         }
+        // A TEMPLATE IS NOT AN ANSWER, and it does not have to be all
+        // placeholders to be one: the task file's own example is the shape the
+        // answer must take, with one field filled in and the rest still in
+        // angle brackets.
+        if leaves.iter().any(|leaf| is_template_slot(leaf)) {
+            return true;
+        }
+    }
+    if is_template_slot(trimmed) {
+        return true;
     }
     false
+}
+
+/// Is this value still wearing the task file's angle brackets?
+///
+/// The task files ship an EXAMPLE answer, and four matches in a row submitted
+/// it verbatim instead of computing anything: 表 4a of #201's first submission
+/// is 108 characters and `task_ended.bestAnswer` spells them out —
+/// `{"city":"北京","oldest_era":"<年代最早的遗产名称>","total_count":"<总记录条数>",
+/// "world_heritage_count":"<保护级别为\"世界遗产\"的数量>"}` — while #203 submitted
+/// the same object twice and #205's first submission was the API document's
+/// sample response. `ANSWER:` is a marker for a RESULT, and `<...>` is the
+/// task's own notation for "put the value here": the prompt's pre-submit
+/// self-check already says so in as many words ("ANSWER 的值里有没有 `<...>`
+/// 占位符…有 = 0 分"), and 任务书 ch.6 scores `回答正确字段个数 / 全量字段个数`,
+/// so a template scores the fields that were already filled in and nothing
+/// else — while costing the rounds and the submissions the session needed to
+/// compute the rest. Rejecting it re-plans instead, which is the whole
+/// difference between the sandbox being asked again and the template being
+/// banked as the best answer the deadline guard will resubmit.
+fn is_template_slot(text: &str) -> bool {
+    let trimmed = text
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .trim();
+    trimmed.len() >= 3
+        && trimmed.starts_with('<')
+        && trimmed.ends_with('>')
+        && !trimmed[1..trimmed.len() - 1].trim().is_empty()
 }
 
 /// Words that only ever appear inside a PLACEHOLDER — never in a result on
@@ -2066,4 +2110,30 @@ pub const ANSWER_LOG_CAP: usize = 4000;
 /// （`answer.chars().count() < chars` 即截断），不会被误当成判题器收到的原文。
 pub fn answer_for_log(payload: &str) -> (String, usize) {
     (truncate(payload, ANSWER_LOG_CAP), payload.chars().count())
+}
+
+/// The exact bytes handed to the judger: always a JSON document.
+///
+/// THE JUDGER PARSES EVERY SUBMISSION AS JSON. Its verdict for one that does
+/// not parse is `答案不是合法 JSON`, and it says so before comparing a single
+/// field — 表 4b carries that line in all four of issues #201/#203/#204/#205,
+/// and 表 4a shows the submission it answered was `unwrapped` in every one of
+/// them: the shape ladder had reduced `{"token": "fc1e78eb2a5a"}` to the bare
+/// text `fc1e78eb2a5a`, which is a string in no language but the shell's, and
+/// the session spent a round and a submission learning nothing. 任务书 ch.6
+/// scores `回答正确字段个数 / 全量字段个数` and 接口文档 §executeCmd has the
+/// judger hand-parse the payload, so a bare string is the ONE shape that can
+/// never score: quoting it is the same value in the only notation the
+/// comparison reads, and it leaves the ladder's other shape (the one-key
+/// object the retry flips to) exactly where it was.
+///
+/// A payload that already parses is passed through byte for byte — including
+/// the bare number `15`, which is legal JSON — so nothing that works today
+/// changes.
+pub fn answer_wire_payload(payload: &str) -> String {
+    if serde_json::from_str::<serde_json::Value>(payload).is_ok() {
+        return payload.to_string();
+    }
+    serde_json::to_string(&serde_json::Value::String(payload.trim().to_string()))
+        .unwrap_or_else(|_| payload.to_string())
 }
