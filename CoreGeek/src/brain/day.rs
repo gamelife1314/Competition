@@ -883,16 +883,9 @@ fn worker_day(
                 if claimed.contains(site) {
                     continue;
                 }
-                // Day 1: build up to 2 towers immediately (no ring wait). The
-                // third tower still waits for the ring to be mostly up.
-                if turn.day == 1 && turn.towers().len() >= 2 {
-                    let ring_open = wall_gaps.len() as i64;
-                    let ring_len = route::ring_cells(turn, 2).len() as i64;
-                    let ring_mostly_up = ring_open * 2 <= ring_len;
-                    if !ring_mostly_up {
-                        continue;
-                    }
-                }
+                // Day 1: build all 3 towers immediately — firepower is the
+                // day's first priority. Every worker needs a weapon to
+                // operate at night; a worker with no tower is dead weight.
                 if let Some(cmd) = build_or_walk(turn, role, *site, kind, claimed) {
                     claimed.insert(*site);
                     plan.push(role.id, cmd);
@@ -2702,11 +2695,12 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
             _ => {}
         }
     }
-    // Build order: gatling controls the near lane, then railgun exploits lined-up
-    // waves without being stopped by the front robot. Rocket remains the third
-    // slot: it is still completed early, but only after the two dependable
-    // no-cooldown weapons can defend the base.
-    let build_order: [(usize, &str); 3] = [(0, "gatling"), (1, "railgun"), (2, "rocket")];
+    // Build order: rocket first (longest range, engages enemies earliest),
+    // then railgun (lined-up wave penetration), then gatling (close defense).
+    // The rocket's splash damage is the opening weapon — it softens waves
+    // before they reach the ring. Railgun exploits the survivors, and
+    // gatling holds the near lane as the last line.
+    let build_order: [(usize, &str); 3] = [(2, "rocket"), (1, "railgun"), (0, "gatling")];
     // Cells that a standing weapon must be able to be OPERATED from. Three guns
     // packed onto adjacent ring cells steal each other's only standing room —
     // the middle one then has no adjacent free cell at all, and a weapon nobody

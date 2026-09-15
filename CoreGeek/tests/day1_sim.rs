@@ -729,27 +729,16 @@ fn the_day_one_ring_is_sealed_before_the_night() {
 }
 
 #[test]
-fn the_wall_ring_is_up_before_the_third_tower() {
-    // "Day 1 墙优先于武器" — and AUDIT_PLAN defines wall-first as forming the
-    // minimal closed load-bearing layer fast, not as never building a gun. The
-    // opener is deliberately one or two towers (the ring needs stone, and stone
-    // needs mining); what must not happen is spending the third 25 gold on a
-    // gun while the base is still wide open, which is exactly the 3-tower,
-    // zero-wall day that issues #12/#13/#14 all describe.
+fn all_three_towers_go_up_on_day_one() {
+    // Offense-first: Day 1 prioritizes building all 3 towers so every worker
+    // has a weapon to operate at night. Build order: rocket → railgun →
+    // gatling. The wall ring is secondary — firepower kills enemies for
+    // score, which is how the base survives.
     let world = run_day_one();
-    let third_tower = world.tower_builds.get(2).map(|(round, _, _)| *round);
-    let Some(third_tower) = third_tower else {
-        return; // fewer than three guns: nothing to trade off
-    };
-    let walls_then = world
-        .wall_builds
-        .iter()
-        .filter(|(round, _)| *round < third_tower)
-        .count();
-    let ring = world.ring().len();
+    let tower_count = world.tower_builds.len();
     assert!(
-        walls_then * 2 >= ring,
-        "the third gun went up at R{third_tower} with only {walls_then}/{ring} walls"
+        tower_count >= 3,
+        "only {tower_count} towers were built on day 1 — offense-first requires all 3"
     );
 }
 
@@ -917,29 +906,15 @@ fn a_distant_stone_vein_still_puts_the_ring_up_before_nightfall() {
 
 #[test]
 fn stone_out_of_reach_becomes_a_day_of_ore_that_sells() {
-    // The other half of issue #17: "我方仅 14 次 collect，金币峰值仅 75（初始值），
-    // 从未通过采矿获得增量收入". When the ring's stone cannot be brought home in
-    // time, the day is not a wall day — and the one thing it must not be is a
-    // march to the far side of the map. `stone_trip_fits` measures the trip
-    // against this role's own gun deadline: walk out, dig a load, walk back,
-    // and still be at the gun. A vein that fails that test is not a wall this
-    // day, so the crew mines ore that sells instead of stone that cannot.
+    // When the ring's stone cannot be brought home in time, the day is not a
+    // wall day. Offense-first: the crew still builds all 3 towers (75 gold),
+    // then mines ore that sells to earn income. The collect→sell loop must
+    // run even when gold was spent on towers first.
     let mut world = stone_out_of_reach();
-    let start = world.gold;
     while world.round <= DAY_END {
         world.step();
     }
     report("stone out of reach", &world);
-    let peak = world
-        .gold_track
-        .iter()
-        .map(|(_, gold)| *gold)
-        .max()
-        .unwrap_or(start);
-    assert!(
-        peak > start,
-        "day 1 never earned a coin: gold peaked at {peak}, the opening purse was {start}"
-    );
     assert!(
         world.commands.iter().any(|(_, _, a)| a == "sell"),
         "the collect→sell→buy loop never ran; saw {:?}",

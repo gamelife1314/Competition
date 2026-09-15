@@ -192,25 +192,23 @@ fn builds_with_builder(roles: Vec<Value>, gold: i64) -> Vec<String> {
 
 #[test]
 fn the_first_weapon_is_exempt_while_the_ring_is_still_open() {
-    // No gun at all, 25 gold, an untouched day-1 ring. The exemption is not a
-    // courtesy: the ring is built from stone, the stone comes from a mine the
-    // crew has to be able to hold, and a base with no gun is a base that loses
-    // the first night outright.
+    // No gun at all, 25 gold, an untouched day-1 ring. The first weapon is
+    // a rocket — longest range, engages enemies earliest. The ring is built
+    // from stone, and a base with no gun loses the first night outright.
     assert_eq!(
         builds_with_builder(vec![station(10, 20)], 25),
-        vec!["gatling"],
+        vec!["rocket"],
         "the first weapon was held back for a ring that is not built yet"
     );
 }
 
 #[test]
 fn the_second_weapon_goes_up_on_day_one_even_with_an_open_ring() {
-    // Offense-first: Day 1 builds up to 2 towers immediately, regardless of
-    // the wall ring. Two towers mean two workers have weapons at night — a
-    // worker with no tower is dead weight during the assault. The third tower
-    // still waits for the ring to be mostly up.
+    // Offense-first: Day 1 builds all 3 towers immediately, regardless of
+    // the wall ring. Every worker needs a weapon to operate at night.
+    // Build order: rocket → railgun → gatling.
     assert_eq!(
-        builds_with_builder(vec![station(10, 20), tower(10020, "gatling", 10, 18)], 25),
+        builds_with_builder(vec![station(10, 20), tower(10020, "rocket", 10, 18)], 25),
         vec!["railgun"],
         "the second weapon goes up on day 1 even with an open ring"
     );
@@ -220,7 +218,7 @@ fn the_second_weapon_goes_up_on_day_one_even_with_an_open_ring() {
 fn the_ring_being_closed_releases_the_second_weapon() {
     // The same board with the shell complete: nothing is holding the gun back
     // any more, and 25 gold in the purse is a gun's price.
-    let mut roles = vec![station(10, 20), tower(10020, "gatling", 10, 18)];
+    let mut roles = vec![station(10, 20), tower(10020, "rocket", 10, 18)];
     roles.extend(closed_ring((10, 20)));
     assert_eq!(
         builds_with_builder(roles, 25),
@@ -231,22 +229,17 @@ fn the_ring_being_closed_releases_the_second_weapon() {
 
 #[test]
 fn the_third_weapon_goes_up_on_day_one_once_the_ring_stands() {
-    // P0-2 + P0-4 together, which is the pairing the failure analysis asks for:
-    // the ring first, and then all three guns on the SAME day — 25 gold is the
-    // third slot's price and no longer a reserve held for the 100-gold voucher.
-    // The two existing guns sit on opposite sides of the station's corridor, so
-    // the remaining pad is on the same arc as the builder — a pair of towers
-    // either side of it would wall the pad off from the crew, which is a
-    // question about `tower_gaps` and not about this rule.
+    // All three guns on day 1: rocket and railgun are already up, gatling
+    // is the third slot (close defense). 25 gold is the third slot's price.
     let mut roles = vec![
         station(10, 20),
-        tower(10020, "gatling", 9, 18),
+        tower(10020, "rocket", 9, 18),
         tower(10030, "railgun", 12, 21),
     ];
     roles.extend(closed_ring((10, 20)));
     assert_eq!(
         builds_with_builder(roles, 25),
-        vec!["rocket"],
+        vec!["gatling"],
         "the third weapon did not go up on day 1 with the ring closed"
     );
 }
@@ -254,13 +247,11 @@ fn the_third_weapon_goes_up_on_day_one_once_the_ring_stands() {
 #[test]
 fn the_second_weapon_does_not_wait_for_the_last_ring_cell() {
     // Offense-first: the second tower goes up on day 1 even with one open ring
-    // cell. The old rule held the second gun back for a single cell — but that
-    // meant 1 tower and 20 walls on day 1, and the worker with no tower was
-    // dead weight during the night assault. The third tower still waits for
-    // the ring to be mostly up.
+    // cell. Every worker needs a weapon at night — no ring cell is worth
+    // leaving a worker unarmed.
     let base = (10, 20);
     let hole = ring_two(base)[0];
-    let mut roles = vec![station(base.0, base.1), tower(10020, "gatling", 10, 18)];
+    let mut roles = vec![station(base.0, base.1), tower(10020, "rocket", 10, 18)];
     roles.extend(ring_walls(base, &[hole]));
     assert_eq!(
         builds_with_builder(roles, 25),
@@ -271,12 +262,11 @@ fn the_second_weapon_does_not_wait_for_the_last_ring_cell() {
 
 #[test]
 fn a_later_day_never_waits_for_the_ring() {
-    // P0-4 is a day-1 rule. From day 2 the shell is standing (or being
-    // repaired), and a gun held back for a repair budget is a gun the coming
-    // night does not have.
+    // From day 2 the shell is standing (or being repaired), and a gun held
+    // back for a repair budget is a gun the coming night does not have.
     let base = (10, 24);
     let hole = ring_two(base)[0];
-    let mut roles = vec![station(base.0, base.1), tower(10020, "gatling", 10, 22)];
+    let mut roles = vec![station(base.0, base.1), tower(10020, "rocket", 10, 22)];
     roles.extend(ring_walls(base, &[hole]));
     // Round 135 is day 2, in-day round 4 — nowhere near the dusk lock-in, and
     // with a ring cell deliberately missing.

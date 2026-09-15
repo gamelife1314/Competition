@@ -447,24 +447,30 @@ pub fn choose_attack_kind_with(
         }
     }
     // Offense-first: when no NPC robot is threatening us, check for enemy
-    // summoned robots. After our robots are cleared, the opponent's summoned
-    // units are still marching — rockets with splash damage can eliminate them
-    // for kill points and reduce enemy pressure.
+    // summoned robots. Only fire when ALL our own robots are cleared —
+    // rocket splash damage would hit our own units if they are still on
+    // the field, so we hold fire until the field is clear of friendlies.
     if tower.kind == UnitKind::Rocket {
-        let enemy_robots: Vec<&Robot> = turn
+        let our_robots_alive = turn
             .robots
             .iter()
-            .filter(|robot| {
-                robot.target_team != turn.team_type
-                    && sim.get(&robot.id).copied().unwrap_or(0) > 0
-                    && in_range(tower, robot.pos)
-            })
-            .collect();
-        if !enemy_robots.is_empty() {
-            if let Some(targets) = choose_rocket(turn, tower, &enemy_robots, projectiles, sim) {
-                if !targets.is_empty() {
-                    sim.fired.insert(tower.id);
-                    return Some((targets, TargetKind::Robots));
+            .any(|robot| robot.target_team == turn.team_type && sim.get(&robot.id).copied().unwrap_or(0) > 0);
+        if !our_robots_alive {
+            let enemy_robots: Vec<&Robot> = turn
+                .robots
+                .iter()
+                .filter(|robot| {
+                    robot.target_team != turn.team_type
+                        && sim.get(&robot.id).copied().unwrap_or(0) > 0
+                        && in_range(tower, robot.pos)
+                })
+                .collect();
+            if !enemy_robots.is_empty() {
+                if let Some(targets) = choose_rocket(turn, tower, &enemy_robots, projectiles, sim) {
+                    if !targets.is_empty() {
+                        sim.fired.insert(tower.id);
+                        return Some((targets, TargetKind::Robots));
+                    }
                 }
             }
         }

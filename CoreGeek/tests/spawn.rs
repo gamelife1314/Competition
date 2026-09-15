@@ -188,8 +188,8 @@ fn the_three_tower_sites_sit_on_the_inner_ring_from_every_base() {
 
         let gaps = tower_gaps(&turn, &state);
         let kinds: Vec<&str> = gaps.iter().map(|(_, kind)| kind.as_str()).collect();
-        // Issue #7 order: gatling first, then railgun, then rocket.
-        assert_eq!(kinds, vec!["gatling", "railgun", "rocket"], "{name}");
+        // Offense-first: rocket first (longest range), then railgun, then gatling.
+        assert_eq!(kinds, vec!["rocket", "railgun", "gatling"], "{name}");
         let unique: HashSet<Pos> = gaps.iter().map(|(pos, _)| *pos).collect();
         assert_eq!(unique.len(), 3, "{name} stacked two towers on one cell");
         for (pos, _) in &gaps {

@@ -1831,18 +1831,18 @@ fn worker_prepositions_to_tower_before_dusk() {
 }
 
 #[test]
-fn gatling_and_railgun_are_built_before_rocket() {
-    // Gatling controls the nearest lane and railgun pierces lined-up waves.
-    // Rocket remains the third early slot, deferred until those two defenses
-    // exist and the upgrade reserve allows another build.
+fn rocket_and_railgun_are_built_before_gatling() {
+    // Rocket has the longest range and engages enemies earliest with splash
+    // damage. Railgun pierces lined-up waves. Gatling holds the near lane
+    // as the last line of defense. Build order: rocket → railgun → gatling.
     let turn = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
     let state = BotState::default();
     let gaps = coregeek::brain::day::tower_gaps(&turn, &state);
     let kinds: Vec<&str> = gaps.iter().map(|(_, kind)| kind.as_str()).collect();
     assert_eq!(
         kinds,
-        vec!["gatling", "railgun", "rocket"],
-        "tower build order is gatling → railgun → rocket"
+        vec!["rocket", "railgun", "gatling"],
+        "tower build order is rocket → railgun → gatling"
     );
 }
 
