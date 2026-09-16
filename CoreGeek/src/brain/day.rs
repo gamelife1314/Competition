@@ -624,6 +624,20 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
         );
     }
 
+    // The day's news/treasure prompt is a team-level channel, not a role
+    // command — it costs the pioneer no movement. Moving it out of
+    // `pioneer_day` so a dead pioneer does not silence the LLM ask: the news
+    // read and treasure altar inference still run when the pioneer has died,
+    // because the prompt slot is a property of the ROUND, not of whichever
+    // role is alive to take it.
+    // Merged prompt: when both news and treasure need asking, send one prompt
+    // with both questions (user request: "用一个 prompt 向大模型发起两个提问").
+    // Falls back to individual prompts when only one consumer needs the slot.
+    if !plan_merged_prompt(turn, state, &mut plan) {
+        news::plan_prompt(turn, state, &mut plan);
+        treasure::plan_ask(turn, state, &mut plan);
+    }
+
     if let Some(pioneer) = turn.pioneer() {
         pioneer_day(turn, state, pioneer, &pairs, &mut claimed, &mut plan);
     }
@@ -1592,38 +1606,11 @@ fn pioneer_day(
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
 ) {
-    // The day's news goes to the model before anything else may ask for the
-    // round's prompt (P1-1).
-    //
-    // POSITION IS THE PRIORITY, and it is a priority over the ROUND, not over
-    // the actions. `plan.prompt` is one slot per round and the first writer owns
-    // the call, so the owner's ranking is enforced twice: here, where the news
-    // and then the altar's ask take the slot before the task line's actions can
-    // reach step 4 at all, and in `BotState::request_prompt`, where a lower
-    // purpose is refused while a higher one still has an ask to make today. The
-    // owner's words: 「价格趋势直接决定了我们采集哪些矿，至关重要」, 「自进化任务
-    // 可以晚点接」, 「顺序上不能固定」.
-    //
-    // It sits above the recall on purpose: the news read is a team-level channel,
-    // not a role command, so it costs the pioneer no movement — a day whose
-    // pioneer is recalled at dawn is still a day whose mining is priced.
-    // Merged prompt: when both news and treasure need asking, send one prompt
-    // with both questions (user request: "用一个 prompt 向大模型发起两个提问").
-    // Falls back to individual prompts when only one consumer needs the slot.
-    if !plan_merged_prompt(turn, state, plan) {
-        news::plan_prompt(turn, state, plan);
-        // The altar's ASK, in the same breath and for the same reason: the prompt
-        // slot is one per round and it is a property of the ROUND, not of whichever
-        // action the pioneer ends up taking. Leaving it at step 6 — below the task
-        // accept — meant a pioneer standing beside a task point returned before the
-        // ask was reached, so the plan (and with it `window_due`, which needs a plan
-        // to see a window at all) waited on a round the task line left free.
-        // 「顺序上不能固定」: the news still owns the slot when there is news
-        // (`request_prompt` refuses the treasure while the read is reserved); the
-        // treasure takes it when there is not; the task line is last and loses only
-        // the rounds those two need.
-        treasure::plan_ask(turn, state, plan);
-    }
+    // News/treasure prompt planning has been moved to `plan()` above the
+    // `pioneer_day` call, so a dead pioneer does not silence the LLM ask.
+    // The prompt slot is a property of the ROUND, not of whichever role is
+    // alive to take it (issue #218: merged prompt never sent because pioneer
+    // died on D1, leaving news/treasure LLM asks stranded for the whole game).
 
     // 0. Dusk recall. The gate seal waits for EVERY role to be inside the ring,
     //    and the pioneer is the one role whose work — task points, treasure,

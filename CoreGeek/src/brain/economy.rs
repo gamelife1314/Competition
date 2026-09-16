@@ -356,7 +356,7 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     });
     let controllers = turn.controllable().len() as i64;
     let medicine = stock_of(turn, "Medicine");
-    let want_medicine = if injured || readiness {
+    let want_medicine = if injured || readiness || turn.day == 1 {
         controllers.max(1)
     } else {
         0
@@ -394,7 +394,7 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     // exactly as protected as they were; a 2-kit day-1 stock is 20 gold.
     let want_fixers = if damaged_walls > 0 {
         damaged_walls.min(6)
-    } else if readiness && !walls.is_empty() {
+    } else if (readiness || turn.day == 1) && !walls.is_empty() {
         // P1-4 续航包：2–4 kits a day. A ring that has been closed before is
         // the ring the night tears open (issue #21: 17→7) — and the kits are
         // the only wall HP available during the night itself.

@@ -644,6 +644,7 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     // spending a round on a step that already ran. Say so, or the model keeps
     // narrating the setup it no longer needs to do.
     prompt.push_str("13. 命令开头已经自动加好了一段固定环境预处理（UTF-8 locale、把任务目录下 `check`/`*.sh` 的 CRLF 去掉并加执行位），**不要再写这些准备步骤**，直接从侦察/计算开始；也不要 `cd` 到没有 `find`/`ls` 确认过的路径（`cd` 失败会让后面所有相对路径写到只读目录、报 `Permission denied`——上一批 4 个 session 因此丢掉了答案）。\n");
+    prompt.push_str("14. **ANSWER 的值必须由脚本在沙盒中实时计算得出，绝对不能从训练数据猜测或硬编码**。例如文化遗产数量、token 值等，都必须通过运行沙盒内的 API/脚本获取——你训练数据里的「北京世界遗产 7 个」在沙盒里可能已经过时，直接写死会判错。脚本要 `curl`/`python` 调用沙盒 API 或运行 `check` 脚本拿到真实结果，再 `echo \"ANSWER: ...\"`。\n");
     if !state.task.discovered_fields.is_empty() {
         prompt.push_str(&format!(
             "\n已从任务文件确认的输出字段：{}。ANSWER 的 JSON 必须恰好包含这些字段，不多不少。\n",

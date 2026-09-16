@@ -8,7 +8,7 @@
 # 暂停开关：1 = 暂停整个工作流（PULLCODE 阶段直接返回，不拉代码不推进）
 #           0 = 正常运行
 # 使用场景：人工想让工作流停下来等代码修复完，不用删除定时任务
-paused: 1
+paused: 0
 
 # 强制对战开关：1 = 无代码更新时，N 个周期后强制发起对战
 #               0 = 只有代码有更新才发起对战
@@ -20,7 +20,7 @@ issue_submit_enabled: 0
 
 # IMPROVE 开关：1 = ANALYZE 后自动优化代码、编译、提交、发起挑战（默认打开）
 #              0 = 跳过自动改进，走 ISSUESUBMIT 流程
-improve_enabled: 1
+improve_enabled: 0
 
 # ==================== PULLCODE 阶段 ====================
 
@@ -36,7 +36,7 @@ battle_wait_timeout: 2100
 # ==================== GOBATTLE 阶段 ====================
 
 # 白天单次发起对战上限（挑战排名前 N 名队伍）
-max_battles_per_round: 8
+max_battles_per_round: 32
 
 # 夜间单次发起对战上限（夜间可以多发起）
 max_battles_per_round_night: 48

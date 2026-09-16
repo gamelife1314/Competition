@@ -55,7 +55,7 @@ pub enum TaskStage {
 /// not the one: the judger has already said this exact thing. A session with no
 /// rejection text at all is back to the plain three-strike ceiling, because
 /// there is nothing to compare and the old rule is the only evidence available.
-pub const MAX_WRONG_ANSWERS: i32 = 3;
+pub const MAX_WRONG_ANSWERS: i32 = 2;
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskSession {
@@ -1434,15 +1434,14 @@ impl BotState {
                 }),
             );
         }
-        // A lack of an error is not proof that a script worked, so the
-        // multi-signal success probe still owns the cache. But a script the
-        // sandbox RAN and answered with is reusable whether or not the answer
-        // was accepted — and that reuse is the whole point of 自进化: a session
-        // that has to spend an LLM round-trip before its first command cannot
-        // finish inside the 2-15 round timeouts of issues #18/#19. Only the
-        // command that actually produced an answer qualifies (`sop_cmd`), never
-        // one that was refused or timed out.
-        if success || self.task.sop_cmd.is_some() {
+        // Only cache SOP on success: a script that produced a WRONG answer is
+        // not reusable. The previous condition `|| self.task.sop_cmd.is_some()`
+        // cached failed sessions too, which caused stale answers to be replayed
+        // verbatim for different tasks of the same kind (alpha's token
+        // fc1e78eb2a5a was replayed for beta and gamma, all rejected). A script
+        // with no `{{placeholders}}` is reused verbatim by bind_template, so a
+        // hardcoded wrong answer poisons every subsequent task of that type.
+        if success {
             self.cache_sop();
         }
         self.task = TaskSession::default();

@@ -479,7 +479,8 @@ def load_state():
         "no_update_count": 0,
         "issue_submitted": False,
         "gobattle_failures": 0,
-        "battle_pks": [],  # 本轮发起的对战 pk 列表
+        "initiated_opponents": [],  # 本轮发起挑战的对手列表 [{teamId, teamName}]
+        "gobattle_initiated_time": "",  # 本轮发起对战的时间戳
         "wait_start_time": "",  # WAIT_BATTLE 开始时间
         "analyze_start_time": "",
         "issue_pending_pks": [],
@@ -756,7 +757,7 @@ def phase_gobattle(state):
         log(f"    [{i+1}] teamId={r['teamId']}  {r['teamName']}  score={r['score']}  win={r['win']}")
 
     success = 0
-    battle_pks = []
+    initiated_opponents = []  # 记录本轮发起挑战的对手 (teamId, teamName)
     for idx, r in enumerate(selected):
         team_a = r["teamId"]
         team_name = r["teamName"]
@@ -779,6 +780,7 @@ def phase_gobattle(state):
         else:
             log(f"    -> API 异常，对战可能已创建（平台已知行为）")
             success += 1
+        initiated_opponents.append({"teamId": team_a, "teamName": team_name})
 
         if idx < len(selected) - 1:
             log(f"    等待 {get_config("sleep_interval")} 秒 ...")
@@ -788,7 +790,8 @@ def phase_gobattle(state):
     state["last_battle_time"] = datetime.now().isoformat()
     state["gobattle_failures"] = 0
     state["gobattle_commit"] = state.get("last_commit", "")  # 标记本轮已发起对战，防止重复
-    state["battle_pks"] = battle_pks  # 本轮发起的 pk（可能为空，平台不返回 id）
+    state["initiated_opponents"] = initiated_opponents  # 本轮发起挑战的对手列表
+    state["gobattle_initiated_time"] = state["last_battle_time"]  # 发起时间，用于过滤对战记录
     state["issue_submitted"] = False  # 对战已发起，清除 issue 标记
     state["phase"] = "WAIT_BATTLE"
     state["wait_start_time"] = datetime.now().isoformat()
@@ -858,10 +861,37 @@ def phase_wait_battle(state):
 
     all_records = records["record"]
 
-    # 自上次收集以来的新对战
+    # 只下载本轮发起的对战日志（通过对手 teamId 匹配）
+    # 平台 addResultPk 不返回 pk ID，所以用发起时记录的对手列表来过滤
+    initiated_opponents = state.get("initiated_opponents", [])
+    initiated_team_ids = set(opp["teamId"] for opp in initiated_opponents)
+    initiated_time_str = state.get("gobattle_initiated_time", "")
+
     downloaded_pks = set(state.get("downloaded_pks", []))
     new_battles = [r for r in successful if r["id"] not in downloaded_pks]
-    log(f"  新增已完成对战: {len(new_battles)} 场")
+
+    if initiated_team_ids:
+        # 过滤：对手 teamId 在本轮发起列表中，且 createTime 在发起时间之后
+        # 我方是 teamB（发起方），对手是 teamA
+        # 也包含别人挑战我们的对战（teamBid == OUR_TEAM_ID, teamAid 不在发起列表）
+        our_initiated = []
+        challenges_us = []
+        for r in new_battles:
+            team_a_id = r.get("teamAid")
+            team_b_id = r.get("teamBid")
+            create_time = r.get("createTime", "")
+
+            # 我方发起的：teamA 是对手，teamB 是我们
+            if team_b_id == OUR_TEAM_ID and team_a_id in initiated_team_ids:
+                our_initiated.append(r)
+            # 别人挑战我们的：teamA 是我们，teamB 是对手
+            elif team_a_id == OUR_TEAM_ID:
+                challenges_us.append(r)
+
+        new_battles = our_initiated + challenges_us
+        log(f"  本轮发起对战: {len(initiated_team_ids)} 个对手, 匹配到 {len(our_initiated)} 场我方发起 + {len(challenges_us)} 场被挑战 = {len(new_battles)} 场")
+    else:
+        log(f"  无发起记录，下载所有新增对战: {len(new_battles)} 场")
 
     if not new_battles:
         log("  没有新增对战日志可下载，进入 ANALYZE")
