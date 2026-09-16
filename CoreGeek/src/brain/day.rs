@@ -247,11 +247,13 @@ pub fn wall_daily_cap(day: i64, ring_ever_complete: bool, primary_open: usize) -
     }
 }
 
-/// Gold reserved for tower builds. We build 1-2 towers first and keep the
-/// rest for wall repair kits, medicine and upgrades — never all three slots
-/// at once (battle pk575557 spent 75g on three towers and had nothing left).
+/// Gold reserved for tower builds. Up to 3 towers are reserved (one per empty
+/// slot), so the third gatling is funded as soon as gold is available. Battle
+/// analysis (pk616181/pk616182) showed the base falls on night 1 with only 2
+/// towers against 0-tower rush opponents; the third tower's close-range fire
+/// is worth more than the gold it costs.
 pub fn tower_build_reserve(tower_count: usize, gap_count: usize) -> i64 {
-    ((2 - tower_count as i64).max(0)).min(gap_count as i64) * WEAPON_BUILD_COST
+    ((3 - tower_count as i64).max(0)).min(gap_count as i64) * WEAPON_BUILD_COST
 }
 
 pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
@@ -3186,17 +3188,19 @@ fn nearest_adjacent_mine(
 /// paired with the weapon kind that should stand there. Cells already
 /// holding one of our towers, blacklisted cells and non-land are excluded.
 ///
-/// One entry per EMPTY tower slot, in line order: slot `i` of the empty-slot
-/// list builds `config::TOWER_BUILD_ORDER[i]`. The list is therefore at most
-/// `config::TOWER_CAP - towers standing` long and may be shorter when the
-/// configured line runs out (issue #206 §5).
+/// One entry per EMPTY tower slot, in ABSOLUTE line order: the i-th empty slot
+/// (0-based among empties) builds `config::TOWER_BUILD_ORDER[existing + i]`,
+/// where `existing` is the number of towers already standing. Slot N of
+/// `TOWER_CAP` therefore always reads `TOWER_BUILD_ORDER[N]`, whatever is
+/// already standing. The list is at most `config::TOWER_CAP - towers standing`
+/// long and may be shorter when the configured line runs out (issue #206 §5).
 pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
     // Positional slots, one per EMPTY tower slot (issue #206 §5). The old
     // per-kind `have[]` counting could never express the owner's line: it built
     // each kind at most once, so "two missiles" and "all missiles" were both
     // unreachable, and the gatling was forced into the third slot. Now slot i
-    // of the empty-slot list builds `config::TOWER_BUILD_ORDER[i]`, so repeats
-    // mean what they say and a line shorter than the slot count simply stops.
+    // of the empty-slot list builds `config::TOWER_BUILD_ORDER[existing + i]`,
+    // so the line is positional: slot N reads index N, whatever is standing.
     let existing = turn.towers().len();
     if existing >= crate::config::TOWER_CAP {
         return Vec::new();
@@ -3256,10 +3260,20 @@ pub fn tower_gaps(turn: &Turn, state: &BotState) -> Vec<(Pos, String)> {
     let mut gaps: Vec<(Pos, String)> = Vec::new();
     let mut used: HashSet<Pos> = HashSet::new();
     for slot in 0..empty_slots {
-        // The line ran out before the slots did: build what the line names and
-        // stop. Deliberately not an error — `["rocket", "railgun"]` with three
-        // empty slots is two towers, which is the owner's line.
-        let Some(&kind) = crate::config::TOWER_BUILD_ORDER.get(slot) else {
+        // ABSOLUTE indexing (pk616181/pk616182, 2026-09-17): slot i of the
+        // empty-slot list reads `TOWER_BUILD_ORDER[existing + i]`, not
+        // `TOWER_BUILD_ORDER[i]`. Under the old relative indexing the third
+        // slot (existing=2, i=0) re-read index 0 and raised a second rocket
+        // instead of the gatling the line names at index 2 — so the close-
+        // range swarm defense the owner configured never got built, and 70
+        // robots walked through two long-cooldown guns on night 1. Absolute
+        // indexing makes the line positional: slot N of TOWER_CAP always
+        // reads TOWER_BUILD_ORDER[N], whatever is already standing.
+        //
+        // The line ran out before the slots did: build what the line names
+        // and stop. Deliberately not an error — `["rocket", "railgun"]` with
+        // three empty slots is two towers, which is the owner's line.
+        let Some(&kind) = crate::config::TOWER_BUILD_ORDER.get(existing + slot) else {
             break;
         };
         let mut taken = permanent.clone();

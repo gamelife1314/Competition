@@ -1406,6 +1406,13 @@ fn the_third_weapon_is_gated_by_the_purse_and_the_three_tower_cap() {
     // fought with two guns, and a first night that was always out-gunned. The
     // gun is now gated by the purse and by the three-tower cap, and nothing
     // else; the upgrade keeps its own priority through `intent_list`.
+    //
+    // The day-1 station-fund guard (issues #201-#205) that used to block the
+    // third tower has been REMOVED (pk616181/pk616182, 2026-09-17): opponents
+    // that build 0 towers and rush with 70 robots destroy our base on night 1
+    // when we have only 2 towers. The third tower (gatling) is critical for
+    // close-range swarm defense; saving 100g for a voucher is moot when the
+    // base does not survive to use it.
     let state = BotState::default();
     let towers = |gold: i64, count: usize, level: i64| {
         let mut roles = vec![station(10, 20, 1)];
@@ -1429,19 +1436,11 @@ fn the_third_weapon_is_gated_by_the_purse_and_the_three_tower_cap() {
         coregeek::brain::economy::may_build_weapon(&towers(25, 1, 1), &state),
         "second weapon builds with 25g"
     );
-    // Day 1 station-fund guard (issues #201-#205): the third tower is blocked
-    // when the station is L1, no upgrade voucher has been bought, and the purse
-    // cannot afford both the 25g tower and the 100g voucher. Building all three
-    // towers on Day 1 drained the budget and the base never left 1500 HP.
+    // The third tower is no longer blocked on Day 1 — the gatling swarm defense
+    // is worth more than the gold it costs (pk616181/pk616182).
     assert!(
-        !coregeek::brain::economy::may_build_weapon(&towers(25, 2, 1), &state),
-        "third tower on Day 1 with L1 station and no voucher is blocked — station fund first"
-    );
-    // With 125g the third tower is allowed: 125 - 25 = 100, exactly the voucher
-    // price. The team can build the tower AND buy the station upgrade.
-    assert!(
-        coregeek::brain::economy::may_build_weapon(&towers(125, 2, 1), &state),
-        "third tower is allowed when the purse covers both the tower and the voucher"
+        coregeek::brain::economy::may_build_weapon(&towers(25, 2, 1), &state),
+        "third tower builds with 25g — station-fund guard removed, base survival first"
     );
     // The two doors that remain. One gold short is one gold short — the gate is
     // the price, and a level-1 main gun does not lower it.
@@ -1460,18 +1459,23 @@ fn the_third_weapon_is_gated_by_the_purse_and_the_three_tower_cap() {
 #[test]
 fn the_worker_lays_the_third_weapon_the_moment_the_gold_is_there() {
     // Two level-1 weapons + 25g, with a worker standing right next to the open
-    // rocket slot. P0-2: that 25 gold is the third gun's, not a reserve held
+    // gatling slot. P0-2: that 25 gold is the third gun's, not a reserve held
     // for the 100-gold voucher — the analysis' five two-gun matches are exactly
     // this board. Day 2 on purpose: while day 1's ring is still being built the
     // 2nd/3rd tower waits for the ring (see `wall_first_p0.rs`:
     // `no_second_weapon_while_the_day_one_ring_is_still_open`).
+    //
+    // The third slot reads TOWER_BUILD_ORDER[2] = "gatling" under absolute
+    // indexing (pk616181/pk616182): the gatling's every-round fire at close
+    // range is the swarm defense that keeps the base alive against 70-robot
+    // rushes.
     let turn = turn_from(day_world_at(
         day_round(5 + coregeek::model::ROUNDS_PER_DAY),
         vec![
             station(10, 20, 1),
             gatling(10020, 5, 5, 1),
             railgun(10030, 7, 7, 1),
-            worker(10010, 12, 19), // adjacent to the rocket gap at (12,18)
+            worker(10010, 12, 19), // adjacent to the gatling gap at (12,18)
         ],
         25,
         vec![],
@@ -1487,7 +1491,7 @@ fn the_worker_lays_the_third_weapon_the_moment_the_gold_is_there() {
         .collect();
     assert_eq!(
         built,
-        vec!["rocket"],
+        vec!["gatling"],
         "25 gold in hand and the third weapon is not being laid: {:?}",
         plan.commands
     );
@@ -2204,16 +2208,19 @@ fn a_confirmed_success_clears_the_templates_strikes() {
 }
 
 #[test]
-fn tower_build_reserve_covers_two_towers_not_three() {
-    // Battle pk575557 all-in'd 75g on three towers and starved every consumable.
-    // The reserve must cover only the 1-2 towers we actually build.
-    assert_eq!(coregeek::brain::day::tower_build_reserve(0, 3), 50);
-    assert_eq!(coregeek::brain::day::tower_build_reserve(1, 2), 25);
+fn tower_build_reserve_covers_all_three_tower_slots() {
+    // Battle pk616181/pk616182: opponents that build 0 towers and rush with 70
+    // robots destroy our base on night 1 when we have only 2 towers. The reserve
+    // now covers all three tower slots — the third (gatling, fires every round)
+    // is the close-range swarm defense that keeps the base alive.
+    assert_eq!(coregeek::brain::day::tower_build_reserve(0, 3), 75);
+    assert_eq!(coregeek::brain::day::tower_build_reserve(1, 2), 50);
     assert_eq!(
         coregeek::brain::day::tower_build_reserve(2, 1),
-        0,
-        "no third tower until an upgrade"
+        25,
+        "the third tower is reserved too — gatling swarm defense"
     );
+    assert_eq!(coregeek::brain::day::tower_build_reserve(3, 0), 0);
 }
 
 #[test]

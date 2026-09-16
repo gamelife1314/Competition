@@ -701,10 +701,31 @@ pub fn break_out(
         .filter(|pos| turn.is_land(*pos) && !blocked.contains(pos))
         .filter(|pos| distance(*pos) < here)
         .collect();
-    if closer.is_empty() {
-        return None;
+    if !closer.is_empty() {
+        return walk_toward(turn, role, &closer, claimed);
     }
-    walk_toward(turn, role, &closer, claimed)
+    // LAST RESORT (pk616181: tower 20040 `controller_stuck@32,9/3/3` for 33
+    // rounds — a whole gun silent for a whole night). The controller is in a
+    // sealed pocket of its own walls: no adjacent wall leads strictly closer,
+    // and no adjacent land cell leads strictly closer. The monotone search
+    // above correctly refuses to wander, but 33 rounds of silence is worse
+    // than a temporary hole the day crew can re-wall at dawn. Cut an adjacent
+    // wall at the SAME distance (a lateral move) — it might open a path around
+    // the obstacle that the strict `<` filter missed. Walls that lead strictly
+    // AWAY from the post are still rejected: a wall farther out is not a path
+    // home, it is a hole in the ring for nothing (the `M = 0` / far-wall
+    // shapes measured in issues #128 and #130).
+    if let Some(pos) = turn
+        .walls()
+        .into_iter()
+        .map(|wall| wall.pos)
+        .filter(|pos| chebyshev(role.pos, *pos) == 1)
+        .filter(|pos| distance(*pos) <= here)
+        .min_by_key(|pos| (distance(*pos), pos.x, pos.y))
+    {
+        return Some(RoleCommand::remove(pos));
+    }
+    None
 }
 
 /// Walk toward `stands`; when the pathfinder finds no route (our own wall

@@ -1149,23 +1149,14 @@ pub fn may_build_weapon(turn: &Turn, _state: &BotState) -> bool {
     if turn.towers().len() >= 3 || turn.gold < WEAPON_BUILD_COST {
         return false;
     }
-    // Day 1 station-fund guard (issues #201-#205): the third tower is blocked
-    // when the station is L1, no upgrade voucher has been bought, and the purse
-    // cannot afford both the 25g tower and the 100g voucher. Building all three
-    // towers on Day 1 drained the budget and the base never left 1500 HP.
-    if turn.towers().len() == 2 && turn.day == 1
-        && turn.in_day_round < DUSK_ROUND - FALLBACK_LEAD
-    {
-        let station_l1 = turn
-            .station()
-            .map(|s| s.level <= 1)
-            .unwrap_or(true);
-        let has_voucher = stock_of(turn, "WeaponUpgradeVoucher1") > 0
-            || stock_of(turn, "StationUpgradeVoucher1") > 0;
-        if station_l1 && !has_voucher && turn.gold < WEAPON_BUILD_COST + WEAPON_VOUCHER1_PRICE {
-            return false;
-        }
-    }
+    // The day-1 station-fund guard that used to block the third tower until
+    // round 35 (issues #201-#205) has been removed. Battle analysis
+    // (pk616181/pk616182, 2026-09-17) shows opponents that build 0 towers and
+    // rush our base with 70 robots destroy it on night 1 when we have only 2
+    // towers. The third tower (gatling, fires every round) is critical for
+    // close-range swarm defense. Saving 100g for a station upgrade voucher is
+    // moot when the base does not survive to use it. The `gold < WEAPON_BUILD_COST`
+    // check above still prevents building when we literally cannot afford it.
     true
 }
 

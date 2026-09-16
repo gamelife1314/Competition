@@ -274,5 +274,5 @@ fn the_configured_line_gets_its_sites_on_an_ordinary_board() {
         assert!(!seen.contains(pos), "{pos:?} is offered twice");
         seen.push(*pos);
     }
-    assert_eq!(sites.len(), 2, "an empty board has room for the whole line");
+    assert_eq!(sites.len(), 3, "an empty board has room for the whole line");
 }
