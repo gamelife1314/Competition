@@ -12,7 +12,7 @@ paused: 0
 
 # 强制对战开关：1 = 无代码更新时，N 个周期后强制发起对战
 #               0 = 只有代码有更新才发起对战
-force_battle: 0
+force_battle: 1
 
 # ISSUESUBMIT 开关：1 = 分析后提交 GitHub Issue（人工审查改进）
 #                   0 = 跳过 Issue 提交（默认关闭，由 IMPROVE 自动改进）
