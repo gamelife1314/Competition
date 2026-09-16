@@ -649,6 +649,29 @@ pub fn clear_gap_order_with(drive: bool, turn: &Turn, needs: &mut Vec<Need>) {
 pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     let mut intents = intent_list(turn, state, reserve);
     let cashout = turn.in_day_round >= DUSK_ROUND - DUSK_CASHOUT_LEAD;
+
+    // Dusk weapon-voucher protection (issues #201-#205): if a
+    // WeaponUpgradeVoucher is still wanted and not yet in hand, every gold
+    // coin counts toward reaching its 100g price. Buying Medicine (10g) or
+    // WallFixer (10g) each round drained the purse from 96 to 36 while the
+    // voucher sat at the head of the list unaffordable — the team died with
+    // 64g it never converted to firepower, 3×L1 towers, 0 weapon upgrades.
+    //
+    // During the cash-out window we block consumable purchases that would push
+    // the purse below the weapon voucher price, so the collect→sell→buy loop
+    // can close the gap instead of being reset by a 10-gold bandage every
+    // round. Once the voucher IS in hand (or all weapons are maxed) the block
+    // lifts and consumables flow normally.
+    let weapon_voucher_pending = cashout
+        && turn.towers().iter().any(|t| t.level < 2)
+        && stock_of(turn, "WeaponUpgradeVoucher1") == 0
+        && stock_of(turn, "WeaponUpgradeVoucher2") == 0;
+    let weapon_voucher_price = turn
+        .weapon_shop
+        .get("WeaponUpgradeVoucher1")
+        .copied()
+        .unwrap_or(100);
+
     if cashout {
         // Dusk cash-out: rank by combat power per gold (descending), then by
         // priority as a tiebreak. Every coin should buy the most combat it can.
@@ -682,6 +705,16 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
             .unwrap_or(i64::MAX);
         if price <= 0 || price == i64::MAX {
             continue;
+        }
+        // Dusk weapon-voucher guard: skip consumables that would drain the
+        // purse below the voucher price while the voucher is still pending.
+        // "Cannot take it with you" — gold hoarded at dusk buys nothing if the
+        // base falls, so the weapon upgrade is the priority, not the bandage.
+        if weapon_voucher_pending && is_night_readiness(&need.name) {
+            let gold_after = remaining - price * need.num;
+            if gold_after < weapon_voucher_price && remaining < weapon_voucher_price {
+                continue;
+            }
         }
         // Wall vouchers count as infrastructure only while the tower fund is
         // not being guarded: a guarded 25 gold is the third tower's, and a
