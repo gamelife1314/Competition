@@ -87,9 +87,26 @@ pub fn on_llm_resp(state: &mut BotState, resp: &str) {
         return;
     }
     if let Some(cmd) = extract_command(resp) {
+        crate::log::event(
+            "task_llm_resp",
+            serde_json::json!({
+                "session": state.task.session_id,
+                "ok": true,
+                "cmdHead": crate::log::brief(&cmd, 300),
+            }),
+        );
         state.task.stage = TaskStage::HavePlan { cmd };
+    } else {
+        // If extraction fails we stay in Planning and re-prompt next round.
+        crate::log::event(
+            "task_llm_resp",
+            serde_json::json!({
+                "session": state.task.session_id,
+                "ok": false,
+                "respHead": crate::log::brief(resp, 300),
+            }),
+        );
     }
-    // If extraction fails we stay in Planning and re-prompt next round.
 }
 
 /// Is this verdict the judger saying the task's execution window is shut?
@@ -109,6 +126,14 @@ pub fn on_cmd_result(state: &mut BotState, result: &str) {
     if !matches!(state.task.stage, TaskStage::WaitingCmdResult { .. }) {
         return;
     }
+    crate::log::event(
+        "task_cmd_result",
+        serde_json::json!({
+            "session": state.task.session_id,
+            "exit": exit_code(result),
+            "resultHead": crate::log::brief(strip_status_line(result), 300),
+        }),
+    );
     if window_closed(result) {
         state.task.judger_window_errors = state.task.judger_window_errors.saturating_add(1);
         crate::log::event(
@@ -358,7 +383,31 @@ pub fn plan_pioneer(
                 // last: what a refusal costs it is the round the news read took,
                 // and the news read asks once a day.
                 state.task.llm_request_round = Some(turn.round_no);
-                plan.prompt = Some(build_prompt(state, turn));
+                let prompt = build_prompt(state, turn);
+                let has_results = !state.task.result_history.is_empty();
+                let has_rejection = !state.task.rejection_feedback.is_empty();
+                let has_schema_issues = !state.task.schema_gaps.is_empty()
+                    || !state.task.schema_extras.is_empty();
+                let phase = if has_rejection || has_schema_issues {
+                    "fix"
+                } else if !has_results {
+                    "read"
+                } else {
+                    "solve"
+                };
+                crate::log::event(
+                    "task_prompt_sent",
+                    serde_json::json!({
+                        "session": state.task.session_id,
+                        "round": turn.round_no,
+                        "phase": phase,
+                        "hasSop": state.task.sop_reuse_script.is_some(),
+                        "hasFields": !state.task.discovered_fields.is_empty(),
+                        "hasResults": has_results,
+                        "promptHead": crate::log::brief(&prompt, 300),
+                    }),
+                );
+                plan.prompt = Some(prompt);
             }
             None
         }
@@ -391,6 +440,14 @@ pub fn plan_pioneer(
                 state.task.cmd_history.push(truncate(&cmd, 800));
                 state.task.cmd_request_round = Some(turn.round_no);
                 state.task.stage = TaskStage::WaitingCmdResult { attempts: 0 };
+                crate::log::event(
+                    "task_cmd_sent",
+                    serde_json::json!({
+                        "session": state.task.session_id,
+                        "round": turn.round_no,
+                        "cmdHead": crate::log::brief(&cmd, 300),
+                    }),
+                );
                 plan.execute_cmd = Some(cmd);
             }
             None
