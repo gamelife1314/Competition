@@ -630,8 +630,8 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     let has_rejection = !state.task.rejection_feedback.is_empty();
     let left = state.task.timeout_round.saturating_sub(turn.round_no);
 
-    prompt.push_str("你的脚本将在隔离沙盒中执行（shell + python3，无外网）。\n");
-    prompt.push_str("任务文件通常在 /tmp/selfEvolutionTask/ 下（可能有多层子目录）。\n\n");
+    prompt.push_str("请帮我写一段 shell 或 python 脚本，我会在沙盒环境中执行它。\n");
+    prompt.push_str("沙盒环境：可运行 shell 和 python3，不能联网。任务文件在 /tmp/selfEvolutionTask/ 下（可能有多层子目录）。\n\n");
     prompt.push_str("任务描述：\n");
     prompt.push_str(&state.task.description);
     prompt.push_str("\n\n");
