@@ -1055,6 +1055,63 @@ fn worker_day(
     //     and repeating it here would only shadow a deadline that works.
     let committed = !pairs.iter().any(|(controller, _)| *controller == role.id)
         && dusk_committed(state, turn, role, dusk_recall_round(turn, role));
+    // 6d. THE MERGED OUTING (issue #206 §2, 「一趟买齐」). One trip out of the
+    //     ring carries the whole errand list — the vein, the vendor, the shop —
+    //     because the pack is what makes it possible and the walk is what makes
+    //     it worth doing: a worker's pack is 100 slots and the pioneer's 40
+    //     (任务书 3.2, read off `backPackCapability`, never assumed here), and
+    //     every separate departure pays the walk again.
+    //
+    //     `economy::outing` lays the trip out and prices it in rounds against
+    //     the daylight left; what the day takes from it is its ORDER. When the
+    //     trip both sells and buys, the sale is walked first — step 7 outranks
+    //     step 9, so a buyer holding ore and a shopping list set off for the
+    //     shop with the load still in its pack, bought nothing (the counter is
+    //     paid in gold, not ore), and walked the pack back out to the mine.
+    //     That is the parking `buyer_must_preposition` was taught to avoid, one
+    //     level up: the goal is payable, so the earner goes — but it goes to the
+    //     VENDOR first and the shop is the next stop on the same trip.
+    //
+    //     When the day cannot fit the whole trip before the dusk recall, the
+    //     route gives up its last stop instead — the shopping — and this step
+    //     then routes nothing at all, leaving step 7 exactly as it was. A short
+    //     afternoon costs a voucher, never the sale.
+    //
+    //     Only the trip's FIRST claim is enforced here. The digging, the
+    //     counter and the shop are the day's own flows (7, 9, 10), each
+    //     re-picking its venue from where the role actually stands.
+    let mut sell_first = false;
+    if !committed
+        && !turn.vendors().is_empty()
+        && (buyer_id == Some(role.id) || economy_id == Some(role.id))
+    {
+        if let Some(outing) = economy::outing(turn, state, role, &budget.shopping, stone_demand) {
+            if outing.sells() && outing.buys() {
+                crate::log::event(
+                    "merged_outing",
+                    serde_json::json!({
+                        "round": turn.round_no,
+                        "role": role.id,
+                        "stops": outing.stops.len(),
+                        "rounds": outing.rounds,
+                        "daylight": outing.daylight,
+                    }),
+                );
+                sell_first = true;
+                if economy::vendor_travel(turn, role.pos) > 0 {
+                    match walk_to_vendor(turn, role, claimed) {
+                        Some(cmd) => {
+                            plan.push(role.id, cmd);
+                            return;
+                        }
+                        // No legal step toward the vendor after all — the route
+                        // gives way rather than parking the role on the spot.
+                        None => sell_first = false,
+                    }
+                }
+            }
+        }
+    }
     // 7. Shopping (dedicated buyer) — upgrades come after survival. When
     //    nothing is affordable YET the buyer still sets off once the ore in its
     //    pack covers the price, so the purchase lands the round the sale does.
@@ -1091,7 +1148,7 @@ fn worker_day(
         let at_shop = turn.weapon_shops().iter().any(|shop| {
             chebyshev(role.pos, *shop) <= 1
         });
-        if !budget.shopping.is_empty() && (is_buyer || at_shop) {
+        if !sell_first && !budget.shopping.is_empty() && (is_buyer || at_shop) {
             // The buyer may still walk to the shop; other workers only buy
             // if already standing at the counter (no new walks for non-buyers
             // — those workers need to get behind the ring for the seal).
@@ -1110,7 +1167,8 @@ fn worker_day(
         }
         // fall through: steps 8 and 9 still run, everything below them is
         // replaced by the lock-in.
-    } else if buyer_id == Some(role.id)
+    } else if !sell_first
+        && buyer_id == Some(role.id)
         && (shop_trip_worth_taking(turn, role, pairs, &budget.shopping)
             || !economy::should_sell(turn, state, role, stone_demand))
     {
@@ -1871,6 +1929,21 @@ fn walk_to_shop(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>) -> Option<
     walk_toward(turn, role, &stands, claimed)
 }
 
+/// Walk to the nearest vendor stand: the SALE leg of a merged outing, walked
+/// before the shop leg because the counter is paid in gold and the pack is
+/// where the gold is. Same shape as `walk_to_shop` — the day has one way of
+/// walking a role to a stand and this is not a second one.
+fn walk_to_vendor(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>) -> Option<RoleCommand> {
+    let mut stands: Vec<Pos> = Vec::new();
+    for vendor in turn.vendors() {
+        stands.extend(stand_cells(turn, vendor));
+    }
+    if stands.is_empty() {
+        return None;
+    }
+    walk_toward(turn, role, &stands, claimed)
+}
+
 /// Buy the first needed item: walk to the weapon shop, then buy. Buying is
 /// the buyer's sole job — a carried summon order must never preempt a voucher,
 /// upgrade or repair purchase.
@@ -2478,15 +2551,34 @@ fn open_door(
     }
     let station = turn.station()?;
     let footprint = station.footprint();
-    // Already outside, or standing on the wall line itself: nothing to cut.
-    if footprint_distance(role.pos, &footprint) > 1 {
+    let outside = outside_cells(turn, &footprint);
+    // Sealed in: inside the ring, with no route to the open map. Asked of a
+    // role by its own id, because the crew's reservations are `blocked_for`'s
+    // business and someone else's claim is not this role's wall.
+    let sealed_in = |who: &Unit| {
+        let blocked = turn.blocked_for(who.id);
+        crate::path::step_toward_stands(turn, who.pos, &outside, &blocked).is_none()
+    };
+    // The rescue. A way out already exists for this worker — the ring is
+    // incomplete, the door is open, or it was never trapped — so it has nothing
+    // to cut for itself. But the PIONEER cannot cut for itself at all: 任务书
+    // 4.4 gives `remove` to 工人 only and `validate.rs` drops anyone else's, so
+    // a ring that closes over the pioneer is a cage it leaves only if someone
+    // comes for it — 「除非有人来救否则就出不去了」. The crew IS the rescue, and
+    // the worker standing outside the line cuts the same ring from its own
+    // side. So the worker with the errand outside is the one who acts, and the
+    // wall it opens is the pioneer's door.
+    let rescue = turn.pioneer().is_some_and(|pioneer| {
+        footprint_distance(pioneer.pos, &footprint) <= 1 && sealed_in(pioneer)
+    });
+    // Already outside, or standing on the wall line itself: nothing to cut —
+    // unless this worker is the one going for the pioneer.
+    if footprint_distance(role.pos, &footprint) > 1 && !rescue {
         return None;
     }
-    // A way out already exists — the ring is incomplete, the door is open, or
-    // this role never was trapped. Never demolish a wall we do not have to.
-    let blocked = turn.blocked_for(role.id);
-    let outside = outside_cells(turn, &footprint);
-    if crate::path::step_toward_stands(turn, role.pos, &outside, &blocked).is_some() {
+    // Never demolish a wall we do not have to: this worker cuts for itself when
+    // it is the trapped one, and for the pioneer when the pioneer is.
+    if !sealed_in(role) && !rescue {
         return None;
     }
     // One door per day, and one is enough. A teammate's cut from THIS round is
@@ -3472,6 +3564,99 @@ mod tests {
         assert!(
             !wall_would_trap(&turn, &[], &state, pos(20, 20)),
             "a wall in the open, far from every role's way home, traps nobody"
+        );
+    }
+
+    /// The closed ring around the mid-map station: all twenty cells one layer
+    /// out from the footprint, which is the 19/20 the day-1 crew kept finishing
+    /// on. Everyone inside is walled away from the ore.
+    fn sealed_ring(extra: Vec<serde_json::Value>) -> Turn {
+        let mut roles = vec![unit(10001, "station", pos(10, 24))];
+        let footprint = station_footprint(pos(10, 24));
+        for (index, at) in ring_cells(&footprint, 2).iter().enumerate() {
+            roles.push(unit(20000 + index as i64, "wall", *at));
+        }
+        roles.extend(extra);
+        let payload = serde_json::json!({
+            // Day 2, in-day round 9: past the day-1 fortification rule, well
+            // before the dusk seal.
+            "roundNo": 140,
+            "mapInfo": {"width": 41, "height": 32, "zones": []},
+            "teamOur": {
+                "type": "challenger", "goldNum": 0, "totalScore": 0,
+                "playerTasks": [], "roles": roles
+            },
+            "teamEnemy": {"roles": []},
+            "robot": {"roles": []},
+        });
+        let req: crate::protocol::Request =
+            serde_json::from_value(payload).expect("payload parses");
+        Turn::from_request(req)
+    }
+
+    fn door_of(turn: &Turn, actor: i64) -> Option<RoleCommand> {
+        let state = &mut BotState::default();
+        let mut claimed = HashSet::new();
+        let role = turn.role_by_id(actor).expect("the actor exists");
+        open_door(turn, state, role, &mut claimed)
+    }
+
+    /// 「工人可以在第二天出不去的时候选择破墙而出，但是开拓者如果夹在武器、基地
+    /// 以及城墙之间，除非有人来救否则就出不去了」 — the worker has an escape
+    /// hatch and the pioneer does not (任务书 4.4: `remove` is 工人 only, and
+    /// `validate.rs` drops anyone else's). Here the ring is closed, every worker
+    /// is out on the ore, and the pioneer is the one inside. With nobody cutting
+    /// for it the pioneer spends the day behind the wall, which is the cage the
+    /// owner described; the crew is the rescue, and the worker standing beside
+    /// the line cuts the door from its own side.
+    #[test]
+    fn a_worker_cuts_the_ring_for_a_pioneer_sealed_inside() {
+        let turn = sealed_ring(vec![
+            unit(10002, "worker", pos(7, 24)),  // outside, beside the ring
+            unit(10004, "pioneer", pos(11, 25)), // inside, and going nowhere
+        ]);
+        let pioneer = turn.role_by_id(10004).expect("the pioneer exists");
+        assert!(
+            !crate::brain::can_reach_any(&turn, pioneer, &outside_cells(&turn, &station_footprint(pos(10, 24)))),
+            "test setup: the pioneer is not actually sealed in"
+        );
+        let cmd = door_of(&turn, 10002).expect("the crew cut the ring for the pioneer");
+        assert_eq!(cmd.action, "remove", "a door is cut with `remove`: {cmd:?}");
+        let target = cmd.targetPos.expect("a removal names its wall")[0];
+        assert_eq!(
+            footprint_distance(target, &station_footprint(pos(10, 24))),
+            2,
+            "{target:?} is not a cell of our ring"
+        );
+        // …and it is the right cell: with that one wall gone the pioneer walks
+        // out. A removal anywhere else leaves it caged for the day.
+        let mut blocked = turn.blocked_for(pioneer.id);
+        blocked.remove(&target);
+        assert!(
+            crate::path::step_toward_stands(
+                &turn,
+                pioneer.pos,
+                &outside_cells(&turn, &station_footprint(pos(10, 24))),
+                &blocked
+            )
+            .is_some(),
+            "the cell the crew cut is not the one that lets the pioneer out"
+        );
+    }
+
+    /// The control for the test above: the same board with the pioneer OUTSIDE
+    /// the ring. Nobody is caged, so nobody cuts — the door costs a stone and a
+    /// hole the dusk has to re-seal, and it is only ever opened for a role that
+    /// cannot open it for itself.
+    #[test]
+    fn no_door_is_cut_when_the_pioneer_is_already_out() {
+        let turn = sealed_ring(vec![
+            unit(10002, "worker", pos(7, 24)),
+            unit(10004, "pioneer", pos(6, 24)),
+        ]);
+        assert!(
+            door_of(&turn, 10002).is_none(),
+            "a sealed-in pioneer is the only reason to cut a door from outside"
         );
     }
 

@@ -806,6 +806,191 @@ pub fn buyer_must_preposition(turn: &Turn, role: &Unit, needs: &[Need]) -> bool 
     })
 }
 
+/// One point on a role's trip out of the ring, in the order the trip visits
+/// it. The contents, not the location, decide what the role does there — the
+/// day's own flows own the commands, and the venue is re-picked from wherever
+/// the role stands when it arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// Work the vein at `pos` until `loads` items are in the pack.
+    Collect { pos: Pos, ore: String, loads: i64 },
+    /// Cash the pack in at the vendor.
+    Sell,
+    /// Buy at the weapons shop, one round per item.
+    Buy { items: Vec<(String, i64)> },
+}
+
+/// One departure from the base and back: everything the role does between two
+/// visits to the ring, with what the whole trip costs in rounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outing {
+    pub stops: Vec<Stop>,
+    /// Rounds the trip costs: every walk, the digging, the counter and the
+    /// walk home.
+    pub rounds: i64,
+    /// The daylight the trip had to fit in: `DUSK_ROUND - in_day_round`.
+    pub daylight: i64,
+}
+
+impl Outing {
+    pub fn has(&self, wanted: &Stop) -> bool {
+        self.stops.contains(wanted)
+    }
+    /// Is a purchase on this trip at all?
+    pub fn buys(&self) -> bool {
+        self.stops.iter().any(|stop| matches!(stop, Stop::Buy { .. }))
+    }
+    /// Is a sale on this trip? This is the stop that funds the purchase and the
+    /// one the trip must never trade away for it.
+    pub fn sells(&self) -> bool {
+        self.stops.contains(&Stop::Sell)
+    }
+}
+
+/// Where a leg ends and what it costs: the STAND beside `target` the role
+/// actually finishes on, and the ring-aware walk to it.
+///
+/// The distinction is a round per leg. A role walks to the cell beside the
+/// counter, not onto the counter, and the next leg starts from where it is
+/// standing — a route that priced itself to the zone cell would credit every
+/// stop with a round the day never gets back, and the trip that "fits" would
+/// be the one that arrives after dark.
+fn leg_end(turn: &Turn, from: Pos, target: Pos) -> (Pos, i64) {
+    crate::brain::stand_cells(turn, target)
+        .into_iter()
+        .map(|stand| (stand, crate::brain::route::trip_rounds(turn, from, stand)))
+        .min_by_key(|(stand, walk)| (*walk, stand.x, stand.y))
+        .unwrap_or((target, crate::brain::route::trip_rounds(turn, from, target)))
+}
+
+/// The one place where a trip's cost is measured: rounds to walk there, plus
+/// the work done at the stop, chained from the stop before it.
+fn nearest_by_trip(turn: &Turn, from: Pos, targets: &[Pos]) -> Option<(Pos, Pos, i64)> {
+    targets
+        .iter()
+        .map(|target| {
+            let (stand, walk) = leg_end(turn, from, *target);
+            (*target, stand, walk)
+        })
+        .min_by_key(|(target, stand, walk)| (*walk, stand.x, stand.y, target.x, target.y))
+}
+
+/// Plan one departure from the base and back (issue #206 §2, 「一趟买齐」).
+///
+/// The owner's point is that the errands share a walk and the pack is big: a
+/// worker has whatever `backPackCapability` the board says (100 in 任务书 3.2;
+/// the number is read off the role, never guessed here) and the pioneer 40, so
+/// one trip can carry a full load of ore to the vendor AND come back past the
+/// shop with the vouchers the night needs. The job that did NOT exist is
+/// deciding the trip as one thing: which vein to work, whether the load is
+/// worth cashing in on the way, what to buy with the gold, in what order, and
+/// whether the whole of it fits in the daylight left before the dusk recall.
+///
+/// What this returns is the route, not the commands: the day's own flows sell,
+/// buy and dig, and each re-picks its venue from where the role actually
+/// stands. Two properties of the route are what the day acts on:
+///
+/// * **The sale outranks the purchase.** The stops are ordered the way the trip
+///   is walked — cash in, then dig, then spend — so a role with ore to sell and
+///   something to buy sells first. That is `buyer_must_preposition`'s lesson
+///   one level up: a purchase is paid for in gold, and the pack is where the
+///   gold is.
+/// * **The daylight trims the tail, never the head.** A trip that cannot be
+///   walked inside `DUSK_ROUND - in_day_round` gives up its LAST stop — the
+///   shopping — rather than its first. So a short day costs the team a voucher
+///   and never costs it the sale, which is also the order that keeps the only
+///   earner earning.
+///
+/// `None` when there is nothing worth leaving for, or when even the first stop
+/// cannot be walked home before dusk (「或者干脆不出门」).
+pub fn outing(
+    turn: &Turn,
+    state: &BotState,
+    role: &Unit,
+    shopping: &[Need],
+    stone_demand: i64,
+) -> Option<Outing> {
+    let station = turn.station()?;
+    let home = station.pos;
+    let daylight = (DUSK_ROUND - turn.in_day_round).max(0);
+    let unclaimed = HashSet::new();
+
+    // (stop, rounds spent so far, where the role stands after it), in the order
+    // the trip walks them.
+    let mut legs: Vec<(Stop, i64, Pos)> = Vec::new();
+    let mut at = role.pos;
+    let mut spent = 0i64;
+
+    // 1. The counter, when the pack already holds a batch the vendor will take.
+    //    First, because the trip is paid for out of the pack: a role that digs
+    //    "one more stack" before cashing in is the stall `should_sell` exists
+    //    to break, and a role that walks to the shop with an unsold pack comes
+    //    home with the pack and no voucher.
+    let selling = should_sell(turn, state, role, stone_demand);
+    if selling {
+        if let Some((_, stand, walk)) = nearest_by_trip(turn, at, &turn.vendors()) {
+            spent += walk + 1;
+            at = stand;
+            legs.push((Stop::Sell, spent, at));
+        }
+    }
+    // 2. The vein, when there is nothing to cash in yet. One stop digs the batch
+    //    the sale is worth — `sell_batch`, the same load step 9 waits for, never
+    //    the whole pack: a stop that digs 100 slots is 100 rounds, which is more
+    //    daylight than any day has, and the trip it would price is one nobody
+    //    can walk. `choose_mine` first, so a ring that still owes stone gets the
+    //    stone trip it is owed; otherwise the sellable-ore ROI the economy
+    //    worker uses.
+    let free = free_slots(role);
+    if !selling && free > 0 {
+        let vein = choose_mine(turn, state, role, stone_demand, &unclaimed)
+            .or_else(|| choose_sellable_mine(turn, state, role, &unclaimed));
+        if let Some((pos, ore)) = vein {
+            let loads = sell_batch(turn, state, role).min(free).max(1);
+            let (stand, walk) = leg_end(turn, at, pos);
+            spent += walk + loads;
+            at = stand;
+            legs.push((Stop::Collect { pos, ore, loads }, spent, at));
+        }
+    }
+    // 3. The shop, for what the team can actually pay for. `shopping` is the
+    //    reserve-respecting affordable list — the trip does not get to spend
+    //    the gold the reserve is holding.
+    if !shopping.is_empty() {
+        if let Some((_, stand, walk)) = nearest_by_trip(turn, at, &turn.weapon_shops()) {
+            spent += walk + shopping.iter().map(|need| need.num).sum::<i64>();
+            at = stand;
+            legs.push((
+                Stop::Buy {
+                    items: shopping
+                        .iter()
+                        .map(|need| (need.name.clone(), need.num))
+                        .collect(),
+                },
+                spent,
+                at,
+            ));
+        }
+    }
+    if legs.is_empty() {
+        return None;
+    }
+    // The daylight decides how much of the trip is real. Tail first: the last
+    // stop is the one that goes.
+    for keep in (1..=legs.len()).rev() {
+        let (_, rounds, after) = &legs[keep - 1];
+        let total = rounds + crate::brain::route::trip_rounds(turn, *after, home);
+        if total <= daylight {
+            return Some(Outing {
+                stops: legs[..keep].iter().map(|(stop, _, _)| stop.clone()).collect(),
+                rounds: total,
+                daylight,
+            });
+        }
+    }
+    None
+}
+
 /// Is a funding goal close enough to its deadline that ore must be cashed in
 /// immediately? Waiting for a larger, cheaper batch would miss the purchase.
 fn purchase_urgent(turn: &Turn, state: &BotState, role: &Unit) -> bool {

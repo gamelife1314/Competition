@@ -212,7 +212,181 @@ pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
         let role = controllers.remove(index);
         pairs.push((role.id, tower.id));
     }
+    pioneer_post(turn, &mut pairs);
     pairs
+}
+
+/// Which gun the pioneer should be holding (issue #206 §7).
+///
+/// The greedy pass above hands every gun the controller standing nearest it,
+/// which is the right question for a worker and the wrong one for the pioneer.
+/// Two facts make the pioneer special, and both are structural rather than
+/// tactical:
+///
+/// * **It cannot cut its own way out.** 任务书 4.4 gives `remove` to 工人 only,
+///   `validate.rs` enforces it (a pioneer `remove` is dropped), and the whole
+///   escape machinery — `walk_or_remove_wall`, `break_out`, `open_door` — is
+///   reached from `worker_day` alone. A worker walled off its gun digs through;
+///   a pioneer walled off its gun stands there. The owner's picture —
+///   「开拓者如果夹在武器、基地以及城墙之间，除非有人来救否则就出不去了」 — is
+///   exactly this, and it is a fact about the rulebook, not about the board.
+/// * **It is the role whose day is spent outside.** Task points, the altar and
+///   the shop are all outside the ring, so the pioneer is the controller most
+///   likely to be arriving at dusk while the last ring cells go down.
+///
+/// So its post is chosen for it, over every gun it could hold, on the two
+/// questions the owner asked of the post itself — 「最安全的位置」 and 「让他操作
+/// 可远程攻击的导弹」:
+///
+/// 1. **Is it the safest one?** Distance from the enemy station, best over that
+///    gun's stands, maximised. Robots come from the enemy bearing, so the gun
+///    furthest from it is the one whose operator spends the fewest nights under
+///    fire.
+/// 2. **Is it the long-range one?** The rocket reaches 10 / 15 / 全图 and is
+///    the only weapon that does not care where it is sited.
+///
+/// The third thing the owner asked for — 「给它留个门」 — is not a property of
+/// the post and is not decided here: the door is cut for the pioneer by the
+/// crew every morning it is sealed in (`day::open_door`), because the pioneer
+/// is the one role that cannot cut it for itself.
+///
+/// The move is a SWAP of two controllers, never a re-run of the greedy pass.
+/// A permutation cannot unman a gun, so "every tower has a controller" is held
+/// by construction rather than by argument — the invariant `tower_unpaired`
+/// exists to watch. A swap is taken only when it strictly improves the key and
+/// only when BOTH controllers can still reach their new guns, so it cannot
+/// trade one silent gun for another. Ties fall through to `(x, y)`, the
+/// codebase's usual last word, so the same board always yields the same post.
+///
+/// The improvement has to be MATERIAL (`post_upgrade`), and that word is doing
+/// real work: the greedy pass hands a gun to the controller standing next to
+/// it, and moving the pioneer onto a gun one cell further from the enemy takes
+/// that gun away from whoever was beside it and leaves them walking. That trade
+/// was measured — on the interface doc's own board it handed the gatling to a
+/// pioneer eight cells away and left the worker who had been standing on it
+/// with nothing to shoot with (`tests/replay.rs`). A one-cell difference in
+/// exposure is not a safety difference; it is a tie that the ranking already
+/// breaks without moving anybody.
+fn pioneer_post(turn: &Turn, pairs: &mut [(i64, i64)]) {
+    let Some(pioneer) = turn.pioneer() else {
+        return;
+    };
+    let Some(mine) = pairs
+        .iter()
+        .position(|(controller, _)| *controller == pioneer.id)
+    else {
+        return;
+    };
+    let here = pairs[mine].1;
+    let Some(current) = turn.role_by_id(here) else {
+        return;
+    };
+    let mut best: Option<(usize, PostRank)> = None;
+    for (index, (controller, tower_id)) in pairs.iter().enumerate() {
+        if index == mine {
+            continue;
+        }
+        let (Some(tower), Some(other)) = (turn.role_by_id(*tower_id), turn.role_by_id(*controller))
+        else {
+            continue;
+        };
+        if !post_upgrade(turn, current, tower) {
+            continue;
+        }
+        if !crate::brain::can_reach_any(turn, pioneer, &tower_stand_cells(turn, tower.pos)) {
+            continue;
+        }
+        if !crate::brain::can_reach_any(turn, other, &tower_stand_cells(turn, current.pos)) {
+            continue;
+        }
+        let rank = post_rank(turn, tower);
+        if best.map(|(_, best_rank)| post_better(rank, best_rank)).unwrap_or(true) {
+            best = Some((index, rank));
+        }
+    }
+    if let Some((index, _)) = best {
+        let (controller, tower_id) = pairs[index];
+        pairs[index] = (controller, here);
+        pairs[mine] = (pioneer.id, tower_id);
+    }
+}
+
+/// How much further from the enemy bearing a gun has to be before moving the
+/// pioneer onto it is a SAFETY decision rather than noise.
+///
+/// One cell is not a difference at all: two cells a Chebyshev step apart share
+/// four neighbours, so a robot standing on any of them is equally close to both
+/// and the two posts are the same post. Two is the smallest separation at which
+/// they share no neighbour — and it is also the largest this decision can
+/// express, because the interior band of a 2x2 station is four columns wide and
+/// a gun's operating cells reach one column past its own. A larger margin would
+/// make 「最安全的位置」 unreachable on every board this game produces, which is
+/// the same as not asking the question.
+const PIONEER_SAFE_MARGIN: i32 = 2;
+
+/// A gun's post, by [`pioneer_post`]'s two questions.
+#[derive(Clone, Copy)]
+struct PostRank {
+    /// Distance from the enemy bearing, best over the gun's stands. Bigger is
+    /// safer.
+    exposure: i32,
+    /// 1 for everything but the rocket, which reaches 10 / 15 / 全图.
+    short_range: i32,
+    x: i32,
+    y: i32,
+}
+
+fn post_rank(turn: &Turn, tower: &Unit) -> PostRank {
+    let stands = tower_stand_cells(turn, tower.pos);
+    // A board with no enemy station left to measure against is treated as
+    // maximally safe rather than as zero, so reach still decides.
+    let exposure = turn
+        .enemy_station()
+        .map(|station| {
+            stands
+                .iter()
+                .map(|pos| chebyshev(*pos, station.pos))
+                .min()
+                .unwrap_or(0)
+        })
+        .unwrap_or(i32::MAX);
+    PostRank {
+        exposure,
+        short_range: i32::from(tower.kind != UnitKind::Rocket),
+        x: tower.pos.x,
+        y: tower.pos.y,
+    }
+}
+
+/// The order two posts are preferred in: safer first, then the longer reach,
+/// then `(x, y)` — the codebase's usual last word.
+fn post_better(a: PostRank, b: PostRank) -> bool {
+    let key = |rank: PostRank| {
+        (
+            rank.exposure,
+            std::cmp::Reverse(rank.short_range),
+            std::cmp::Reverse(rank.x),
+            std::cmp::Reverse(rank.y),
+        )
+    };
+    key(a) > key(b)
+}
+
+/// Is `candidate` worth moving the pioneer off `current` for?
+///
+/// Reach and shelter trade only inside the noise band; outside it, shelter
+/// wins, because a rocket the pioneer cannot live long enough to fire is not a
+/// better gun.
+fn post_upgrade(turn: &Turn, current: &Unit, candidate: &Unit) -> bool {
+    let now = post_rank(turn, current);
+    let new = post_rank(turn, candidate);
+    if new.exposure >= now.exposure + PIONEER_SAFE_MARGIN {
+        return true; // materially further from the enemy bearing
+    }
+    if new.exposure + PIONEER_SAFE_MARGIN <= now.exposure {
+        return false; // materially closer to it: not worth the reach
+    }
+    new.short_range < now.short_range
 }
 
 /// Stable controller↔tower pairings. The cache key includes every living
@@ -343,6 +517,35 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // mutably (to report enemy fire back to the coach), and the stance must not
     // change halfway through one round's firing sequence.
     let coach_policy = state.coach.policy();
+    // THE ROUND'S ASSIGNMENT (issue #206 §3b). Every tower that will pull a
+    // trigger tonight, in the order it will pull it — the same filter, in the
+    // same order, as the loop below. `plan_round` answers "who does each gun
+    // shoot at" for all of them at once; each tower is then fired with the cell
+    // the round gave it, and one the plan did not name fires exactly as it
+    // always has. Passing the list rather than the loop means the plan is
+    // decided before the first tower has changed the simulation — which is the
+    // whole point of an assignment.
+    let firing: Vec<(i64, i64)> = pairs
+        .iter()
+        .filter(|(controller_id, tower_id)| {
+            let (Some(tower), Some(controller)) =
+                (turn.role_by_id(*tower_id), turn.role_by_id(*controller_id))
+            else {
+                return false;
+            };
+            // `night_medicine` and the distance are what the loop itself tests
+            // before it reaches the trigger; anything that fails them is a
+            // tower that will not fire, and the plan must not spend a shot on
+            // it (`simulate_round` would otherwise score a round nobody has).
+            tower.alive()
+                && controller.alive()
+                && tower.cooldown == 0
+                && chebyshev(controller.pos, tower.pos) <= 1
+                && night_medicine(turn, controller).is_none()
+        })
+        .map(|(controller_id, tower_id)| (*tower_id, *controller_id))
+        .collect();
+    let aims = combat::plan_round(&coach_policy, turn, &firing);
 
     // Per-pair diagnostics, folded into one record after the loop — see the
     // note at the push site.
@@ -488,9 +691,13 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 idle_reason = "controller_healing";
                 plan.push(controller.id, cmd);
             } else if tower.cooldown == 0 {
-                if let Some((targets, kind)) =
-                    combat::choose_attack_kind_with(&coach_policy, turn, tower, &mut sim)
-                {
+                if let Some((targets, kind)) = combat::choose_attack_kind_aimed(
+                    &coach_policy,
+                    turn,
+                    tower,
+                    &mut sim,
+                    aims.get(&tower.id).copied(),
+                ) {
                     targets_count = targets.len();
                     fired = true;
                     enemy_fire = kind == combat::TargetKind::EnemyAssets;

@@ -412,6 +412,22 @@ pub fn choose_attack_kind(
     choose_attack_kind_with(&crate::brain::coach::Policy::committed(), turn, tower, sim)
 }
 
+/// As `choose_attack_kind_with`, but with a target the ROUND has already
+/// assigned to this tower (`plan_round`). A plan is an opening shot, not a
+/// leash: `aim` is honoured only while the cell it names still has a live robot
+/// down the trajectory, and every other decision — the rest of a gatling's
+/// bullets, the missiles after a rocket's first, the fallback to the
+/// opponent's assets — is the tower's own, exactly as when `aim` is `None`.
+pub fn choose_attack_kind_aimed(
+    policy: &crate::brain::coach::Policy,
+    turn: &Turn,
+    tower: &Unit,
+    sim: &mut Sim,
+    aim: Option<Pos>,
+) -> Option<(Vec<Pos>, TargetKind)> {
+    choose_attack_kind_planned(policy, turn, tower, sim, aim)
+}
+
 /// As `choose_attack_kind`, against the adaptive policy the coach currently
 /// holds (`BotState::coach`). The committed policy reproduces the shipped
 /// behaviour bit for bit, so the plain entry point above is unchanged for every
@@ -426,13 +442,26 @@ pub fn choose_attack_kind_with(
     tower: &Unit,
     sim: &mut Sim,
 ) -> Option<(Vec<Pos>, TargetKind)> {
+    choose_attack_kind_planned(policy, turn, tower, sim, None)
+}
+
+/// The body behind both entry points above: `aim` is the target the round's
+/// plan assigned to this tower, if any.
+fn choose_attack_kind_planned(
+    policy: &crate::brain::coach::Policy,
+    turn: &Turn,
+    tower: &Unit,
+    sim: &mut Sim,
+    aim: Option<Pos>,
+) -> Option<(Vec<Pos>, TargetKind)> {
     let projectiles = crate::model::tower_projectiles(tower.kind, tower.level.max(1)) as usize;
     if projectiles == 0 {
         return None;
     }
     // Absolute priority: a station that dies this round ends the half. Nothing
     // else on the board — not even the wave in front of us — is worth more, so
-    // this is the one case that outranks robot targeting.
+    // this is the one case that outranks robot targeting. It outranks the
+    // round's plan for the same reason: the plan assigns ROBOTS.
     if station_killable(turn, sim) {
         if let Some(targets) = station_targets(turn, tower, projectiles, sim) {
             sim.fired.insert(tower.id);
@@ -445,9 +474,9 @@ pub fn choose_attack_kind_with(
         .filter(|robot| sim.get(&robot.id).copied().unwrap_or(0) > 0)
         .collect();
     let targets = match tower.kind {
-        UnitKind::Gatling => choose_gatling(turn, tower, &robots, projectiles, sim),
-        UnitKind::Railgun => choose_railgun(turn, tower, &robots, sim),
-        UnitKind::Rocket => choose_rocket(turn, tower, &robots, projectiles, sim),
+        UnitKind::Gatling => choose_gatling(turn, tower, &robots, projectiles, sim, aim),
+        UnitKind::Railgun => choose_railgun(turn, tower, &robots, sim, aim),
+        UnitKind::Rocket => choose_rocket(turn, tower, &robots, projectiles, sim, aim),
         _ => None,
     };
     if let Some(targets) = targets {
@@ -476,7 +505,9 @@ pub fn choose_attack_kind_with(
                 })
                 .collect();
             if !enemy_robots.is_empty() {
-                if let Some(targets) = choose_rocket(turn, tower, &enemy_robots, projectiles, sim) {
+                // No `aim` here on purpose: the plan assigns NPC robots, and an
+                // enemy summon is not on the board the plan was computed from.
+                if let Some(targets) = choose_rocket(turn, tower, &enemy_robots, projectiles, sim, None) {
                     if !targets.is_empty() {
                         sim.fired.insert(tower.id);
                         return Some((targets, TargetKind::Robots));
@@ -493,6 +524,156 @@ pub fn choose_attack_kind_with(
         sim.fired.insert(tower.id);
         (targets, TargetKind::EnemyAssets)
     })
+}
+
+/// How many of its reachable robots one tower is offered as a target for the
+/// round's plan. Three towers offering five aims each (plus "leave this tower
+/// alone") is 216 full-round simulations, which is cheap; the cap is what keeps
+/// the plan's cost flat when a wave of twenty robots walks into range.
+const PLAN_AIMS_PER_TOWER: usize = 5;
+
+/// The most combinations the plan will enumerate before falling back to the
+/// free pass. A guard, not a tuning knob: `TOWER_CAP` is 3, so the real
+/// ceiling is 6^3.
+const PLAN_MAX_COMBOS: usize = 512;
+
+/// Decide the round's firing assignment for all of `firing` together.
+///
+/// `firing` is the towers that will shoot this round, IN THE ORDER THEY WILL
+/// SHOOT, as `(tower_id, controller_id)`. Each tower is asked the same question
+/// the free pass asks it — which robot — but the answer is chosen for the round
+/// as a whole instead of one tower at a time against a simulation the tower
+/// before it has already changed. That is what keeps two guns off the same
+/// robot when a third, killable one is standing beside it, and what stops a gun
+/// from finishing a robot another gun has already finished.
+///
+/// Every candidate assignment is judged by RUNNING the round's own choosers
+/// against it and reading the damage simulation back — never by a model of what
+/// the weapons would do. So the plan is compared with the free pass on the real
+/// outcome, and a bad candidate costs a missed opportunity rather than a worse
+/// round. A tie keeps today's behaviour: the free pass is the first candidate
+/// scored, and only a strict improvement displaces it.
+///
+/// Returns the aim cells assigned, by tower id. A tower missing from the map
+/// fires exactly as it does without a plan.
+pub fn plan_round(
+    policy: &crate::brain::coach::Policy,
+    turn: &Turn,
+    firing: &[(i64, i64)],
+) -> HashMap<i64, Pos> {
+    let none: HashMap<i64, Pos> = HashMap::new();
+    // One tower cannot overlap with anybody, so there is nothing to allocate.
+    if firing.len() < 2 {
+        return none;
+    }
+    let towers: Vec<&Unit> = firing
+        .iter()
+        .filter_map(|(tower_id, _)| turn.role_by_id(*tower_id))
+        .collect();
+    if towers.len() < 2 {
+        return none;
+    }
+    // The aims on offer, per tower, in a fixed order — the robots this tower
+    // can reach, the ones worth the most first (the same ranking the choosers
+    // use), and by position where that ties.
+    let aims: Vec<Vec<Pos>> = towers
+        .iter()
+        .map(|tower| {
+            let mut reach: Vec<&Robot> = turn
+                .robots
+                .iter()
+                .filter(|robot| robot.health > 0 && in_range(tower, robot.pos))
+                .collect();
+            reach.sort_by_cached_key(|robot| {
+                (
+                    std::cmp::Reverse(win_value(turn, robot)),
+                    chebyshev(tower.pos, robot.pos),
+                    robot.id,
+                )
+            });
+            reach
+                .into_iter()
+                .take(PLAN_AIMS_PER_TOWER)
+                .map(|robot| robot.pos)
+                .collect()
+        })
+        .collect();
+    let combos: usize = aims.iter().map(|a| a.len() + 1).product();
+    if combos <= 1 || combos > PLAN_MAX_COMBOS {
+        return none;
+    }
+
+    // The odometer walks every combination, "leave this tower alone" first —
+    // the all-zero choice is the free pass itself, so it is scored first and
+    // only a strict improvement over it is ever returned.
+    let mut best: Option<((i32, i64), HashMap<i64, Pos>)> = None;
+    let mut choice = vec![0usize; towers.len()];
+    loop {
+        let mut assigned: HashMap<i64, Pos> = HashMap::new();
+        for (i, pick) in choice.iter().enumerate() {
+            if *pick > 0 {
+                assigned.insert(towers[i].id, aims[i][*pick - 1]);
+            }
+        }
+        let score = simulate_round(policy, turn, firing, &assigned);
+        if best.as_ref().map(|(b, _)| score > *b).unwrap_or(true) {
+            best = Some((score, assigned));
+        }
+        let mut i = 0;
+        loop {
+            if i == towers.len() {
+                let (score, assigned) = best.expect("the free pass is always scored");
+                let free = simulate_round(policy, turn, firing, &none);
+                return if score > free { assigned } else { none };
+            }
+            choice[i] += 1;
+            if choice[i] <= aims[i].len() {
+                break;
+            }
+            choice[i] = 0;
+            i += 1;
+        }
+    }
+}
+
+/// Run the round's choosers against `assigned` and report the board they leave
+/// behind: `(robots killed, -health left on the ones that survived)`. The
+/// second term is negated so that "more is better" is the whole tuple, and it
+/// is the honest measure of 「不要重叠攻击」 — damage that lands on a robot that
+/// is already dead is damage that bought nothing, and it leaves health on the
+/// board that a better assignment would have taken off it.
+fn simulate_round(
+    policy: &crate::brain::coach::Policy,
+    turn: &Turn,
+    firing: &[(i64, i64)],
+    assigned: &HashMap<i64, Pos>,
+) -> (i32, i64) {
+    let mut sim = init_sim(turn);
+    for (tower_id, _) in firing {
+        let Some(tower) = turn.role_by_id(*tower_id) else {
+            continue;
+        };
+        let _ = choose_attack_kind_planned(
+            policy,
+            turn,
+            tower,
+            &mut sim,
+            assigned.get(tower_id).copied(),
+        );
+    }
+    let (mut kills, mut left) = (0i32, 0i64);
+    for robot in &turn.robots {
+        if robot.health <= 0 {
+            continue;
+        }
+        let hp = sim.get(&robot.id).copied().unwrap_or(robot.health);
+        if hp <= 0 {
+            kills += 1;
+        } else {
+            left += hp;
+        }
+    }
+    (kills, -left)
 }
 
 /// True when every robot marching on us is already covered by a ready tower —
@@ -537,6 +718,7 @@ fn choose_gatling(
     robots: &[&Robot],
     bullets: usize,
     sim: &mut Sim,
+    aim: Option<Pos>,
 ) -> Option<Vec<Pos>> {
     let candidates: Vec<&&Robot> = robots
         .iter()
@@ -546,6 +728,15 @@ fn choose_gatling(
         return None;
     }
     let mut chosen: Vec<Pos> = Vec::new();
+    // The round's plan has first claim on the opening bullet — the cone is not
+    // consulted because the first bullet is inside every cone by definition,
+    // and `first_on_line` is what decides where the bullet actually lands.
+    if let Some(aim) = aim {
+        if let Some(victim) = aimed_victim(tower, aim, robots, sim) {
+            sim.damage_robot(victim, 10);
+            chosen.push(aim);
+        }
+    }
     while chosen.len() < bullets {
         let mut best: Option<(i64, Pos)> = None;
         for robot in &candidates {
@@ -585,7 +776,58 @@ fn choose_gatling(
     Some(chosen)
 }
 
-fn choose_railgun(turn: &Turn, tower: &Unit, robots: &[&Robot], sim: &mut Sim) -> Option<Vec<Pos>> {
+/// The robot a planned shot lands on, if the plan's cell still has one. The
+/// plan names a CELL; what a shot hits is the first live robot down the
+/// trajectory from the tower, which is what makes an assignment expressible
+/// even when the enemy is stacked in a line.
+fn aimed_victim(tower: &Unit, aim: Pos, robots: &[&Robot], sim: &Sim) -> Option<i64> {
+    if !in_range(tower, aim) {
+        return None;
+    }
+    first_on_line(robots, sim, tower.pos, aim).map(|victim| victim.id)
+}
+
+/// A railgun volley aimed at `target`: the energy walks the line from the
+/// tower outwards, taking the first robot it meets down to zero before moving
+/// to the next. Returns the total value and the `(robot, damage)` list, and
+/// changes nothing — both the aim path and the free choice below spend it.
+fn pierce(
+    turn: &Turn,
+    tower: &Unit,
+    target: Pos,
+    robots: &[&Robot],
+    sim: &Sim,
+    energy0: i64,
+) -> (i64, Vec<(i64, i64)>) {
+    let mut energy = energy0;
+    let mut value = 0i64;
+    let mut hits: Vec<(i64, i64)> = Vec::new();
+    for cell in line_cells(tower.pos, target) {
+        if cell == tower.pos || energy <= 0 {
+            continue;
+        }
+        let Some(victim) = robot_at(robots, cell) else {
+            continue;
+        };
+        let hp = sim.get(&victim.id).copied().unwrap_or(0);
+        if hp <= 0 {
+            continue;
+        }
+        let dmg = energy.min(hp);
+        energy -= dmg;
+        value += hit_value(turn, victim, hp, dmg);
+        hits.push((victim.id, dmg));
+    }
+    (value, hits)
+}
+
+fn choose_railgun(
+    turn: &Turn,
+    tower: &Unit,
+    robots: &[&Robot],
+    sim: &mut Sim,
+    aim: Option<Pos>,
+) -> Option<Vec<Pos>> {
     let energy0 = if tower.attack_power > 0 {
         tower.attack_power
     } else {
@@ -595,30 +837,26 @@ fn choose_railgun(turn: &Turn, tower: &Unit, robots: &[&Robot], sim: &mut Sim) -
             _ => 30,
         }
     };
+    // The round's plan has first claim, while the cell it names still has a
+    // live robot anywhere on the line from this tower: a railgun pierces, so
+    // the plan's cell is an aim, not necessarily the only thing it hits.
+    if let Some(aim) = aim {
+        if in_range(tower, aim) {
+            let (value, hits) = pierce(turn, tower, aim, robots, sim, energy0);
+            if value > 0 {
+                for (id, dmg) in hits {
+                    sim.damage_robot(id, dmg);
+                }
+                return Some(vec![aim]);
+            }
+        }
+    }
     let mut best: Option<(i64, i32, Pos, Vec<(i64, i64)>)> = None; // (value, dist, target, (id,dmg) list)
     for robot in robots {
         if !in_range(tower, robot.pos) {
             continue;
         }
-        let mut energy = energy0;
-        let mut value = 0i64;
-        let mut hits: Vec<(i64, i64)> = Vec::new();
-        for cell in line_cells(tower.pos, robot.pos) {
-            if cell == tower.pos || energy <= 0 {
-                continue;
-            }
-            let Some(victim) = robot_at(robots, cell) else {
-                continue;
-            };
-            let hp = sim.get(&victim.id).copied().unwrap_or(0);
-            if hp <= 0 {
-                continue;
-            }
-            let dmg = energy.min(hp);
-            energy -= dmg;
-            value += hit_value(turn, victim, hp, dmg);
-            hits.push((victim.id, dmg));
-        }
+        let (value, hits) = pierce(turn, tower, robot.pos, robots, sim, energy0);
         if value <= 0 {
             continue;
         }
@@ -644,6 +882,7 @@ fn choose_rocket(
     robots: &[&Robot],
     missiles: usize,
     sim: &mut Sim,
+    aim: Option<Pos>,
 ) -> Option<Vec<Pos>> {
     let candidates: Vec<Pos> = robots
         .iter()
@@ -654,7 +893,16 @@ fn choose_rocket(
         return None;
     }
     let mut impacts: Vec<Pos> = Vec::new();
-    for _ in 0..missiles {
+    // The round's plan has first claim on the opening missile. A rocket's
+    // "target" is an impact cell and it splashes, so the plan's cell is where
+    // the first warhead lands — the rest of the volley is the tower's own.
+    if let Some(aim) = aim {
+        if in_range(tower, aim) {
+            apply_splash(aim, robots, sim);
+            impacts.push(aim);
+        }
+    }
+    for _ in impacts.len()..missiles {
         let mut best: Option<(i64, Pos)> = None;
         for impact in &candidates {
             let value = splash_value(turn, *impact, robots, sim);
