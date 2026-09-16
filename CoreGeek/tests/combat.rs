@@ -1609,9 +1609,11 @@ fn a_task_that_timed_out_without_running_anything_retires_its_point() {
 
 #[test]
 fn a_task_that_ran_commands_is_not_retired_by_a_timeout() {
-    // The other half: a session that got commands executed hit a WORKING
-    // window, so the point stays available — a timeout there is this script's
-    // failure, not the point's, and the next session may well solve it.
+    // A session that ran commands hit a working window, but 任务书 5.3 still
+    // imposes a 30-round cooldown on the point after the session ends. The
+    // server's `cooldown_rounds` lags one round, so a local shadow must mark
+    // the point — without it the pioneer re-accepts next round and the judger
+    // times the new session out at `cmdRounds=0` (pk615723 sessions 2 and 5).
     let mut state = BotState::default();
     state.task.active = true;
     state.task.session_id = 4;
@@ -1631,9 +1633,17 @@ fn a_task_that_ran_commands_is_not_retired_by_a_timeout() {
     ));
     state.observe(&turn);
     assert!(!state.task.active);
+    // The point is shadowed for 30 rounds (accepted_round + 30 = 40), so the
+    // pioneer does not re-accept it before the server-side cooldown refreshes.
+    let until = state.task_refusals.get(&Pos { x: 10, y: 10 });
     assert!(
-        state.task_refusals.is_empty(),
-        "a point whose window worked is still worth re-accepting"
+        until.is_some(),
+        "a point that ended a session must be shadowed for the 30-round cooldown"
+    );
+    assert_eq!(
+        *until.unwrap(),
+        40,
+        "cooldown runs to accepted_round + 30"
     );
 }
 

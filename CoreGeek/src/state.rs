@@ -57,6 +57,17 @@ pub enum TaskStage {
 /// there is nothing to compare and the old rule is the only evidence available.
 pub const MAX_WRONG_ANSWERS: i32 = 2;
 
+/// Rounds a task point is unavailable for re-acceptance after any session ends
+/// (任务书 5.3: "在任务执行结束后，再次接取任务需等待 30 个回合刷新时间").
+///
+/// The server-side `cooldown_rounds` field on the task point lags by one round,
+/// so without a local shadow the pioneer re-accepts the same point the round
+/// after a session ends and the judger immediately times the new session out
+/// (`cmdRounds=0`). Observed in pk615723: session 2 (r26, same point as
+/// session 1 which ended r25) and session 5 (r151, same point as session 4
+/// which ended r150) both expired with zero productive rounds.
+pub const TASK_COOLDOWN_ROUNDS: i64 = 30;
+
 #[derive(Debug, Clone, Default)]
 pub struct TaskSession {
     pub active: bool,
@@ -1399,6 +1410,23 @@ impl BotState {
         // hardcoded wrong answer poisons every subsequent task of that type.
         if success {
             self.cache_sop();
+        }
+        // Shadow the server-side 30-round cooldown locally (任务书 5.3). The
+        // server's `cooldown_rounds` field on the task point updates a round
+        // late, so without this the pioneer re-accepts the point the very next
+        // round and the judger ends the new session immediately (`cmdRounds=0`,
+        // `reason=timeout`). `retire_dead_task_point` already handles the
+        // no-command timeout case (retiring until end of day); this covers
+        // every other end path — `wrong_answers`, `judger_window_closed`,
+        // `sterile`, `dusk_recall`, `night_defense`, `treasure_race`, and
+        // `confirmed_success` — none of which previously marked the point.
+        // Take the max so the longer "dead ground" retirement is not shortened.
+        if let Some(point) = self.task.point {
+            let until = self.task.accepted_round + TASK_COOLDOWN_ROUNDS;
+            self.task_refusals
+                .entry(point)
+                .and_modify(|v| *v = (*v).max(until))
+                .or_insert(until);
         }
         self.task = TaskSession::default();
     }
