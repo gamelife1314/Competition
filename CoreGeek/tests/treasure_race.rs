@@ -27,6 +27,7 @@
 
 use serde_json::{json, Value};
 
+use coregeek::brain::news::{Direction, ReadPhase};
 use coregeek::brain::{day, Plan};
 use coregeek::model::Turn;
 use coregeek::protocol::{Pos, Request};
@@ -420,17 +421,24 @@ fn the_altars_ask_does_not_take_the_prompt_off_the_days_news() {
 /// A market announcement that names an ore and points its price down.
 const COPPER_FALLS: &str = "矿业协会通告：铜矿库存充足，需求下降，预计价格下跌。";
 
+/// The merged ask (issue #207 §3). This test replaces
+/// `with_no_window_the_news_still_goes_first`, which pinned the rule the owner
+/// has since changed: it asserted that a round with both an unread day's news
+/// and a readied altar sent the news ALONE and left `state.treasure.phase`
+/// `Idle` — 「the treasure's ask waits for a round the news does not want」. That
+/// serialisation is gone. 「要尽快向大模型发起民间传闻的解读以及对官方消息的解
+/// 读，合并在一个回合中，用一个 prompt 向大模型发起两个提问」: the two questions
+/// travel together, in the news's own slot, so neither consumer's ask is ever
+/// delayed by the other's, and the round pays one call instead of two.
+///
+/// What did NOT change is the fallback, and that is the second half of this
+/// test: with one of the two consumers having nothing to ask, the round is that
+/// consumer's prompt alone, exactly as before.
 #[test]
-fn with_no_window_the_news_still_goes_first() {
-    // 「顺序上不能固定」 is not "the treasure always wins". With the altar out of
-    // the picture the order is what it was and what it should be: the day's
-    // price trend takes the round's prompt (「价格趋势直接决定了我们采集哪些矿，
-    // 至关重要」), and the task point is accepted normally.
-    //
-    // The treasure is given a full set of legends so that it HAS an ask to make
-    // this round. The test is therefore about the ranking and not about the
-    // treasure being unready: a window that is not live leaves the day's news
-    // first, and the treasure's ask waits for a round the news does not want.
+fn the_merged_ask_carries_both_the_news_and_the_legends() {
+    // The altar is out of the picture (no plan, so no window) and the pioneer
+    // has a full set of legends, so the treasure HAS an ask this round; the day
+    // has news. Both want the slot, so one prompt asks both questions.
     let mut payload = world(OPENING_ROUND, (29, 6));
     payload["worldNews"] = json!({"officialNews": COPPER_FALLS});
     let turn = turn_from(payload);
@@ -446,6 +454,49 @@ fn with_no_window_the_news_still_goes_first() {
     let prompt = plan
         .prompt
         .as_deref()
+        .expect("the round asked the model nothing at all");
+    assert!(
+        prompt.contains(COPPER_FALLS),
+        "the merged prompt does not carry the day's news text:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("民间传闻"),
+        "the merged prompt does not carry the legends:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("传闻其一"),
+        "the legends themselves, not just the heading:\n{prompt}"
+    );
+    assert_eq!(state.news.attempts, 1, "the news read did not make its ask");
+    assert_eq!(
+        state.llm_used_today, 1,
+        "two questions cost two of the day's three calls"
+    );
+    assert!(
+        matches!(state.treasure.phase, TreasurePhase::AskedLlm { .. }),
+        "the answer to the second question is not expected: {:?}",
+        state.treasure.phase
+    );
+    assert_eq!(
+        pioneer_command(&plan),
+        Some("acceptTask"),
+        "an ask costs the pioneer no movement — the task point is still accepted"
+    );
+
+    // The other half of the rule: with the SAME news and no legends, only the
+    // news has business, and the round is the news read alone — no second
+    // question, and the treasure is not put in a waiting state it never asked
+    // for. (The mirror — the altar alone, on a day with no news — is
+    // `a_day_with_no_official_news_reserves_no_prompt_and_blocks_nobody`.)
+    let mut payload = world(OPENING_ROUND, (29, 6));
+    payload["worldNews"] = json!({"officialNews": COPPER_FALLS});
+    let turn = turn_from(payload);
+    let mut state = BotState::default();
+    state.observe(&turn);
+    let plan = day::plan(&turn, &mut state);
+    let prompt = plan
+        .prompt
+        .as_deref()
         .expect("the day's news never went to the LLM");
     assert!(
         prompt.contains(COPPER_FALLS),
@@ -453,20 +504,211 @@ fn with_no_window_the_news_still_goes_first() {
     );
     assert!(
         !prompt.contains("民间传闻"),
-        "the treasure took the prompt off the day's news:\n{prompt}"
+        "a question nobody asked rode along on the news read:\n{prompt}"
     );
-    assert_eq!(
-        state.news.attempts, 1,
-        "the news read did not make its ask"
-    );
+    assert_eq!(state.news.attempts, 1, "the news read did not make its ask");
+    assert_eq!(state.llm_used_today, 1);
     assert_eq!(
         state.treasure.phase,
         TreasurePhase::Idle,
-        "the treasure asked in the round the news owned"
+        "the treasure was asked in a round it had no question for"
     );
     assert_eq!(
         pioneer_command(&plan),
         Some("acceptTask"),
         "a task point that a closed window leaves alone was not accepted"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 7. The merged ANSWER: one field, two readings, and neither half can spoil
+//    the other (issue #207 §3)
+// ---------------------------------------------------------------------------
+
+/// The answer the merged prompt asks for: both halves in ONE JSON object.
+fn merged_answer(open_day: i64) -> String {
+    json!({
+        "outlooks": [{"ore": "copper", "direction": "rise", "days": 3, "confidence": 90}],
+        "pos": {"x": ALTAR.0, "y": ALTAR.1},
+        "items": ["StarSand"],
+        "openDay": open_day,
+    })
+    .to_string()
+}
+
+/// A board where both consumers have an ask, carried one round forward: round
+/// `OPENING_ROUND` sends the merged ask, and the state it leaves is what the
+/// answer round is read against.
+fn both_asking() -> (Turn, BotState) {
+    let mut payload = world(OPENING_ROUND, (29, 6));
+    payload["worldNews"] = json!({"officialNews": COPPER_FALLS});
+    let turn = turn_from(payload);
+    let mut state = BotState::default();
+    state.treasure.legends = vec![
+        (1, "传闻其一".to_string()),
+        (2, "传闻其二".to_string()),
+    ];
+    state.observe(&turn);
+    let plan = day::plan(&turn, &mut state);
+    assert!(
+        plan.prompt.is_some(),
+        "premise: the merged ask went out (see the test above)"
+    );
+    (turn, state)
+}
+
+/// The answer round: the same board, one round later, carrying `resp`.
+fn answer_round(round_no: i64, resp: &str, state: &mut BotState) -> Turn {
+    let mut payload = world(round_no, (29, 6));
+    payload["worldNews"] = json!({"officialNews": COPPER_FALLS});
+    payload["llmResp"] = json!(resp);
+    let turn = turn_from(payload);
+    state.observe(&turn);
+    turn
+}
+
+#[test]
+fn a_merged_answer_is_read_by_both_consumers() {
+    let (_, mut state) = both_asking();
+    let turn = answer_round(OPENING_ROUND + 1, &merged_answer(4), &mut state);
+
+    // Half one: the readings are in force for today — the model's, not the
+    // keyword scan's (the scan reads this text as copper falling; the model's
+    // answer in the merged object says rising).
+    assert!(
+        state
+            .outlooks
+            .iter()
+            .any(|outlook| outlook.day == turn.day && outlook.direction == Direction::Rise),
+        "the news half of the merged answer was dropped: {:?}",
+        state.outlooks
+    );
+    assert_eq!(state.news.read_day, Some(turn.day), "the day was not read");
+    // Half two: the altar plan is in hand, so the pioneer can start buying.
+    let plan = state
+        .treasure
+        .plan
+        .as_ref()
+        .expect("the altar half of the merged answer was dropped");
+    assert_eq!((plan.pos.x, plan.pos.y), ALTAR);
+    assert_eq!(plan.items, vec!["StarSand".to_string()]);
+    assert_eq!(plan.open_day, 4);
+    assert_eq!(state.treasure.phase, TreasurePhase::HavePlan);
+}
+
+#[test]
+fn a_malformed_news_half_does_not_cost_the_altar_its_plan() {
+    // The model answered question two and botched question one: the altar plan
+    // is usable and the readings are not. The plan must be taken — the whole
+    // point of asking both at once is that neither answer waits on the other —
+    // and the news must reach its OWN retry (`note_lost` puts it back to Idle
+    // with a correction) rather than the round being discarded whole.
+    let (_, mut state) = both_asking();
+    let resp = json!({
+        "pos": {"x": ALTAR.0, "y": ALTAR.1},
+        "items": ["StarSand"],
+        "openDay": 4,
+    })
+    .to_string();
+    let turn = answer_round(OPENING_ROUND + 1, &resp, &mut state);
+
+    assert!(
+        state.treasure.plan.is_some(),
+        "a malformed readings half cost the altar its plan"
+    );
+    assert_eq!(state.treasure.phase, TreasurePhase::HavePlan);
+    // The model's reading was copper RISING (90%); the keyword scan reads the
+    // same text as copper FALLING. So "no rise on the books" is the assertion
+    // that the half with no readings in it did not put any there.
+    assert_ne!(
+        state.news.read_day,
+        Some(turn.day),
+        "the day was read from an answer that had no readings in it"
+    );
+    assert!(
+        !state
+            .outlooks
+            .iter()
+            .any(|outlook| outlook.day == turn.day && outlook.direction == Direction::Rise),
+        "readings were taken from an answer that had none: {:?}",
+        state.outlooks
+    );
+    assert_eq!(
+        state.news.phase,
+        ReadPhase::Idle,
+        "the news did not go back for its own answer"
+    );
+}
+
+#[test]
+fn a_malformed_plan_half_does_not_cost_the_news_its_readings() {
+    // The mirror image: question one answered, question two botched. The
+    // readings are taken, and the treasure's own accounting runs — one ask
+    // spent, another allowed — instead of the malformed plan freezing the line
+    // in `AskedLlm` until `plan_ask` times it out.
+    let (_, mut state) = both_asking();
+    let resp =
+        json!({"outlooks": [{"ore": "copper", "direction": "rise", "days": 3, "confidence": 90}]})
+            .to_string();
+    let turn = answer_round(OPENING_ROUND + 1, &resp, &mut state);
+
+    assert!(
+        state
+            .outlooks
+            .iter()
+            .any(|outlook| outlook.day == turn.day && outlook.direction == Direction::Rise),
+        "a malformed plan half cost the news its readings: {:?}",
+        state.outlooks
+    );
+    assert_eq!(state.news.phase, ReadPhase::Done, "the day was not read");
+    assert!(
+        state.treasure.plan.is_none(),
+        "a plan was taken from an answer that had none"
+    );
+    assert_eq!(
+        state.treasure.ask_attempts, 1,
+        "the failed half was not charged its attempt"
+    );
+    assert_eq!(
+        state.treasure.phase,
+        TreasurePhase::Idle,
+        "the altar did not go back for its own answer"
+    );
+}
+
+#[test]
+fn the_altars_answer_is_read_when_the_news_had_nothing_to_ask() {
+    // The altar asks ALONE on a day with no official news (the shape
+    // `a_day_with_no_official_news_reserves_no_prompt_and_blocks_nobody` pins).
+    // Its answer used to be nested inside the news branch of the reader, and the
+    // news was not waiting — so nobody read it: the phase stayed `AskedLlm`
+    // until `plan_ask`'s four-round timeout threw the ask away, three times a
+    // day, and the line never once saw a plan.
+    let turn = turn_from(world(OPENING_ROUND, (29, 6)));
+    let mut state = BotState::default();
+    state.treasure.legends = vec![
+        (1, "传闻其一".to_string()),
+        (2, "传闻其二".to_string()),
+    ];
+    state.observe(&turn);
+    let plan = day::plan(&turn, &mut state);
+    assert!(
+        plan.prompt.is_some(),
+        "premise: the altar asked on its own round"
+    );
+    assert_eq!(state.news.attempts, 0, "premise: there was no news to read");
+
+    let resp = json!({
+        "pos": {"x": ALTAR.0, "y": ALTAR.1},
+        "items": ["StarSand"],
+        "openDay": 4,
+    })
+    .to_string();
+    answer_round(OPENING_ROUND + 1, &resp, &mut state);
+    assert!(
+        state.treasure.plan.is_some(),
+        "the altar's own answer was dropped: {:?}",
+        state.treasure.phase
+    );
+    assert_eq!(state.treasure.phase, TreasurePhase::HavePlan);
 }

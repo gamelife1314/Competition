@@ -1726,23 +1726,64 @@ fn a_breached_ring_is_repaired_past_the_maintenance_budget() {
 }
 
 #[test]
-fn a_ring_that_was_never_closed_keeps_the_maintenance_budget() {
-    // Same day, same holes, same spent budget — but this ring has never been
-    // closed, so this is build-out and the 6-cell budget still binds. Otherwise
-    // the cap the economy depends on would be gone on every later day.
+fn a_ring_that_was_never_closed_still_gets_the_budget_to_re_close() {
+    // Same day, same holes, same spent budget as the test above — but this ring
+    // has NEVER been closed, and that used to be the whole difference: the
+    // 6-cell budget bound for the day and the holes stayed open. "6 unless it
+    // was ever whole" is a ratchet, not a budget: 6 cells in against a night
+    // that takes 10 walls out is a ring that ratchets down to nothing, and the
+    // station pays the difference in HP. The release no longer depends on
+    // history — a ring that is OPEN NOW gets the build-out budget — so the
+    // carrier closes the hole it is standing next to either way.
     let mut state = BotState::default();
     for cell in 0..6 {
         state.walled_cells_today.insert(Pos { x: cell, y: 0 });
     }
     let breached = turn_from(ring_world(135, 10, 20, &breach_holes(), breach_roles()));
     let plan = coregeek::brain::day::plan(&breached, &mut state);
-    assert!(
-        plan.commands.get(&10010).is_none(),
-        "the maintenance budget still stops build-out for the day"
+    let cmd = plan
+        .commands
+        .get(&10010)
+        .expect("an open ring gets the budget to re-close it, closed-before or not");
+    assert_eq!(cmd.action, "build", "the ring outranks the budget");
+    assert_eq!(
+        cmd.targetPos.as_ref().and_then(|t| t.first()).copied(),
+        Some(Pos { x: 13, y: 19 }),
+        "and it closes the hole it is standing next to"
     );
     assert!(
         !state.ring_ever_complete,
         "a holed ring is not a closed one"
+    );
+}
+
+#[test]
+fn the_wall_budget_still_caps_a_ring_that_wants_more_than_it_owes() {
+    // THE CONTROL for the release above: the cap is released to REPAIR a ring,
+    // never to expand one. A ring that is whole today (no gaps the sweep can be
+    // sent to) is on the 6-cell maintenance budget however the day started —
+    // the second layer, tidying, a cell nobody can reach: none of it buys the
+    // build-out budget, or the economy starves on a base that needs nothing.
+    use coregeek::brain::day::{wall_daily_cap, D1_WALL_CAP, LATER_WALL_CAP};
+    assert_eq!(
+        wall_daily_cap(3, false, 0),
+        LATER_WALL_CAP,
+        "a whole ring wanting more stays on the maintenance budget"
+    );
+    assert_eq!(
+        wall_daily_cap(3, true, 0),
+        D1_WALL_CAP,
+        "a ring that was closed and is whole is repair work, not upkeep"
+    );
+    assert_eq!(
+        wall_daily_cap(3, false, 8),
+        D1_WALL_CAP,
+        "an open ring is a breach: the budget is released whatever the history"
+    );
+    assert_eq!(
+        wall_daily_cap(1, false, 0),
+        D1_WALL_CAP,
+        "day 1 is the build-out day even before a single cell is measured"
     );
 }
 

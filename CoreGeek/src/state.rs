@@ -830,25 +830,60 @@ impl BotState {
         // serialise the channel: a script that arrives while the news read is
         // waiting falls through to the task branch below, unread and unclaimed,
         // which is exactly where it belongs.
-        if self.news.awaits_response()
-            && !turn.llm_resp.is_empty()
+        //
+        // ONE FIELD, TWO QUESTIONS (issue #207 §3: 「合并在一个回合中，用一个
+        // prompt 向大模型发起两个提问」). A merged ask puts the readings and the
+        // altar's plan in the same answer, so the claim is per HALF: each half is
+        // claimed by its OWN parse, and then EVERY awaiting consumer reads the
+        // response — including the half that failed to parse, whose own failure
+        // accounting (`note_lost`, `ask_attempts`) is the thing that gets it
+        // re-asked. One half's shape must never decide the other half's fate:
+        // a merged answer whose `outlooks` are malformed still carries a usable
+        // altar plan, and one whose plan is malformed still carries readings.
+        //
+        // The treasure is also read when the news had nothing to ask at all (no
+        // official news today — the treasure asks that round alone). It used to
+        // be nested inside the news branch, so a treasure-only answer was never
+        // read by anyone: the phase stayed `AskedLlm` until `plan_ask`'s
+        // four-round timeout reset it, and the line burned three asks per day
+        // without ever seeing a plan.
+        let news_awaits = self.news.awaits_response();
+        let treasure_awaits = matches!(self.treasure.phase, TreasurePhase::AskedLlm { .. });
+        if !turn.llm_resp.is_empty()
             && turn.llm_resp != self.seen_llm_resp
-            && news::parse_outlook(turn.day, &turn.llm_resp).is_some()
+            && (news_awaits || treasure_awaits)
         {
-            self.seen_llm_resp = turn.llm_resp.clone();
-            crate::log::event(
-                "llm_resp",
-                serde_json::json!({"channel": "news", "chars": turn.llm_resp.len()}),
-            );
-            news::on_llm_resp(self, turn.day, &turn.llm_resp);
-            // Merged prompt: if treasure was also awaiting (both asked in one
-            // prompt), process the treasure part of the response too.
-            if matches!(self.treasure.phase, TreasurePhase::AskedLlm { .. })
-                && self.treasure.phase != TreasurePhase::Done
-            {
-                crate::brain::treasure::on_llm_resp(self, &turn.llm_resp, turn.round_no);
+            let news_half =
+                news_awaits && news::parse_outlook(turn.day, &turn.llm_resp).is_some();
+            let treasure_half = treasure_awaits
+                && crate::brain::treasure::parse_plan(&turn.llm_resp, self.current_day).is_some();
+            if news_half || treasure_half {
+                // A half that parsed proves the answer is the one we asked for,
+                // so the other awaiting consumer reads it too — that is how a
+                // malformed half reaches its own retry instead of being dropped
+                // in silence.
+                let news_gets = news_awaits && (news_half || treasure_half);
+                let treasure_gets = treasure_awaits && (treasure_half || news_half);
+                self.seen_llm_resp = turn.llm_resp.clone();
+                crate::log::event(
+                    "llm_resp",
+                    serde_json::json!({
+                        "channel": match (news_gets, treasure_gets) {
+                            (true, true) => "news+treasure",
+                            (false, true) => "treasure",
+                            _ => "news",
+                        },
+                        "chars": turn.llm_resp.len(),
+                    }),
+                );
+                if news_gets {
+                    news::on_llm_resp(self, turn.day, &turn.llm_resp);
+                }
+                if treasure_gets {
+                    crate::brain::treasure::on_llm_resp(self, &turn.llm_resp, turn.round_no);
+                }
+                return;
             }
-            return;
         }
         if self.task.active {
             // Task responses are one-shot per (session, request round), not per

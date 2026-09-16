@@ -20,11 +20,24 @@ const ALL_ITEMS: [&str; 6] = [
     "IronWhistle",
 ];
 
-/// Gold that must survive a treasure-item purchase (P2-1). The summon is a
-/// gamble — result code 3 consumes the sacrifice items for nothing — so it
-/// may never eat the night's medicine money. Fifteen gold covers one treasure
-/// item (user request: "必须把团队经济上预留 15 金币用于买东西开启宝藏").
-const TREASURE_GOLD_FLOOR: i64 = 15;
+/// Gold that must survive a treasure-item purchase (P2-1): the night's
+/// MEDICINE money, and nothing else. The summon is a gamble — result code 3
+/// consumes the sacrifice items for nothing — so the last dose in the purse is
+/// never spent on it.
+///
+/// Ten is one Medicine (任务书 4.6.3 商店列表: 生命药剂 10 金) — the price of
+/// the consumable a controller at 30% HP dies without. This constant is NOT the
+/// sacrifice's budget, and reading it as one is the bug it was raised to 15 for:
+/// the owner's correction is 「预留 15 币好像不太对，有时候宝藏开启可能不止 15
+/// 币，改成灵活运用吧，所以挖矿必须进行，必须赚钱」. A fixed 15 cannot be right
+/// in both directions — it under-funds a three-item sacrifice (45 gold) and it
+/// hands the altar gold the defence needs on a one-item one. The item money is
+/// therefore FLEXIBLE and computed from the plan itself: `gold_reserve` below,
+/// `Σ shop price × missing count` over the plan's distinct items, capped at
+/// [`TREASURE_RESERVE_CAP`], held out of the shopping list rather than out of
+/// the medicine. This floor is the only fixed number, because the dose is the
+/// only fixed thing: one Medicine, 10 gold.
+const TREASURE_GOLD_FLOOR: i64 = 10;
 
 /// Shop price assumed for a sacrifice item the shop has not quoted.
 const TREASURE_ITEM_PRICE: i64 = 15;

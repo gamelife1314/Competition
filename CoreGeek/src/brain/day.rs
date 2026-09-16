@@ -101,8 +101,8 @@ fn stone_batch(turn: &Turn, gaps: usize) -> i64 {
 /// The radius-2 station ring has 20 cells. Day 1 is allowed to complete that
 /// entire single-layer shell; later days retain the conservative repair/expand
 /// budget so fortification cannot permanently starve the economy.
-const D1_WALL_CAP: i64 = 20;
-const LATER_WALL_CAP: i64 = 6;
+pub const D1_WALL_CAP: i64 = 20;
+pub const LATER_WALL_CAP: i64 = 6;
 
 /// First day the second wall layer may be paid for (P2-1). Day 1 belongs to the
 /// first ring: a stone spent on ring 3 that day is a hole in the ring that is
@@ -173,6 +173,49 @@ const TASK_MIN_ATTEMPT_ROUNDS: i64 = 12;
 /// working, and `MAX_WRONG_ANSWERS` already governs that case.
 const MAX_STERILE_ROUNDS: i64 = 15;
 
+/// How many ring stones the dedicated economy worker carries and lays on day 1
+/// before its shift changes to earning.
+///
+/// The ring is 20 cells plus the gate, and the day has to buy it AND earn with
+/// it: 「挖矿必须进行，必须赚钱」. The wall worker carries the rest — its pack
+/// holds 100 (`backPackCapability`, 任务书 3.2) against the 21 stones the day
+/// owes, so nothing about the ring's stone needs a second carrier. What the
+/// second carrier buys is TIME, and only on the cells it lays itself: measured
+/// on the day-1 board, the two workers' 21 placements take the whole afternoon
+/// (R17 to R56) because both walk the same ring route and only the one standing
+/// beside the gap may build. A worker that carries six and lays six is out of
+/// that queue by mid-morning with the rest of the day ahead of it; a worker that
+/// carries eleven is in it until dusk, which is exactly the day the owner
+/// filed. Six is the share the day's remaining rounds can pay for: leaving the
+/// ring work at ~R30 puts the nearest sellable vein (eight to ten rounds out) in
+/// reach before the dusk recall, and hands the wall worker the 15 stones it can
+/// still lay before the gate seals.
+const ECONOMY_D1_STONE_SHARE: i64 = 6;
+
+/// Rounds one carrier needs per ring cell on the day-1 sweep.
+///
+/// The build order walks the ring, so a cell costs a step to the site and then
+/// the placement: measured on the day-1 board, the sweep lays one cell every
+/// other round from R17 to R56. Used by `worker_day`'s `ring_fits_without_me`,
+/// which is what stops the economy worker standing down while the cells it
+/// would leave behind no longer fit in the afternoon.
+const ROUNDS_PER_RING_CELL: i64 = 2;
+
+/// Does the team already carry the stone the day owes the ring?
+///
+/// THE one bound on the stone-first rule. `stone_demand` is what the day still
+/// owes — the gaps, the doors the economy cut, and the gate's own stone — and
+/// stone is dug while the TEAM is short of that number, not one fetch longer.
+/// The bound is what keeps "dig stone first" from becoming "dig stone all day":
+/// it is asked by `mine_flow`'s `want_stone` (who digs) and by `plan`'s
+/// `shared_wall_duty` (who is still tied to the wall line), and a team with the
+/// ring's stone in its packs answers yes to both at once. Two workers splitting
+/// a 20-cell ring hold 10 each and neither pack ever reaches a batch, so the
+/// test is the TEAM's stone and never one pack's.
+fn stone_covered(turn: &Turn, stone_demand: i64) -> bool {
+    stone_demand <= 0 || economy::team_ores(turn, STONE) >= stone_demand
+}
+
 /// How many ring cells this day's fortification budget covers.
 ///
 /// Day 1 is the build-out: the whole shell is allowed, because an open ring is
@@ -182,8 +225,22 @@ const MAX_STERILE_ROUNDS: i64 = 15;
 /// budget cannot even re-close a ring the night took 10 walls out of, and the
 /// half-spent budget is paid for by the station (issue #21: -30 residual, base
 /// 1500 → 20 HP).
-fn wall_daily_cap(day: i64, ring_ever_complete: bool) -> i64 {
-    if day == 1 || ring_ever_complete {
+///
+/// `primary_open` is the second exit from the maintenance budget, and it is the
+/// one that does not depend on history. `ring_ever_complete` asks "was the ring
+/// EVER whole" — so a ring that was never whole at all (day 1 lost to a distant
+/// stone vein, a night that emptied the shell before it closed) had no exit: it
+/// was repaired on 6 cells a day forever, and 6 cells a day cannot out-build a
+/// night that takes 10 walls out. Six in, ten out is a ratchet, and the ring it
+/// ratchets down is the one holding the base. A ring that is OPEN NOW gets the
+/// build-out budget whether it has ever been whole or not, whatever the day.
+///
+/// The anti-starvation intent is untouched, and it is the third case: a ring
+/// that is whole (no primary gaps) and wants MORE than it has — the ring-3
+/// second layer, extra tidying — is still on the 6-cell maintenance budget. The
+/// cap is released to REPAIR a ring, never to expand one.
+pub fn wall_daily_cap(day: i64, ring_ever_complete: bool, primary_open: usize) -> i64 {
+    if day == 1 || ring_ever_complete || primary_open > 0 {
         D1_WALL_CAP
     } else {
         LATER_WALL_CAP
@@ -245,10 +302,11 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // question would mean the ring's own breach-repair budget never latched,
     // and a ring the night tore open would be repaired on the six-cell
     // maintenance budget that cannot re-close it (issue #21).
-    if primary_wall_gaps(turn, state).is_empty() && !turn.walls().is_empty() {
+    let primary_open = primary_wall_gaps(turn, state).len();
+    if primary_open == 0 && !turn.walls().is_empty() {
         state.ring_ever_complete = true;
     }
-    let wall_cap = wall_daily_cap(turn.day, state.ring_ever_complete);
+    let wall_cap = wall_daily_cap(turn.day, state.ring_ever_complete, primary_open);
     // On D1 carry enough stone to finish the complete radius-2 shell. Later
     // days use a bounded maintenance budget. `stone_demand` counts the GAPS
     // still open, not the shortfall against what is already carried: stone in a
@@ -335,14 +393,46 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // no time for errands, so the old same-role fallback holds; with one worker
     // alive it holds too.
     let workers = turn.workers();
-    // Day 1: both workers build walls until the ring is nearly closed, then the
-    // economy worker switches to mining sellable ore. We need gold for towers
-    // AND upgrade vouchers — both workers on stone all day = zero income.
-    // The economy worker is released only when ≤4 gaps remain (the first worker
-    // can close 4 gaps in ~8 rounds, well within the dusk deadline).
+    // Day 1: both workers fortify while the ring is short of the stone the day
+    // owes it, and the economy worker is released the moment the TEAM's packs
+    // hold that stone. We need gold for towers AND upgrade vouchers — both
+    // workers on stone all day = zero income (issue #18's freeze), so the day
+    // has to buy its ring and then go earn.
+    //
+    // WHAT PAYS FOR THE WALL NOW: the stone already in the crew's packs. The
+    // release is `stone_covered` — the very bound `mine_flow` uses to decide
+    // who digs (see it there) — so "the ring has its stone" cannot mean two
+    // different things in two places. The old trigger was `wall_gaps.len() > 4`,
+    // i.e. release once the ring is all but closed, and on the day-1 board that
+    // lands at R41 with dusk at 55 and the nearest sellable vein eight to ten
+    // rounds out: the released worker reached the ore exactly as the recall
+    // took it home, and the day produced 21 stone and nothing else (0 iron,
+    // 0 copper, 0 sales, purse frozen at 25). Releasing on the stone the day
+    // owes frees that worker ~25 rounds earlier. The first worker keeps the
+    // wall duty, and digs any stone the day turns out to still owe (a failed
+    // build, a robot's hole), so the ring is never left short to pay for the
+    // ore.
     let shared_wall_duty = turn.day == 1
-        && wall_gaps.len() > 4
-        && workers.len() >= 2;
+        && workers.len() >= 2
+        && !stone_covered(turn, stone_demand);
+    // THE RING HAS THE LAST WORD (issue #207 §5(iii)). The release above is a
+    // loan against a ring that is on schedule, and the schedule is arithmetic:
+    // one carrier lays a ring cell every other round (a step to the site, then
+    // the placement — measured over the day-1 sweep), so `worker_day`'s
+    // `ring_fits_without_me` takes the earner back the moment the cells it
+    // would leave behind no longer fit in the afternoon. This flag is the other
+    // half of the bound, and the cruder one: the day is out of wall work it can
+    // be sent to while the ring is still open.
+    //
+    // The debt is counted on the ring itself, not on `wall_gaps`: the sweep's
+    // list drops the gate, the economy's door, a cell a teammate is standing on
+    // and a cell whose only approach is blocked, and those dropped cells are
+    // exactly the ones that end a day at 16/20 (the day-1 board closed its last
+    // four from the dusk seal alone, R56 → R65, with the whole crew idle inside
+    // the ring and 3 iron in a backpack). What the night finds open is the debt
+    // that matters, so the debt is what this reads.
+    let ring_debt = ring_open_cells(turn, state) as i64;
+    let ring_at_risk = turn.day == 1 && ring_debt > 0 && wall_gaps.is_empty();
     let wall_work_done = wall_gaps.is_empty() && !shared_wall_duty;
     let buyer_id: Option<i64> = if budget.intent.is_empty() {
         None
@@ -472,10 +562,12 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             &tower_gaps,
             &wall_gaps,
             stone_demand,
+            wall_cap,
             &budget,
             buyer_id,
             economy_id,
             shared_wall_duty,
+            ring_at_risk,
             &pairs,
             &mut claimed,
             &mut plan,
@@ -584,10 +676,15 @@ fn worker_day(
     tower_gaps: &[(Pos, String)],
     wall_gaps: &[Pos],
     stone_demand: i64,
+    // Today's fortification budget, computed once in `plan` — the same number
+    // the day's `wall_demand` is measured against, so the day's stone and the
+    // day's wall work can never disagree about how much ring today is worth.
+    wall_cap: i64,
     budget: &economy::Budget,
     buyer_id: Option<i64>,
     economy_id: Option<i64>,
     shared_wall_duty: bool,
+    ring_at_risk: bool,
     pairs: &[(i64, i64)],
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
@@ -788,7 +885,25 @@ fn worker_day(
                     }),
                 );
             }
-            if turn.in_day_round >= deadline && !at_counter && !on_shop_errand {
+            // THE RING'S TAIL OUTRANKS THE POST, AND IT IS BOUNDED BY THE HARD
+            // DEADLINE (issue #207 §5). The lock above is measured against the
+            // PRE-POSITION round, which is dusk minus the walk minus the detour
+            // slack — on the day-1 board that is round 46, nine rounds before
+            // dusk. A stone carrier locked there stops being a carrier: the two
+            // cells the sweep could still reach sat bare until the gate seal
+            // released them at dusk, and the ring closed at R65 — 「第一天只挖
+            // 石头」's own ring, with the dusk at 55. The exception is the same
+            // one step 3 already takes for the gate, and it is bounded the same
+            // way: a role carrying stone for gaps that are still open keeps the
+            // wall sweep available to it until `HARD_SEAL_ROUND`, and the
+            // moment the gaps are filled (or the hard deadline passes) this
+            // falls through and the lock has the last word. The gun is not
+            // abandoned — `night::plan`'s unconditional recall is the backstop,
+            // and the sweep's errand is inside the ring.
+            let ring_tail = role.count_item(STONE) > 0
+                && !wall_gaps.is_empty()
+                && turn.in_day_round < economy::DUSK_ROUND;
+            if turn.in_day_round >= deadline && !at_counter && !on_shop_errand && !ring_tail {
                 // "Arrived" is a cell the gun can be OPERATED from, not merely
                 // one within a chebyshev cell of it. A gun's diagonal
                 // neighbours sit on the radius-2 wall ring: a controller that
@@ -908,16 +1023,53 @@ fn worker_day(
     //    also stops the moment any role could no longer reach its night
     //    weapon — the gate stays open until everyone has retreated inside,
     //    so we never wall ourselves out.
-    let on_wall_duty = (Some(role.id) != economy_id || shared_wall_duty)
-        && (state.walled_cells_today.len() as i64)
-            < wall_daily_cap(turn.day, state.ring_ever_complete);
+    // DAY 1 IS THE SAME SPLIT, ONE SHIFT EARLIER. Day 1 used to keep the
+    // economy worker on the stone queue until the ring was all but closed
+    // (`wall_gaps.len() > 4`), and on the day-1 board the two workers spent
+    // every daylight round of the day digging and laying 21 stone between
+    // them: 21 stone dug, 20 walls up at R56 with dusk at 55, and not one iron
+    // or copper in either pack — the purse never moved off 25 and the whole day
+    // bought nothing (「第一天只挖石头」). The wall does not need the second
+    // carrier for its stone, only for its cells: the first worker carries what
+    // the day owes once this one has laid its share, and what this one carries
+    // it still lays itself — [`ECONOMY_D1_STONE_SHARE`] stones, placed by the
+    // `economy_unload_stone` branch below before the shift changes. From then
+    // on it is the earner: `keep_gold_loop` takes it off the stone queue
+    // altogether, so it fetches no more stone and digs only ore the vendor buys
+    // (`choose_sellable_mine`).
+    let economy_share_laid = Some(role.id) == economy_id
+        && turn.day == 1
+        && role.count_item(STONE) as i64 >= ECONOMY_D1_STONE_SHARE;
+    // THE SHIFT CHANGE IS BOUNDED BY THE RING'S OWN REMAINING WORK. The last
+    // carrier to leave the wall line is the one that decides whether the day
+    // ends with a closed ring, and the rule above releases it on "my share is
+    // carried" alone — which says nothing about whether the cells still bare
+    // fit in the afternoon that is left. Measured on the distant-vein board
+    // (the ring's stone eight cells further out): the earner stood down at R45
+    // with six cells and ten rounds left, the solo carrier laid one cell every
+    // other round as the build order walks the ring, and the ring closed at 65
+    // against a bound of 63 — the gate had sealed at 61, so the last two cells
+    // had to wait for the seal step. One carrier lays `ROUNDS_PER_RING_CELL`
+    // rounds a cell (a step to the site, then the placement), so the day can
+    // spare this role exactly when the gaps it would leave behind still fit.
+    let ring_fits_without_me = (wall_gaps.len() as i64) * ROUNDS_PER_RING_CELL
+        <= (economy::DUSK_ROUND - turn.in_day_round).max(0);
+    // The shift change in one predicate, asked in three places below (the wall
+    // step, the carried stone, the gold loop): the economy worker EARNS while
+    // the ring is on schedule, and is a carrier whenever it is not.
+    let economy_earns = Some(role.id) == economy_id
+        && (!shared_wall_duty || economy_share_laid)
+        && !ring_at_risk
+        && ring_fits_without_me;
+    let on_wall_duty = (Some(role.id) != economy_id || shared_wall_duty || ring_at_risk)
+        && (state.walled_cells_today.len() as i64) < wall_cap;
     // Economy worker carrying stone when released from wall duty on Day 1:
     // let it place the stone it's carrying before switching to mining. A
     // worker with a pack full of stone can't mine ore, and standing idle
     // with stone is the exact freeze issue #12 describes. Day 2+ the economy
     // worker sells/ shops instead — wall repair is the first worker's job.
     let economy_unload_stone = Some(role.id) == economy_id
-        && !shared_wall_duty
+        && (!shared_wall_duty || economy_share_laid || ring_at_risk)
         && turn.day == 1
         && role.count_item(STONE) > 0
         && !wall_gaps.is_empty();
@@ -1264,7 +1416,11 @@ fn worker_day(
         // once the ring's own build-out is over: outside day 1 it digs ore the
         // vendor buys, never the stone the wall line is holding back. See
         // `economy::choose_sellable_mine`.
-        let keep_gold_loop = Some(role.id) == economy_id && !shared_wall_duty;
+        //
+        // (`economy_earns` is the same predicate the wall step reads: the day-1
+        // shift change is one rule, asked in two places, and the stone-first
+        // bound lives inside it — see `plan`'s `ring_at_risk`.)
+        let keep_gold_loop = economy_earns;
         if role.backpack_full() {
             if let Some(cmd) = economy::discard_command(turn, state, role, stone_demand) {
                 plan.push(role.id, cmd);
@@ -1299,14 +1455,29 @@ fn worker_day(
 }
 
 /// Merged prompt: when BOTH the news read and the treasure ask want the
-/// round's prompt slot, send a single prompt that asks both questions (user
-/// request: "用一个 prompt 向大模型发起两个提问"). This saves one LLM
-/// round-trip and lets the treasure line start immediately instead of waiting
-/// for the news read to complete.
+/// round's prompt slot, send a single prompt that asks both questions (issue
+/// #207 §3: 「要尽快向大模型发起民间传闻的解读以及对官方消息的解读，合并在一个
+/// 回合中，用一个 prompt 向大模型发起两个提问」). One round-trip instead of two,
+/// and a second question that costs no extra slot.
 ///
 /// Returns `true` if a merged prompt was sent, `false` if either consumer
 /// doesn't need asking (in which case the individual `news::plan_prompt` /
-/// `treasure::plan_ask` calls handle it as before).
+/// `treasure::plan_ask` calls handle it as before, unchanged).
+///
+/// BOTH is the whole rule, and each half is the consumer's OWN predicate —
+/// `news::plan_prompt`'s (`wants_reading` + today's text on the board) and
+/// `treasure::plan_ask`'s (`Idle` + two legends + day ≥ 2). Merge only when the
+/// two asks would otherwise BOTH go out this round, and the merge can never
+/// stand a consumer down: with one of them wanting the slot the call above
+/// falls through to the same two functions in the same order they were in
+/// before this existed.
+///
+/// The budget is asked for on the news's purpose — the highest ranked and the
+/// one never stood down. Asking for the treasure's purpose as well would
+/// REFUSE the merge on every day whose news is still unread (`news_read_reserved`
+/// stands the treasure down precisely then), which is the one round the merge
+/// exists for; and it would refuse it for a reason that does not apply, since
+/// the altar's question rides on the news's own ask and spends no second slot.
 fn plan_merged_prompt(turn: &Turn, state: &mut BotState, plan: &mut Plan) -> bool {
     if plan.prompt.is_some() {
         return false;
@@ -2769,9 +2940,7 @@ fn mine_flow(
     // the one ore the vendor is refused. See
     // `economy::choose_sellable_mine` for the freeze that cost issue #18 the
     // whole match.
-    let want_stone = !keep_gold_loop
-        && stone_demand > 0
-        && economy::team_ores(turn, STONE) < stone_demand;
+    let want_stone = !keep_gold_loop && !stone_covered(turn, stone_demand);
     let pick = if keep_gold_loop {
         economy::choose_sellable_mine(turn, state, role, claimed)?
     } else {
@@ -3371,6 +3540,38 @@ pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
         return ring;
     }
     second_layer_gaps(turn, state)
+}
+
+/// Ring cells the day still owes a wall: the primary ring minus the walls that
+/// are standing in it.
+///
+/// This is the DEBT, not the work list. [`primary_wall_gaps`] is what the sweep
+/// can be sent to — it drops the gate until the seal, the door the economy cut,
+/// any cell a teammate's footprint covers, any cell that already failed to
+/// build — and every one of those drops is a cell the night still finds open.
+/// The difference is what a day that is running out of time looks like from
+/// inside the planner: on the day-1 board the sweep's list emptied at R46 with
+/// four cells of the ring's south row still bare, and the crew — one carrier
+/// outside the ring, the other idle inside it — could not touch them until the
+/// dusk seal released them at R61 (「第一天只挖石头」's ring, closed at R65 with
+/// dusk at 55). See `plan`'s `ring_at_risk`, which is the deadline this count
+/// exists for.
+fn ring_open_cells(turn: &Turn, state: &BotState) -> usize {
+    let Some(station) = turn.station() else {
+        return 0;
+    };
+    let footprint = station_footprint(station.pos);
+    let walls: HashSet<Pos> = turn.walls().iter().map(|wall| wall.pos).collect();
+    ring_cells(&footprint, 2)
+        .into_iter()
+        .filter(|pos| {
+            turn.is_land(*pos)
+                && !walls.contains(pos)
+                && !state
+                    .blacklisted_builds
+                    .contains(&(*pos, "wall".to_string()))
+        })
+        .count()
 }
 
 /// The second wall layer: ring-3 cells on the arc that is actually taking

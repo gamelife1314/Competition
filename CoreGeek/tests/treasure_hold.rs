@@ -137,6 +137,46 @@ fn the_sacrifice_shopping_leaves_the_medicine_money_intact() {
     assert_eq!(cmd.name.as_deref(), Some("StarSand"));
 }
 
+/// The floor is the DOSE, not the item's price — and the test above only says
+/// so while the two happen to be 15 and 10. The owner's correction is that the
+/// sacrifice's money must be flexible (「改成灵活运用吧」), which only works if
+/// the floor is the one number that is *not* flexible: a cheap sacrifice must
+/// not cheapen the medicine, or the flexibility becomes a way to spend it.
+#[test]
+fn the_medicine_floor_is_one_dose_whatever_the_item_costs() {
+    let mut payload = world(140, (28, 21));
+    with_shop_items(&mut payload, &[("IronWhistle", 5)]);
+    let mut state = BotState::default();
+    state.current_day = 2;
+    state.treasure.phase = TreasurePhase::HavePlan;
+    state.treasure.plan = Some(TreasurePlan {
+        pos: Pos { x: 30, y: 5 },
+        items: vec!["IronWhistle".into()],
+        open_day: 3,
+    });
+
+    // 14 gold is 5 for the item and 9 left: one gold short of a Medicine, so
+    // the purchase is refused even though the item itself is trivially
+    // affordable. A floor that tracked the item's price would have bought it.
+    with_gold(&mut payload, 14);
+    let turn = turn_from(payload.clone());
+    let pioneer = turn.pioneer().unwrap().clone();
+    let mut claimed = HashSet::new();
+    let mut plan = Plan::default();
+    assert!(
+        plan_pioneer(&turn, &mut state, &pioneer, &mut claimed, &mut plan).is_none(),
+        "14 gold is 5 + 9: the item is affordable, the dose is not"
+    );
+
+    // 15 is the first purse that leaves a dose behind, so it buys.
+    with_gold(&mut payload, 15);
+    let turn = turn_from(payload.clone());
+    let pioneer = turn.pioneer().unwrap().clone();
+    let cmd = plan_pioneer(&turn, &mut state, &pioneer, &mut claimed, &mut plan)
+        .expect("15 gold leaves exactly one Medicine");
+    assert_eq!(cmd.action, "buy");
+}
+
 #[test]
 fn day_plan_never_drags_the_waiting_pioneer_off_the_altar() {
     // The wiring behind holds_altar: with the sacrifice already in the pack
@@ -222,6 +262,48 @@ fn the_sacrifice_gold_is_reserved_out_of_the_shopping_list() {
     payload["teamOur"]["roles"][1]["backpack"] = json!(["StarSand", "FlameBreath"]);
     let turn = turn_from(payload.clone());
     assert_eq!(gold_reserve(&turn, &state), 0);
+}
+
+/// The reserve is the PLAN's arithmetic, in both directions — the owner's
+/// 「有时候宝藏开启可能不止 15 币」 and its mirror image, a sacrifice cheaper
+/// than the old constant. A fixed 15 was wrong for a three-item list (45 gold)
+/// and wrong for a five-gold item (it held back three times what the errand
+/// needed, out of a defence that was still short of vouchers).
+#[test]
+fn the_item_money_follows_the_plan_and_not_a_constant() {
+    // Three items at 15 apiece: the reserve is 45, three times the constant.
+    let mut payload = world(140, (28, 21));
+    with_shop_items(&mut payload, &[("StarSand", 15)]);
+    with_gold(&mut payload, 200);
+    let mut state = BotState::default();
+    state.current_day = 2;
+    state.treasure.phase = TreasurePhase::HavePlan;
+    state.treasure.plan = Some(TreasurePlan {
+        pos: Pos { x: 30, y: 5 },
+        items: vec!["StarSand".into(); 3],
+        open_day: 3,
+    });
+    let turn = turn_from(payload.clone());
+    assert_eq!(
+        gold_reserve(&turn, &state),
+        TREASURE_RESERVE_CAP,
+        "a three-item sacrifice is 45 gold, not 15"
+    );
+
+    // A five-gold item is reserved at five — the reserve reads the shop's
+    // quote, not a guess about what a sacrifice costs.
+    with_shop_items(&mut payload, &[("IronWhistle", 5)]);
+    state.treasure.plan = Some(TreasurePlan {
+        pos: Pos { x: 30, y: 5 },
+        items: vec!["IronWhistle".into()],
+        open_day: 3,
+    });
+    let turn = turn_from(payload.clone());
+    assert_eq!(
+        gold_reserve(&turn, &state),
+        5,
+        "the reserve is the quote, not the constant"
+    );
 }
 
 #[test]

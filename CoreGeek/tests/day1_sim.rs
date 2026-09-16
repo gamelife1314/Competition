@@ -1282,3 +1282,57 @@ fn a_shop_trip_that_cannot_finish_before_dusk_is_not_started() {
         );
     }
 }
+
+#[test]
+fn day_one_mines_ore_the_vendor_buys_and_still_closes_the_ring() {
+    // Issue #207 §5, both halves of it: 「挖矿必须进行，必须赚钱」. Day 1 used to
+    // dig stone and nothing else — the ring went up (R56, dusk at 55) with not
+    // one iron or copper in either pack, the purse never moved off the tower
+    // money and the day bought nothing (「第一天只挖石头」). A stone-only day is
+    // not an acceptable price for the ring, so this asserts the ore KINDS the
+    // crew actually collected — every collect is recorded with the cell it came
+    // from, and the cell says what was in it — and then that the ring closed
+    // anyway. Not a flag: the ore names come out of the board.
+    let world = run_day_one();
+    report("day 1 earn", &world);
+    let ores: std::collections::BTreeMap<String, i64> = world
+        .collects
+        .iter()
+        .fold(Default::default(), |mut acc, (_, pos)| {
+            *acc.entry(world.zones.get(pos).cloned().unwrap_or_default())
+                .or_insert(0) += 1;
+            acc
+        });
+    let sellable: i64 = ores
+        .iter()
+        .filter(|(ore, _)| {
+            VENDOR
+                .iter()
+                .any(|(item, price)| item == ore && *price > 0)
+        })
+        .map(|(_, count)| *count)
+        .sum();
+    assert!(
+        ores.contains_key("stone"),
+        "the ring's own stone still has to be dug: {ores:?}"
+    );
+    assert!(
+        sellable >= 1,
+        "day 1 collected nothing the vendor buys — a stone-only day: {ores:?}"
+    );
+    // And the ring is not the price paid for it: same acceptance as
+    // `day_one_closes_the_wall_ring_before_nightfall`.
+    let open = world.open_ring();
+    assert!(
+        open <= 1,
+        "earning cost the ring: {open} cells open at nightfall: {:?}",
+        world.open_cells()
+    );
+    let closed = world
+        .ring_closed_round()
+        .expect("not one ring cell was ever walled");
+    assert!(
+        closed <= coregeek::brain::economy::DUSK_ROUND + 8,
+        "the last ring wall went up at R{closed}, after the night had started"
+    );
+}
