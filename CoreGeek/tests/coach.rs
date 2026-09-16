@@ -368,7 +368,7 @@ fn a_breached_station_arms_the_gap_funding_the_dial_was_waiting_for() {
         } else if offset < 20 {
             (1500, 1500, 700, 0)
         } else {
-            (1400, 1500, 700, 0)
+            (1200, 1500, 700, 0)
         };
         Round::of(hp)
     });
@@ -381,7 +381,7 @@ fn two_untouched_nights_stand_the_gap_funding_down_again() {
     let start = *night_of(1).start();
     run(&mut coach, night_of(1), |round| {
         let hp = if round > start {
-            (1400, 1500, 1000, 0)
+            (1200, 1500, 1000, 0)
         } else {
             (1500, 1500, 1000, 0)
         };
@@ -389,8 +389,8 @@ fn two_untouched_nights_stand_the_gap_funding_down_again() {
     });
     assert!(coach.policy().gap_funding);
 
-    run(&mut coach, night_of(2), steady((1400, 1500, 1000, 0), 0));
-    run(&mut coach, night_of(3), steady((1400, 1500, 1000, 0), 0));
+    run(&mut coach, night_of(2), steady((1200, 1500, 1000, 0), 0));
+    run(&mut coach, night_of(3), steady((1200, 1500, 1000, 0), 0));
     assert!(
         !coach.policy().gap_funding,
         "连着两夜零损失 → 固定排序够用，回到承诺档"

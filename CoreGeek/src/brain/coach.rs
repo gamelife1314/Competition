@@ -46,6 +46,14 @@ use crate::model::{Turn, UnitKind, DAY_ROUNDS};
 
 /// 连续两夜毫发无损 → 解除对外火力的抑制。
 const QUIET_TO_REARM: i64 = 2;
+/// 我方基地一夜累计掉血超过这个阈值才判为"正在被压制"并收火。
+///
+/// 17 场对战分析（2026-09-17）显示：胜场 `station_pressure` 平均 day2-3 才关闭
+/// （敌基地 HP 末值 53），负场 day1 就关闭（敌基地 HP 末值 730+）。原因是对任意
+/// 损伤（`our_station_lost > 0`）立即收火，导致炮塔停止攻击敌基地，敌基地存活，
+/// 我方输掉基地竞速。250 HP ≈ 基地总血量的 17%，能过滤掉边缘摩擦伤但保留对真正
+/// 压制的响应。对战的测试场景（一夜掉 300 HP）仍会触发。
+const STATION_BLEED_THRESHOLD: i64 = 250;
 /// 连续两次令没咬动对方 → 降到 `Off`。
 const STERILE_TO_DOWNGRADE: i64 = 2;
 /// 连续两次令咬动了对方 → 升到 `Rich`。
@@ -398,13 +406,17 @@ impl Coach {
             self.night_gap = crate::brain::combat::firepower_gap(turn);
         }
 
-        // 即时抑制：本夜我方基地在掉血、对方基地没掉 → 对方的火力落在我方基地上，
+        // 即时抑制：本夜我方基地在持续掉血、对方基地没掉 → 对方的火力落在我方基地上，
         // 而我方炮塔还在"有余力"时去点对方建筑。这一刻就收火，不等夜晚结算：
         // 让基地多活一夜比多打对方建筑几十点伤害值钱得多。
+        //
+        // 但只有累计掉血超过 `STATION_BLEED_THRESHOLD` 才触发——边缘摩擦伤不应
+        // 让我们放弃对敌基地的压制。17 场数据显示原来 1 HP 就收火导致 day1 全部
+        // 关闭，敌基地毫发无损地活到终场。
         if self.enabled
             && !turn.is_day
             && self.policy.station_pressure
-            && self.ledger.our_station_lost > 0
+            && self.ledger.our_station_lost >= STATION_BLEED_THRESHOLD
             && self.ledger.their_station_lost == 0
         {
             self.set_station_pressure(false, "our_station_bleeding", turn);
@@ -451,8 +463,9 @@ impl Coach {
     fn settle(&mut self, turn: &Turn) {
         let night = std::mem::take(&mut self.ledger);
 
-        // A. 基地交换：谁在挨打。
-        if night.our_station_lost > 0 && night.their_station_lost == 0 {
+        // A. 基地交换：谁在挨打。与即时抑制用同一个阈值：只有掉血超过
+        //    STATION_BLEED_THRESHOLD 才算"被压制"，否则视为正常交火。
+        if night.our_station_lost >= STATION_BLEED_THRESHOLD && night.their_station_lost == 0 {
             self.bleed_nights += 1;
             self.quiet_nights = 0;
         } else if night.our_station_lost == 0 {
@@ -500,7 +513,8 @@ impl Coach {
 
         // C. 火力缺口：估计有缺口 + 我方基地真挨打 = 估计被证实；连着零损失 =
         //    固定排序够用。`gap_funding` 只在缺口为正时才有作用（economy.rs）。
-        if night.our_station_lost > 0 {
+        //    与收火用同一个阈值：摩擦伤不应触发资金重排。
+        if night.our_station_lost >= STATION_BLEED_THRESHOLD {
             self.gap_breach_nights += 1;
             self.gap_quiet_nights = 0;
         } else if night.our_loss() == 0 {
@@ -626,7 +640,7 @@ impl Coach {
         if !self.ledger.idle() {
             let night = std::mem::take(&mut self.ledger);
             self.last_night = night;
-            if night.our_station_lost > 0 && night.their_station_lost == 0 {
+            if night.our_station_lost >= STATION_BLEED_THRESHOLD && night.their_station_lost == 0 {
                 self.bleed_nights += 1;
             }
             if self.orders_from_day > 0 && !night.our_fire_on_enemy {
