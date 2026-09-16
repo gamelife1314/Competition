@@ -302,7 +302,8 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // question would mean the ring's own breach-repair budget never latched,
     // and a ring the night tore open would be repaired on the six-cell
     // maintenance budget that cannot re-close it (issue #21).
-    let primary_open = primary_wall_gaps(turn, state).len();
+    let (ring_owed, ring_shoulder) = ring_gap_split(turn, state);
+    let primary_open = ring_owed.len();
     if primary_open == 0 && !turn.walls().is_empty() {
         state.ring_ever_complete = true;
     }
@@ -312,6 +313,13 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // still open, not the shortfall against what is already carried: stone in a
     // backpack is committed to those gaps, and treating it as "demand already
     // met" made the carrier sell the ring's own stone out from under itself.
+    // ...and the far shoulder is counted only when it IS the day's work
+    // (issue #206 §6). 「有条件全部建造好」 does not mean "dig for a cell you were
+    // told you may skip": `wall_gaps` returns the arc while any of it is open
+    // and the shoulder only once none of it is, so this line is the arc's own
+    // count for as long as a robot could walk in through it, and the shoulder's
+    // count only on a day the arc is already complete — which is precisely the
+    // day that can afford it.
     let wall_demand = (wall_gaps.len() as i64).min(wall_cap);
     // P0-3 门重封的石头保障：白天 `open_door` 切开的门在黄昏前不计入
     // `wall_gaps`（白天它是通道，不是缺口），但黄昏必须重封。门不计入采石
@@ -472,6 +480,48 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             "teamStone": economy::team_ores(turn, STONE),
             "mayBuild": economy::may_build_weapon(turn, state),
             "upgradeReachable": economy::upgrade_reachable(turn, state),
+        }),
+    );
+    // THE FAR SHOULDER, ONCE A ROUND (issue #206 §6).
+    //
+    // 「围墙不一定得全部建造起来，后边的门，背向机器人的方向可以开着」 is a rule
+    // about what the day OWES, and the whole point of it is that a day which
+    // stops at the enemy-facing arc is not a day that failed. That verdict is
+    // invisible in a wall count: `wallGaps: 0` above reads the same whether the
+    // ring is whole or the shoulder was written off, and a batch that cannot
+    // tell those apart cannot tell "the owner's rule is working" from "the
+    // crew stopped early".
+    //
+    // Written every day round for the same reason `tower_plan` is: "how many
+    // rounds was the shoulder left open, and on how many of them was it because
+    // the arc was still going up" is a ratio over rounds, and a record that only
+    // fires on change cannot answer it. `reason` is the verdict, `open` is the
+    // set the day is leaving for last, and `owed` is what it is doing instead.
+    let far_reason = if turn.in_day_round >= far_edge_cutoff() {
+        // Past the cutoff the shoulder is required, so it is in `ring_owed` and
+        // not in `open` — the ring has to hold the night.
+        "dusk_required"
+    } else if !ring_owed.is_empty() {
+        // The arc first: while a cell a robot can walk in through is open, the
+        // shoulder is not even in the day's build list.
+        "enemy_first"
+    } else if !ring_shoulder.is_empty() {
+        // The arc is finished and this is the day's remaining wall work — the
+        // 「有条件全部建造好」 half, on the day that can afford it.
+        "spare_rounds"
+    } else {
+        "none"
+    };
+    crate::log::event(
+        "wall_far_edge",
+        serde_json::json!({
+            "round": turn.round_no,
+            "day": turn.day,
+            "owed": ring_owed.len(),
+            "open": ring_shoulder.iter().map(|cell| crate::log::xy(*cell)).collect::<Vec<_>>(),
+            "reason": far_reason,
+            "teamStone": economy::team_ores(turn, STONE),
+            "stoneDemand": stone_demand,
         }),
     );
     // With two workers, the LAST one is the dedicated economy worker: it skips
@@ -3530,14 +3580,29 @@ pub fn gate_open_record(
 /// Every wall cell the day wants filled: the primary ring, and — once that
 /// ring is complete — the second layer on the damaged arc (P2-1).
 ///
-/// The order matters and is deliberate. While a single cell of the primary ring
-/// is open the second layer is not offered at all: the ring is what stands
-/// between the robots and the station, and an outer arc bought with the stone
-/// that would have closed it is worse than no outer arc.
+/// The order matters and is deliberate, and it is a two-step one:
+///
+///   1. **the ring, as [`ring_gap_split`] divides it** — 「朝向敌人的三个方向城墙
+///      一定是完整的」 first, and the far shoulder only once that arc is
+///      finished. Nothing outranks a cell a robot can walk in through, and the
+///      shoulder is what the day does with the stone left over after the arc
+///      (「有条件全部建造好」). Past [`far_edge_cutoff`] the split puts the
+///      shoulder back in the first half by itself, because by then the ring is
+///      what holds the night.
+///   2. **the second layer** — it guards the arc the robots demonstrably come
+///      through, and it is a luxury: it is reached only on a day whose primary
+///      ring is whole, which is exactly the day that has earned it.
+///
+/// The important consequence is the one `plan`'s `stone_demand` is built on: a
+/// far cell is never on this list while the arc that faces the enemy is still
+/// open, so no stone is ever mined for a cell the day has been told it may skip.
 pub fn wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
-    let ring = primary_wall_gaps(turn, state);
-    if !ring.is_empty() {
-        return ring;
+    let (owed, shoulder) = ring_gap_split(turn, state);
+    if !owed.is_empty() {
+        return owed;
+    }
+    if !shoulder.is_empty() {
+        return shoulder;
     }
     second_layer_gaps(turn, state)
 }
@@ -3571,6 +3636,13 @@ fn ring_open_cells(turn: &Turn, state: &BotState) -> usize {
                     .blacklisted_builds
                     .contains(&(*pos, "wall".to_string()))
         })
+        // ...and only the cells the day OWES. The far shoulder is not a debt
+        // (issue #206 §6): counting it kept `plan`'s `ring_at_risk` true from
+        // the moment the enemy-facing arc closed, which pulls the economy
+        // worker back onto the wall line for a cell the day does not owe —
+        // the freeze the whole of `ring_at_risk` exists to prevent, rebuilt
+        // out of the cell the owner just made optional.
+        .filter(|pos| !far_shoulder(turn, state, *pos))
         .count()
 }
 
@@ -3652,13 +3724,121 @@ fn wall_layer(turn: &Turn, site: Pos) -> i64 {
 /// Desired D1 wall cells: one radius-2 shell around the station. One gate cell
 /// remains omitted while any controller is outside; after the dusk retreat
 /// checkpoint `update_wall_gate` explicitly admits that final seal cell.
+///
+/// This is the ring the day OWES — [`ring_gap_split`]'s first half. The far
+/// shoulder is not in it (issue #206 §6).
 pub fn primary_wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
+    ring_gap_split(turn, state).0
+}
+
+/// The compass ring of the eight non-centre sectors, in order round the base.
+///
+/// `arc_sector` numbers the 3×3 compass row-major (0 is south-west, 4 is the
+/// centre, 8 is north-east), so two sectors that touch on the map are NOT
+/// neighbours in the numbers: 2 (south-east) touches 5 (east), not 3. Walking
+/// the compass therefore needs this list, and it is the same walk the ring
+/// cells themselves take.
+const SECTOR_RING: [usize; 8] = [0, 1, 2, 5, 8, 7, 6, 3];
+
+/// The three sectors that face `enemy_sector`: the enemy's own and the two
+/// beside it. The owner's 「朝向敌人的三个方向城墙一定是完整的」 — three of the
+/// eight is the arc a robot walks in through, and it is why the far shoulder can
+/// be left for last without opening a way in.
+///
+/// A centre sector (the enemy standing on top of our station) has no bearing to
+/// spread, so nothing at all is optional there.
+fn enemy_facing_sectors(enemy_sector: usize) -> [usize; 3] {
+    match SECTOR_RING.iter().position(|sector| *sector == enemy_sector) {
+        Some(at) => {
+            let last = SECTOR_RING.len() - 1;
+            [
+                SECTOR_RING[if at == 0 { last } else { at - 1 }],
+                enemy_sector,
+                SECTOR_RING[if at == last { 0 } else { at + 1 }],
+            ]
+        }
+        None => [enemy_sector; 3],
+    }
+}
+
+/// How close a robot has to be for the ring to stop treating any cell as
+/// optional.
+///
+/// The shell sits two cells out from the station's footprint, so a robot inside
+/// the ring or standing on its far shoulder is within a few cells of the
+/// centre. That is the case the owner's 「后边的门可以开着」 does not cover: a
+/// door is a door while nothing is at it, and a way in the moment something is.
+/// Deliberately generous — the cheap mistake here is a wall the day did not
+/// strictly need.
+const ROBOT_AT_THE_RING: i32 = 6;
+
+/// The round the far shoulder stops being optional.
+///
+/// 「可以选择性缺口」 is a licence to leave the far side for last, not to leave it
+/// for the night: past this round the ring is again the thing standing between
+/// the base and the dark, and every cell of it is owed. Measured the way the
+/// rest of the afternoon is — back from `DUSK_ROUND` by the walk home — so the
+/// crew that has to close it still has the rounds to.
+pub fn far_edge_cutoff() -> i64 {
+    economy::DUSK_ROUND - economy::DUSK_TRIP_MARGIN
+}
+
+/// Is this ring cell on the shoulder that faces AWAY from the enemy — the one
+/// the owner made optional (issue #206 §6)?
+///
+/// Four things make a cell required instead, and the first three are the ones
+/// that decide an ordinary round:
+///
+///   * it is on the enemy's arc (or the enemy is standing on the base, which
+///     leaves no bearing to be far from);
+///   * robots have already come through its sector — [`BotState::
+///     threatened_sectors`] is evidence, and evidence beats the compass;
+///   * it is late: see [`far_edge_cutoff`];
+///   * a robot is close enough to be at the ring at all.
+///
+/// The geometry is the one already in the codebase — `state::arc_sector` around
+/// the station, the enemy's own bearing from `turn.enemy_station`, and the
+/// damage-ranked sectors P2-1 built — so the wall line and the second layer
+/// cannot disagree about which side of the base a cell is on.
+pub fn far_shoulder(turn: &Turn, state: &BotState, cell: Pos) -> bool {
+    if turn.in_day_round >= far_edge_cutoff() {
+        return false;
+    }
     let Some(station) = turn.station() else {
-        return Vec::new();
+        return false;
+    };
+    let Some(enemy) = turn.enemy_station() else {
+        // No enemy base on the board is no bearing to be far from: with nothing
+        // to face, every cell faces it.
+        return false;
+    };
+    let center = station.pos;
+    let sector = crate::state::arc_sector(center, cell);
+    if enemy_facing_sectors(crate::state::arc_sector(center, enemy.pos)).contains(&sector) {
+        return false;
+    }
+    if state.threatened_sectors().contains(&sector) {
+        return false;
+    }
+    !turn
+        .robots
+        .iter()
+        .any(|robot| chebyshev(robot.pos, center) <= ROBOT_AT_THE_RING)
+}
+
+/// The primary ring's open cells, split by whether the day OWES them.
+///
+/// `.0` is the ring the owner requires — 「朝向敌人的三个方向城墙一定是完整的」 —
+/// and `.1` is the far shoulder — 「0 的位置可以选择性缺口，有条件全部建造好」.
+/// The split changes what the day owes, never what it may build: the same cells
+/// are on the list, and a day with the stone to spare builds all of them.
+pub fn ring_gap_split(turn: &Turn, state: &BotState) -> (Vec<Pos>, Vec<Pos>) {
+    let Some(station) = turn.station() else {
+        return (Vec::new(), Vec::new());
     };
     let footprint = station_footprint(station.pos);
     let Some(gate) = wall_gate(turn, state) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
 
     // THE BUILD ORDER IS THE RING WALKED FROM THE ENTRANCE (see
@@ -3691,7 +3871,10 @@ pub fn primary_wall_gaps(turn: &Turn, state: &BotState) -> Vec<Pos> {
                     .blacklisted_builds
                     .contains(&(*pos, "wall".to_string()))
         })
-        .collect()
+        // The split, last, so it sees the cells the sweep would actually be
+        // sent to: a cell that is already walled or that a teammate is standing
+        // on is not a gap in either half.
+        .partition(|pos| !far_shoulder(turn, state, *pos))
 }
 
 fn ring_cells(footprint: &[Pos], radius: i32) -> Vec<Pos> {

@@ -512,7 +512,7 @@ impl NewsRead {
 /// about that ore rather than an omission to be filled in from the words — which
 /// is what 「都由大模型来判断」 asks for. A day the model never answered for is
 /// untouched, and there the scan's reading is the answer, exactly as before.
-pub fn on_llm_resp(state: &mut BotState, day: i64, resp: &str) {
+pub fn on_llm_resp(state: &mut BotState, day: i64, round_no: i64, resp: &str) {
     if !state.news.awaits_response() {
         return;
     }
@@ -521,6 +521,12 @@ pub fn on_llm_resp(state: &mut BotState, day: i64, resp: &str) {
             "news_read_failed",
             serde_json::json!({
                 "day": day,
+                // The round the answer landed on, beside the round the ask went
+                // out on (`news_read_ask.round`). Without it the two halves of
+                // the retry cannot be joined, and 「第一回合收到新闻之后并没有第一
+                // 时间向大模型请求」 — issue #207 §5 — is a question about exactly
+                // that gap.
+                "round": round_no,
                 "attempts": state.news.attempts,
                 "head": crate::log::headline(resp, 200),
             }),
@@ -551,6 +557,10 @@ pub fn on_llm_resp(state: &mut BotState, day: i64, resp: &str) {
         "news_read",
         serde_json::json!({
             "day": day,
+            // Same join as `news_read_failed`: the round the model's answer came
+            // back on, so "asked at round N, answered at round N+k, in force from
+            // then on" is one line rather than a `llm_resp` next to a `news_outlook`.
+            "round": round_no,
             "readings": outlooks.len(),
             "replaced": replaced,
         }),

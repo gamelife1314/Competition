@@ -379,6 +379,19 @@ pub enum PromptPurpose {
     Task,
 }
 
+impl PromptPurpose {
+    /// The word the log and the evidence tables use for this purpose. Kept here
+    /// rather than spelled out at each `log::event` call site so the collector's
+    /// `prompt_sent` column and the emitter cannot drift apart.
+    pub fn word(self) -> &'static str {
+        match self {
+            PromptPurpose::News => "news",
+            PromptPurpose::Treasure => "treasure",
+            PromptPurpose::Task => "task",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum TreasurePhase {
     #[default]
@@ -513,6 +526,24 @@ pub struct BotState {
     /// keyword scan stands until — and unless — it answers (P1-1).
     pub news: news::NewsRead,
 
+    /// Which consumer won this round's prompt slot, recorded by
+    /// [`Self::request_prompt`] and drained by the round's `prompt_sent` record.
+    ///
+    /// The ranking in `request_prompt` is a function of the round, so "who asked"
+    /// is not recoverable from the prompt text alone — and the one question issue
+    /// #207 §5 asks of it, 「第一回合收到新闻之后并没有第一时间向大模型请求」, is
+    /// exactly "on the round the news arrived, did the news ask get the slot, or
+    /// did the treasure or the task line take it first". `None` on a round whose
+    /// prompt no consumer asked for.
+    pub last_prompt: Option<PromptPurpose>,
+
+    /// What today earned, tallied from the commands issued rather than from the
+    /// veins: `mine_pick` fires once per round a role spends WALKING to a vein,
+    /// so counting it would price a five-round walk as five picks. This counts
+    /// the picks and the sales themselves, and is written out once a day as
+    /// `day_earn`. See [`DayEarn`].
+    pub earn: DayEarn,
+
     /// Dedup strings for non-task one-shot channels. Task LLM/command responses
     /// are deduped by (session_id, request_round) inside TaskSession.
     pub seen_llm_resp: String,
@@ -596,6 +627,96 @@ pub struct BotState {
     /// 内置教练（`brain::coach`）：不靠环境变量、不靠外部 workflow，从局势里读出
     /// 证据自己移动三个策略开关。它随半场一起活着（见 `observe` 的重置分支）。
     pub coach: Coach,
+}
+
+/// One day's earning, tallied as the commands go out.
+///
+/// The owner's question after the first batch was 「第一天挖了什么、卖了多少钱」, and
+/// nothing in the log answered it: `mine_pick` is a line about a WALK (a role
+/// that takes five rounds to reach a vein writes five of them), `sell` is one
+/// line per sale with the running gold and no day total, and the `round` record
+/// carries the purse rather than the trade. So the two halves are counted here,
+/// from the commands themselves, and written once per day as `day_earn`.
+///
+/// Counted from the DECIDED commands, not from the judger's answer: the judger
+/// does not report per-action ore, and a `collect` that comes back empty is a
+/// separate question (the vein ran out) that `mine_outage` already covers.
+#[derive(Debug, Default, Clone)]
+pub struct DayEarn {
+    /// The day these totals belong to; a different day starts a fresh tally.
+    pub day: i64,
+    /// Ore kind -> picks ordered today.
+    pub mined: std::collections::BTreeMap<String, i64>,
+    /// Ore kind -> units sold today.
+    pub sold: std::collections::BTreeMap<String, i64>,
+    /// Gold the day's sales came to, at the vendor's own prices.
+    pub sold_gold: i64,
+    /// Picks and sales that named no ore (a vein with no zone under it, a sell
+    /// with no item): counted so a tally that lost its labels cannot read as a
+    /// day that did nothing.
+    pub unlabelled: i64,
+}
+
+impl DayEarn {
+    /// Roll the tally over if `day` is a new one, then fold in this round's
+    /// commands.
+    pub fn note(&mut self, turn: &Turn, commands: &[crate::protocol::RoleCommand]) {
+        if turn.day != self.day {
+            *self = DayEarn {
+                day: turn.day,
+                ..DayEarn::default()
+            };
+        }
+        for cmd in commands {
+            match cmd.action.as_str() {
+                "collect" => match cmd
+                    .targetPos
+                    .as_ref()
+                    .and_then(|targets| targets.first())
+                    .and_then(|pos| turn.zones.get(pos))
+                {
+                    Some(ore) => *self.mined.entry(ore.clone()).or_insert(0) += 1,
+                    None => self.unlabelled += 1,
+                },
+                "sell" => {
+                    let num = cmd.num.unwrap_or(0).max(0);
+                    let Some(item) = cmd.name.clone() else {
+                        self.unlabelled += 1;
+                        continue;
+                    };
+                    *self.sold.entry(item.clone()).or_insert(0) += num;
+                    self.sold_gold += num * turn.vendor_prices.get(&item).copied().unwrap_or(0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `["stone", 12, "iron", 3]` — a flat list, so the collector can print it
+    /// in a fixed-width column without knowing the ore names in advance.
+    fn pairs(tally: &std::collections::BTreeMap<String, i64>) -> Vec<serde_json::Value> {
+        tally
+            .iter()
+            .flat_map(|(ore, n)| {
+                [
+                    serde_json::Value::String(ore.clone()),
+                    serde_json::json!(n),
+                ]
+            })
+            .collect()
+    }
+
+    pub fn record(&self, turn: &Turn) -> serde_json::Value {
+        serde_json::json!({
+            "round": turn.round_no,
+            "day": turn.day,
+            "mined": Self::pairs(&self.mined),
+            "sold": Self::pairs(&self.sold),
+            "soldGold": self.sold_gold,
+            "unlabelled": self.unlabelled,
+            "gold": turn.gold,
+        })
+    }
 }
 
 impl BotState {
@@ -877,7 +998,7 @@ impl BotState {
                     }),
                 );
                 if news_gets {
-                    news::on_llm_resp(self, turn.day, &turn.llm_resp);
+                    news::on_llm_resp(self, turn.day, turn.round_no, &turn.llm_resp);
                 }
                 if treasure_gets {
                     crate::brain::treasure::on_llm_resp(self, &turn.llm_resp, turn.round_no);
@@ -1670,6 +1791,10 @@ impl BotState {
         if !free_window {
             self.consume_prompt_budget();
         }
+        // The slot is this purpose's. Recorded on the way out, so the round's
+        // `prompt_sent` record names the consumer that won rather than leaving a
+        // reader to infer it from the prompt text — see [`Self::last_prompt`].
+        self.last_prompt = Some(purpose);
         true
     }
 

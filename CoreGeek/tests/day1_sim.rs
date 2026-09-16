@@ -17,8 +17,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
-use coregeek::model::{chebyshev, footprint_distance};
-use coregeek::protocol::Pos;
+use coregeek::brain::day::{far_edge_cutoff, far_shoulder, ring_gap_split};
+use coregeek::model::{chebyshev, footprint_distance, Turn};
+use coregeek::protocol::{Pos, Request};
 
 const WIDTH: i32 = 41;
 const HEIGHT: i32 = 32;
@@ -125,6 +126,12 @@ struct World {
     collects: Vec<(i64, Pos)>,
     /// Role id -> (round, position, backpack size), for diagnosing stalls.
     positions: HashMap<i64, Vec<(i64, Pos, i64)>>,
+    /// The enemy station, on the boards that have one.
+    ///
+    /// `far_shoulder` needs a bearing to be far FROM: with no enemy base on the
+    /// board every ring cell faces it and the whole ring is owed, so the day-1
+    /// tests that predate issue #206 §6 run without one and are unchanged.
+    enemy_station: Option<Pos>,
     /// This match's own cross-round memory. Private on purpose: the planner's
     /// decisions on round N depend on rounds 1..N-1, so a test that shares it
     /// with another test is not testing a day, it is testing an interleaving.
@@ -207,8 +214,17 @@ impl World {
             gold_track: vec![],
             collects: vec![],
             positions: HashMap::new(),
+            enemy_station: None,
             state: coregeek::state::BotState::default(),
         }
+    }
+
+    /// The same board with the enemy base in the far corner (任务书 §4.1: the
+    /// two bases sit in opposite corners, and the sides swap between halves),
+    /// a long way from the stone.
+    fn with_enemy(mut self, pos: (i32, i32)) -> Self {
+        self.enemy_station = Some(Pos { x: pos.0, y: pos.1 });
+        self
     }
 
     /// Cells a unit may not enter: neutral zones and every other unit.
@@ -252,6 +268,23 @@ impl World {
             .iter()
             .map(|(pos, kind)| json!({"pos": {"x": pos.x, "y": pos.y}, "neutralType": kind}))
             .collect();
+        let enemy_roles: Vec<Value> = self
+            .enemy_station
+            .map(|pos| {
+                vec![json!({
+                    "id": 20001,
+                    "pos": {"x": pos.x, "y": pos.y},
+                    "roleType": "station",
+                    "health": 1500,
+                    "attackPower": 0,
+                    "attackRange": 0,
+                    "level": 1,
+                    "cooldown": 0,
+                    "backPackCapability": 0,
+                    "backpack": [],
+                })]
+            })
+            .unwrap_or_default();
         json!({
             "roundNo": self.round,
             "mapInfo": {"width": WIDTH, "height": HEIGHT, "zones": zones},
@@ -262,7 +295,7 @@ impl World {
                 "playerTasks": [],
                 "roles": roles,
             },
-            "teamEnemy": {"roles": []},
+            "teamEnemy": {"roles": enemy_roles},
             "robot": {"roles": []},
             "vendorShopList": VENDOR.iter()
                 .map(|(name, price)| json!({"name": name, "price": price}))
@@ -580,6 +613,29 @@ impl World {
 
     fn wall_count(&self) -> usize {
         self.units.iter().filter(|unit| unit.kind == "wall").count()
+    }
+
+    /// Every cell this match has a wall standing on.
+    fn wall_cells(&self) -> Vec<Pos> {
+        self.units
+            .iter()
+            .filter(|unit| unit.kind == "wall")
+            .map(|unit| unit.pos)
+            .collect()
+    }
+
+    /// The board as the planner would see it on `round_no`, rebuilt from the
+    /// sim's own units and walls rather than from a fixture — so a question
+    /// asked of it ("is this cell still owed") is asked of the day that
+    /// actually happened.
+    ///
+    /// The units are where they ended the day, which is the point: the walls are
+    /// the day's full output, so the ring questions get the finished ring.
+    fn turn_at(&self, round_no: i64) -> Turn {
+        let mut payload = self.payload();
+        payload["roundNo"] = json!(round_no);
+        let req: Request = serde_json::from_value(payload).expect("payload parses");
+        Turn::from_request(req)
     }
 
     fn towers(&self) -> Vec<&SimUnit> {
@@ -1334,5 +1390,185 @@ fn day_one_mines_ore_the_vendor_buys_and_still_closes_the_ring() {
     assert!(
         closed <= coregeek::brain::economy::DUSK_ROUND + 8,
         "the last ring wall went up at R{closed}, after the night had started"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #206 §6 — 「后边的门，背向机器人的方向可以开着」
+// ---------------------------------------------------------------------------
+//
+// The two ends of the rule, on real days rather than on a single board read.
+// `tests/wall_far_shoulder.rs` pins *which* cell is optional; these pin what the
+// two kinds of day actually end up looking like, which is the half a unit test
+// on a predicate cannot see.
+
+/// The enemy base, in the corner opposite ours (任务书 §4.1) and on the other
+/// side of the base from the stone — so the ring's far shoulder is the side the
+/// crew works from all day, which is the tension the issue is about.
+const ENEMY_BASE: (i32, i32) = (38, 4);
+
+#[test]
+fn a_day_with_stone_to_spare_still_builds_the_whole_ring() {
+    // 「有条件全部建造好」. The licence to skip the far shoulder is for a day
+    // that cannot afford it. The standard opening can, and this is the control
+    // that keeps the rule from quietly becoming "the far side is never built".
+    let mut world = World::new().with_enemy(ENEMY_BASE);
+    while world.round <= DAY_END {
+        world.step();
+    }
+    report("day 1 (enemy, stone to spare)", &world);
+    assert_eq!(
+        world.open_cells(),
+        Vec::new(),
+        "the standard opening has the stone and the rounds for the whole ring, \
+         and it left {:?} open",
+        world.open_cells()
+    );
+    assert!(
+        world.state.wall_gate_sealed,
+        "the gate never sealed"
+    );
+}
+
+#[test]
+fn a_scarce_day_leaves_the_far_shoulder_open_and_the_enemy_arc_complete() {
+    // The other end: one stone vein, so the day has to choose. What it must
+    // never choose is a hole on the bearing the robots come from.
+    // The distant-vein board, which closes the whole ring on its own (see
+    // `a_distant_stone_vein_still_puts_the_ring_up_before_nightfall`) — so what
+    // this test measures is the enemy's bearing and nothing else. The trip out
+    // and back is what the far shoulder costs, and it is the first thing a day
+    // short of rounds gives up.
+    let mut world = stone_eight_cells_out().with_enemy(ENEMY_BASE);
+    while world.round <= DAY_END {
+        world.step();
+    }
+    report("day 1 (enemy, distant stone)", &world);
+
+    let open = world.open_cells();
+    assert!(
+        !open.is_empty(),
+        "this board is not scarce enough to exercise the rule: the ring closed \
+         completely, so nothing was skipped"
+    );
+    // Read the ring as the planner read it, on the last round before the cutoff
+    // — past `far_edge_cutoff` the whole ring is owed again by design, so a
+    // later reading would call every one of these cells a failure.
+    let turn = world.turn_at(far_edge_cutoff());
+    let state = coregeek::state::BotState::default();
+    for cell in &open {
+        assert!(
+            far_shoulder(&turn, &state, *cell),
+            "{cell:?} was left unwalled and it is not a far shoulder — the day \
+             skipped a cell that faces the enemy"
+        );
+    }
+    // ...and the arc that does face the enemy is finished: nothing owed is
+    // still standing open.
+    let (owed, shoulder) = ring_gap_split(&turn, &state);
+    let walls = world.wall_cells();
+    for cell in &owed {
+        assert!(
+            walls.contains(cell),
+            "the day ended owing {cell:?}: 「朝向敌人的三个方向城墙一定是完整的」"
+        );
+    }
+    assert!(
+        !shoulder.is_empty(),
+        "the shoulder is what this board should have left for last, and it is \
+         not there at all"
+    );
+    // And it is still a ring: the gate is sealed before the night.
+    assert!(
+        world.state.wall_gate_sealed,
+        "the far shoulder was skipped and the entrance was left open with it"
+    );
+}
+
+#[test]
+fn the_days_earning_is_tallied_where_a_reader_can_find_it() {
+    // Issue #207 §5's question — 「挖矿必须进行，必须赚钱」 — was answered off
+    // `collects`, which is this harness reconstructing the day from the board.
+    // The deployed bot has no such reconstruction: `mine_pick` fires once per
+    // round a role spends WALKING to a vein, so a five-round walk reads as five
+    // picks and a day of walking reads as a day of mining. `state.earn` is the
+    // tally the log writes once a day (`day_earn`), and the first half of this
+    // pins it against the day the board actually played: the same 21 picks,
+    // counted twice, have to agree.
+    let mut world = run_day_one();
+    let earn = &world.state.earn;
+    assert_eq!(earn.day, 1, "the tally is not the day that just ran");
+    // 表 12 joins the earning half to the news half by day and prints the round
+    // it was taken at, so the record `day_earn` writes has to carry both — the
+    // tally being right is worth nothing if the row it becomes cannot be read.
+    let turn = world.turn_at(1);
+    let record = earn.record(&turn);
+    for key in [
+        "day",
+        "round",
+        "mined",
+        "sold",
+        "soldGold",
+        "unlabelled",
+        "gold",
+    ] {
+        assert!(
+            record.get(key).is_some(),
+            "the `day_earn` record has no `{key}`, so 表 12 cannot print its \
+             column: {record}"
+        );
+    }
+    assert_eq!(record["day"], 1);
+    assert_eq!(record["round"], turn.round_no);
+    assert_eq!(
+        earn.mined.get("stone").copied().unwrap_or(0),
+        world
+            .collects
+            .iter()
+            .filter(|(_, pos)| world.zones.get(pos).map(String::as_str) == Some("stone"))
+            .count() as i64,
+        "the tally and the board disagree about how much stone the day dug: {:?} vs {:?}",
+        earn.mined,
+        world.collects
+    );
+    assert!(
+        earn.mined.get("stone").copied().unwrap_or(0) > 0,
+        "a day that mined stone tallied none: {:?}",
+        earn.mined
+    );
+    assert_eq!(
+        earn.unlabelled, 0,
+        "the tally lost the label off {} picks or sales, so its per-ore numbers are wrong",
+        earn.unlabelled
+    );
+
+    // The other half is day 2's: day 1 spends itself on the ring and sells
+    // nothing, which is why the earning question could not be answered from the
+    // day-1 line alone.
+    let day_one_stone = earn.mined.get("stone").copied().unwrap_or(0);
+    run_day(&mut world, 2);
+    let earn = &world.state.earn;
+    assert_eq!(earn.day, 2, "the tally did not roll over into day 2");
+    assert!(
+        earn.mined.get("stone").copied().unwrap_or(0) != day_one_stone || !earn.mined.is_empty(),
+        "day 2's tally is empty: {:?}",
+        earn.mined
+    );
+    let sellable: i64 = earn
+        .sold
+        .iter()
+        .filter(|(ore, _)| VENDOR.iter().any(|(item, price)| item == ore && *price > 0))
+        .map(|(_, count)| *count)
+        .sum();
+    assert!(
+        sellable > 0,
+        "day 2 sold nothing the vendor buys, and the tally is where that shows: {:?}",
+        earn.sold
+    );
+    assert!(
+        earn.sold_gold > 0,
+        "the day's sales came to {} gold — the tally is not pricing them (vendor {:?})",
+        earn.sold_gold,
+        VENDOR
     );
 }

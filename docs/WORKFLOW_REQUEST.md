@@ -1,5 +1,17 @@
 # 对战数据交付规范（workflow agent 接口）
 
+> **版本 v22** · 本文档是内网自动对战 workflow 的**交付规范**。
+> **v22 只加一节：§20 请求十五**，别的什么都没动——交付方式、**收集命令一个字没变**，
+> 你那边**不需要做任何新动作**：重跑一次那条命令就会多印**表 12（每天一行：当天收益
+> 与新闻往返）**和**表 13（远肩每天收在哪）**，`--day N` 会多印两节 `drill`（模型往返
+> 逐回合、新闻往返）。行数预算 700 **不变**：`CAPS` 总和 676 → **700**（两张新表各
+> 十二行，都是一天一行、10 天 + 余量），**这一版把 700 用满了，没有余量了**。
+> 起因是 issue #207 §5 的两句话：「现在的 REQ 日志会被截断」「第一回合收到新闻之后我
+> 发现并没有第一时间向大模型请求」。第一句是日志被切了（代码已改，§20.4），第二句
+> **查下来行为是对的、证据是缺的**——收集脚本一行都没印过 `news_read_ask`，也没印过
+> 那一天到底挖了什么卖了什么（`mine_pick` 是**走到矿脉的那一回合一次**，走五回合报
+> 五次，一天的矿看起来就是一整天的挖矿）。这一版补的就是这两格。
+>
 > **版本 v21** · 本文档是内网自动对战 workflow 的**交付规范**。
 > **v21 只加一节：§19 请求十四**，别的什么都没动——交付方式、**收集命令一个字没变**，
 > 你那边**不需要做任何新动作**。§19 要的表 11（买家出门账）是**聚合式、恒定二十行**，
@@ -514,8 +526,10 @@ Debian/Ubuntu `sudo apt-get install -y python3`；装完**重开终端**再跑�
 | 5 封门 | 5a / 5b / 5c | 52 / 3 / 1 | 160 / 20 / 20 | **每天最多 15 行** |
 | 6 夜间塔况 | 6a / 6b | 3 / 7 | 20 / 40 | 聚合式，恒定 |
 | 0b 分数拆解 | 8 | 3 | 20 | 一天一行，**v17 新增** |
+| 每天收益与新闻 | 12 | 10 | 12 | 一天一行，**v22 新增** |
+| 远肩每天收在哪 | 13 | 10 | 12 | 一天一行，**v22 新增** |
 
-**封顶在脚本里，不用你数**：跑一次最多 680 行表格（那是"每天都出问题"的极端场），典型一场
+**封顶在脚本里，不用你数**：跑一次最多 700 行表格（那是"每天都出问题"的极端场），典型一场
 250 行 / 7.0 KB。被截断的节会自己写明「本表共 N 行」——**看到那句就照贴，我会知道哪节被切了**。
 
 - 表 5 的 5a 是唯一按回合线性长的：黄昏窗口一天就 15 回合，所以**每天封顶 15 行**，10 天
@@ -922,7 +936,7 @@ agent_request:
           deliverable. If one table blows past its budget, paste it anyway and say why (gate
           table: the gate WAS open that long).
         produced_by: python tools/collect_log.py <log>
-        cap_lines_total: 680   # the script's per-section caps summed; a typical battle prints 250 lines (219 rows)
+        cap_lines_total: 700   # the script's per-section caps summed; a typical battle prints 250 lines (219 rows)
         tables:
           - id: tower_plan
             sections: [表 1 造塔计划: 20 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
@@ -987,6 +1001,29 @@ agent_request:
             gotchas:
               - 'all three blocks are change-gated (§2 rule 2): a round without `enemyTowers` means UNCHANGED, not "no guns" — read the series with carry-forward'
               - 'the table prints one row per day, at the day''s last round, so read the day-1 row for "did they have three guns on night 1"'
+          - id: day_earn
+            sections: [表 12 每天一行：当天收益与新闻往返: 12 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
+            name: 每天收益与新闻往返
+            tells: what the day actually dug and sold, and when the model was asked about the day's news — one row per day, because `mine_pick` fires once per round a role spends WALKING to a vein, so a five-round walk reads as five picks and a day of walking reads as a day of mining (issue #207 §5, 「挖矿必须赚钱」)
+            fields:
+              mined: '[ore, count, ore, count, ...] — counted off the `collect` commands that went out, not off `mine_pick`'
+              sold: '[item, count, ...] — counted off the `sell` commands'
+              soldGold: 'gold the day''s sales came to, priced at the round''s `vendor_prices`'
+              unlabelled: 'commands whose ore/item could not be resolved; non-zero means the two lists above under-count, and the row says so instead of looking complete'
+              askRounds: 'the day-rounds the news ask went out on; `-` means it was never asked, which is the thing issue #207 §5 is about'
+              readings: 'ore readings the model''s answer put in force; empty means no answer came back or it was unparseable'
+              lost: 'answers that could not be parsed (`news_read_failed`)'
+          - id: far_shoulder
+            sections: [表 13 远肩每天收在哪: 12 行]   # 上限写在脚本的 CAPS 里，这里是同一组数
+            name: 远肩每天收在哪
+            tells: whether the day spent its stone on the wall that faces the enemy or on the far shoulder — 任务书/owner, issue #206 §6, 「围墙不一定得全部建造起来……0 的位置可以选择性缺口，有条件全部建造好」
+            fields:
+              owed: 'shell cells the day still owes (enemy-facing arc, breached sectors, a robot at the ring, or past `far_edge_cutoff`)'
+              open: 'shell cells the day is allowed to leave (the far shoulder)'
+              reason: 'dusk_required / enemy_first / spare_rounds / none — read at the day''s last round, so `enemy_first` at dusk means the enemy-facing arc was still open'
+            gotchas:
+              - '`enemy_first` is a red flag; `spare_rounds` is 「有条件全部建造好」 happening; `none` means the ring closed'
+              - 'a far-side cell is never written off while a robot is at the ring or a sector has been breached — the licence is withdrawn on the round that becomes true'
       - id: gaps
         title: 缺口
         content: everything unobtainable, with the reason. A table that printed （0 行） and a thing that did not happen are different claims — say so when you cannot tell them apart.
@@ -1818,3 +1855,87 @@ v21 给它加了三个键，收集脚本直接读：
 - **验收判据**：`表 11` 里 `walk` 应当出现在金币到位的那些回合；`表 2a` 应当出现
   `buy StationUpgradeVoucher1`；`表 0`/`表 8` 的「我方基地等级」应当从 1 变 2。
   只买得起一张券时（金币 100-155，表 2c）应当是**基地券**，不是武器券。
+
+---
+
+## §20 请求十五（v22）：那两行说明「这一整天到底干了什么」
+
+> **v22 只加一节：§20 请求十五**，别的什么都没动——交付方式、**收集命令一个字没变**，
+> 你那边**不需要做任何新动作**：同一条命令再跑一次，会多印**表 12（每天一行：当天收益
+> 与新闻往返）**和**表 13（远肩每天收在哪）**；`--day N` 会多印两节 `drill`（第 N 天模型
+> 往返逐回合、第 N 天新闻往返）。
+> 行数预算 700 **不变**，但 `CAPS` 总和 676 → **700**：两张新表各十二行，都是「一天一行、
+> 10 天 + 余量」的聚合式，所以一场多长都只多这 24 行。**这一版把 700 用满了，没有余量**；
+> 下一版要加表，得从现有表里换行数出来（那会在 §7.3 的预算表上写明换的是哪一张）。
+> 起因是 issue #207 §5 的两句话。第二句「第一回合收到新闻之后我发现并没有第一时间向大
+> 模型请求」**查下来行为是对的**——`news_read_ask` 确实在第 1 个白天回合就发了问，
+> 证据见 §20.4——**但收集脚本一行都没印过它**，所以那句话在交付面上无法证伪。第一句
+> 「现在的 REQ 日志会被截断」是日志被切了，代码已改（§20.4 第一条）。
+
+### 20.1 是什么
+
+**表 12 · 每天一行：当天收益与新闻往返**（一天一行，封顶 12 行）：
+
+```text
+表 12 · 每天一行：当天收益与新闻往返　列：第几天 回合 挖到 卖掉 卖得金币 当时金币 认不出 新闻问于（当天第几回合） 问了几次 答复生效条数 丢了几个
+```
+
+**表 13 · 远肩每天收在哪**（一天一行，取当天最后一个回合，封顶 12 行）：
+
+```text
+表 13 · 远肩每天收在哪（每天最后一个回合）　列：第几天 回合 还欠 可开 原因 队石 石需
+```
+
+`--day N` 时额外两节逐回合明细（各自封顶 160 行，**不计入 700**）：
+
+```text
+drill · 第 N 天模型往返逐回合　列：回合 当天第几回合 事件 问给谁 字数 开头
+drill · 第 N 天新闻往返　　　　列：回合 当天第几回合 事件 第几次问 关键词字数 生效条数 换掉几条 回答开头
+```
+
+### 20.2 为什么需要
+
+**「这一天挖了什么、卖了多少钱」现在没有一行能回答。** 唯一的矿脉证据是 `mine_pick`，
+而它是**走到矿脉的那一回合一次**——走五回合报五次，走一天的矿看起来就是一整天的挖矿。
+issue #207 §5 的「挖矿必须赚钱」之前是靠 `collects` 回答的，那是把整天的板子重建一遍
+数出来的，而**部署中的机器人没有这份重建**。表 12 的 `挖到`/`卖掉` 数的是**真正发出去的
+`collect`/`sell` 指令**（每天写一次的 `day_earn`），`卖得金币` 按当时 `vendor_prices`
+计价，`认不出` 是没能归到物品上的指令数——这一格非 0 就说明前两列少算了，表会自己说。
+
+**「新闻到底第几回合问的」现在一格都没有。** `news_read_ask` 从 P1-1 起就在写，收集
+脚本从没印过它。表 12 的 `新闻问于` 印的是**当天第几回合**（不是绝对回合号），因为
+issue #207 §5 的原话是「第一回合收到新闻之后……」——问的就是「当天第一个回合有没有发问」。
+`答复生效条数` 空 = 模型没回或答得读不了，`丢了几个` 数的是读不了的回答。
+
+**「围墙今天砌的是正面还是远肩」现在也看不出来。** issue #206 §6 把环分成两半：朝向敌人
+的三个方向一定是完整的，背向的「0 的位置可以选择性缺口，有条件全部建造好」。表 13 一天
+一行，`还欠`/`可开` 两列是当天下工时两半各剩多少格，`原因` 是那一刻的判决：
+`dusk_required`（到点了必须全砌）、`enemy_first`（正面还没砌完）、`spare_rounds`（正面
+砌完了、正在补远肩）、`none`（环已收口）。**`enemy_first` 出现在天黑那一行就是要报的
+事**——那一天把石头全花在了别处，正面的环到黄昏还是缺的。
+
+### 20.3 建议格式
+
+照旧：**整段贴，不要挑行**。表 12 / 表 13 各一行一天，两行一起看就是当天的一句话——
+「挖了 21 块石头、一块没卖、金币 25；新闻是当天第 1 个回合问的，模型回了 3 条；
+环还欠 0 格、可以开着 12 格，原因是 `spare_rounds`」，这正是「有条件全部建造好」在
+发生。表里出现 `（0 行）` 照样贴——「这张表印了 0 行」和「这件事没发生」是两件事，
+我需要看到是哪一种。要哪一天的逐回合就往 `--day` 后面填那一天，**六张表（现在是二十一节）
+仍然一起印，整段贴**。
+
+### 20.4 这一批改了什么（不必再报）
+
+- **REQ/RESP 的 stdout 不再截断**（`server.rs`）：整条请求现在完整打印，并且
+  `prompt` 和 `executeCmd` 各自单起一行、各自完整（带自己的上限标记）。之前被切掉的是
+  **这条记录的后半段**，这正是 issue #207 §5 第一句话的来源。
+- **`news_read` / `news_read_failed` 补上 `round`**（`news.rs`）：这两条记录原来只有
+  `day`，所以「第几回合发的问、第几回合收到的答」join 不起来。现在 `news_read_ask`、
+  `news_read`、`news_read_failed` 三条都带 `round`。
+- **`prompt_sent` 补上 `purpose`**（`state.rs` / `brain/mod.rs`）：这一回合抢到提示词槽位
+  的消费者（`news` / `treasure` / `task`，排名见 `state::request_prompt`）。没有它，
+  「这一回合的提示词是不是新闻」只能从提示词正文猜。**这是只写日志的改动，不改任何决策。**
+- **`day_earn` / `wall_far_edge` 两个事件**（`state.rs` / `brain/day.rs`）：每天写一次，
+  分别是当天的收益账和远肩的判决。**同样是只写日志。**
+- **§20 要的是验收**：表 12 的 `新闻问于` 应当出现 `1`（当天第 1 个回合）；表 13 的
+  `原因` 在环收口后应当是 `spare_rounds` 或 `none`。这两格对不上，就是代码里的排名或
+  远肩判定出了问题，请照贴原始行，不要下结论。

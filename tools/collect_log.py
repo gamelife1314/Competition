@@ -22,7 +22,7 @@
     所以读到的一定是完整的一页，或一句诚实的截断声明。
   * **只读不写。** 不改日志、不在日志旁边留中间文件。原始日志自己留着（§1）。
   * **不认识的东西要说出来。** 解不开的压缩包、读不了的编码、解析不了的行，都计数并在
-    开头声明——十六张空表绝不能被读成「这场什么都没发生」。
+    开头声明——二十一张空表绝不能被读成「这场什么都没发生」。
 
 输入格式：`.jsonl`、`.jsonl.gz`、`.zip`（Windows 上多半是压缩包）都行。BOM、CRLF、
 UTF-16、GBK 都能读，都是 Windows 上真的会遇到的东西。
@@ -43,7 +43,7 @@ from collections import Counter
 ARCHIVE_ERRORS = (OSError, EOFError, zlib.error, zipfile.BadZipFile)
 
 # 每张表的行数封顶。**这是预算的唯一出处**——WORKFLOW_REQUEST §7.3 的预算表和 §8 的
-# cap_lines_total 都是这个数，CoreGeek/tests/collect_log.rs 会核对总量不超过 660 行。
+# cap_lines_total 都是这个数，CoreGeek/tests/collect_log.rs 会核对总量不超过 700 行。
 # 加一节而忘了给预算，或者把某一节放大到超出总量，都会在那里失败。
 CAPS = {
     "tower_plan": 20,      # 聚合式，恒定
@@ -65,10 +65,12 @@ CAPS = {
     "score_split": 20,     # 一天一行，10 天 + 余量（v17 §14）
     "enemy_build": 12,     # 一天一行，10 天 + 余量
     "dawn_clear": 12,      # 一天一行，10 天 + 余量（v19 §17）
+    "day_earn": 12,        # 一天一行，10 天 + 余量（v22 §20）
+    "far_shoulder": 12,    # 一天一行，10 天 + 余量（v22 §20）
 }
 CAP_TOTAL = sum(CAPS.values())
 
-# `--day N` 点名的逐回合明细。**不计入 660**：那十七张是每批都要贴的，这个是点了名才印的。
+# `--day N` 点名的逐回合明细。**不计入 700**：那二十一张是每批都要贴的，这个是点了名才印的。
 DRILL_CAP = 160
 
 # 一天/一夜的回合数，用来把 round 换算成「第几天、当天第几回合」。
@@ -276,7 +278,7 @@ title, lines, cap):
 
 def drill(title, lines, cap):
     """`--day N` 时加印的逐回合明细。和 section 分开只是为了封顶预算好核对：
-    这十三张是每次都要贴的，drill 是点了名才印的。"""
+    这二十一张是每次都要贴的，drill 是点了名才印的。"""
     _emit(title, lines, cap)
 
 
@@ -369,18 +371,18 @@ def main(argv):
         build_tables(records, day)
         out("")
         # 结尾这句是给司机看的最后一句，所以它得说清「贴到哪为止」。带 --day 时后面还有
-        # 几节 drill，笼统写「以上即六张表」会让他只贴前半段。
+        # 几节 drill，笼统写「以上即二十一张表」会让他只贴前半段。
         if day is None:
-            out("===== 以上即 §7.3 六张表，整段贴进 issue 就行 =====")
+            out("===== 以上即 §7.3 的二十一张表，整段贴进 issue 就行 =====")
         else:
-            out("===== 以上整段贴进 issue：先是六张表，后面是第 %d 天的逐回合明细 =====" % day)
+            out("===== 以上整段贴进 issue：先是二十一张表，后面是第 %d 天的逐回合明细 =====" % day)
     return 0
 
 
 def coach_block(records):
     """`--coach`：回执里 `coach` 那一块（§5），以及 issue 头部的教练汇总行。
 
-    单独一个模式，不混进那十三张表里，因为**去向不同**：表是贴进 issue 正文的，
+    单独一个模式，不混进那二十一张表里，因为**去向不同**：表是贴进 issue 正文的，
     这一块是填进 `receipt.json` 的。混在一起，司机就得在一页输出里挑挑拣拣。
     """
     moves = []
@@ -754,6 +756,84 @@ def build_tables(records, day):
         enemy_rows, CAPS["enemy_build"],
     )
 
+    # ------------------------------------------- 表 12 每天的收益与新闻（v22 §20）
+    # 「挖矿必须赚钱」 在 issue #207 §5 里是靠 `collects` 回答的——那是把整天的板子重
+    # 建一遍数出来的。部署中的机器人没有这份重建：`mine_pick` 是**走到矿脉的那一回合
+    # 一次**，走五回合就报五次，走一天的矿脉看起来就是一整天的挖矿。`day_earn` 是
+    # 每天写一次的账（`state.earn`），这张表把它和当天的新闻往返并排放：一天一行，
+    # 「挖了什么、卖了多少钱、模型几点被问到、答复生效了没有」四件事一条线看完。
+    #
+    # 「新闻问于」印的是**当天第几回合**而不是绝对回合号：issue #207 §5 的原话是
+    # 「第一回合收到新闻之后并没有第一时间向大模型请求」，问的就是「当天第一个回合有
+    # 没有发问」，换算成当天第几回合才和那句话对得上。一天问了好几次（重试）就全部
+    # 列出，`,` 分隔。
+    earn_by_day, news_ask, news_ok, news_lost = {}, {}, {}, {}
+    for r in pick(records, "day_earn"):
+        d = data(r)
+        if isinstance(d.get("day"), int):
+            earn_by_day[d["day"]] = d
+    for r in pick(records, "news_read_ask"):
+        d = data(r)
+        if isinstance(d.get("day"), int):
+            news_ask.setdefault(d["day"], []).append(d)
+    for r in pick(records, "news_read"):
+        d = data(r)
+        if isinstance(d.get("day"), int):
+            news_ok.setdefault(d["day"], []).append(d)
+    for r in pick(records, "news_read_failed"):
+        d = data(r)
+        if isinstance(d.get("day"), int):
+            news_lost.setdefault(d["day"], []).append(d)
+    earn_rows = []
+    for which in sorted(set(earn_by_day) | set(news_ask) | set(news_ok) | set(news_lost)):
+        d = earn_by_day.get(which, {})
+        asks = news_ask.get(which) or []
+        oks = news_ok.get(which) or []
+        lost = news_lost.get(which) or []
+        got = ",".join(str(o.get("readings")) for o in oks) or "-"
+        earn_rows.append(tsv([
+            which, d.get("round"),
+            tostring(d.get("mined") or []), tostring(d.get("sold") or []),
+            d.get("soldGold"), d.get("gold"), d.get("unlabelled"),
+            ",".join(str(in_day(a.get("round") or 0)) for a in asks) or "-",
+            len(asks), got, len(lost),
+        ]))
+    section(
+        "表 12 · 每天一行：当天收益与新闻往返　列：第几天 回合 挖到 卖掉 卖得金币 当时金币 "
+        "认不出 新闻问于（当天第几回合） 问了几次 答复生效条数 丢了几个"
+        "（`挖到`/`卖掉` 是 [物品, 条数, …] 的紧凑列表，来自每天写一次的 `day_earn`；"
+        "`认不出` 是没能归到物品上的指令数，它非 0 就是上面两列少算了——"
+        "`mine_pick` 一天几十行，这一行是那一天唯一的汇总。`答复生效条数` 空说明模型没回"
+        "（或被判读不了），`丢了几个` 数的是不可解析的回答；`-` 是「一次都没问」）",
+        earn_rows, CAPS["day_earn"],
+    )
+
+    # ------------------------------------------- 表 13 远肩收在哪（v22 §20）
+    # issue #206 §6 「围墙不一定得全部建造起来……0 的位置可以选择性缺口，有条件全部
+    # 建造好」把环分成了两半，而两半的差别只有 `wall_far_edge` 说得清：`还欠` 是今天
+    # 必须砌的（朝向敌人 / 被突破过 / 机器人已经到环上 / 过了 `far_edge_cutoff`），
+    # `可开` 是可以留到最后的。一天取**当天最后一个回合**：那时的 `原因` 就是这一天
+    # 收工时的状态——`enemy_first` 说明到天黑还在补正面（应当报警），`spare_rounds`
+    # 说明正面砌完了、正在补远肩（「有条件全部建造好」在发生），`none` 说明环已经收口。
+    far_rows, far_last = [], {}
+    for r in pick(records, "wall_far_edge"):
+        d = data(r)
+        if isinstance(d.get("day"), int):
+            far_last[d["day"]] = d
+    for which in sorted(far_last):
+        d = far_last[which]
+        far_rows.append(tsv([
+            which, d.get("round"), d.get("owed"),
+            len(d.get("open") or []), d.get("reason"),
+            d.get("teamStone"), d.get("stoneDemand"),
+        ]))
+    section(
+        "表 13 · 远肩每天收在哪（每天最后一个回合）　列：第几天 回合 还欠 可开 原因 队石 石需"
+        "（`原因` = dusk_required 到点了必须全砌 / enemy_first 正面还没砌完 / "
+        "spare_rounds 正面砌完了、在补远肩 / none 环已收口）",
+        far_rows, CAPS["far_shoulder"],
+    )
+
     if day is not None:
         drill_day(records, day)
 
@@ -761,7 +841,7 @@ def build_tables(records, day):
 def drill_day(records, day):
     """点名要某一天/某一夜时加印的逐回合行（§7.3 里"我点名要哪一天"那条路）。
 
-    三条明细各自封顶 160 行——一天最多 70 个白天回合 + 60 个夜晚回合，封顶够用，
+    每条明细各自封顶 160 行——一天最多 70 个白天回合 + 60 个夜晚回合，封顶够用，
     但不会因为日志里有重复行就无限长。
     """
     def on_day(rec):
@@ -803,6 +883,34 @@ def drill_day(records, day):
               data(r).get("reserve"), data(r).get("buyerShopDist"), data(r).get("deadline"),
               data(r).get("shopTrip"), data(r).get("trip"), data(r).get("lockRound")])
          for r in pick(records, "shopping") if on_day(r)],
+        DRILL_CAP,
+    )
+    # v22 §20 的第四件事：**每回合真正发出去的那两样东西**。表 12 一天一行说的是
+    # 「问到了没有」，这一条说的是「问的是什么、脚本是什么」。`问给谁` 是这一回合
+    # 抢到提示词槽位的消费者（`news` / `treasure` / `task`，见 `state::request_prompt`
+    # 的排名）——「第一回合收到新闻之后并没有第一时间向大模型请求」这句话，先要能看出
+    # 那一回合的槽位给了谁，才谈得上「是不是新闻」。
+    #
+    # 提示词和脚本**分属两条记录**（`prompt_sent` / `cmd_sent`），所以一回合可能两行；
+    # `事件` 那一格就是用来分开它们的。`开头` 截到 160 字符，和表 4c 的 `cmd_result.head`
+    # 同一个宽度：整段贴进 issue 的表不该被一个 300 字符的格子撑破。
+    drill(
+        "drill · 第 %d 天模型往返逐回合　列：回合 当天第几回合 事件 问给谁 字数 开头" % day,
+        [tsv([data(r).get("round"), in_day(data(r).get("round") or 0), r.get("event"),
+              data(r).get("purpose"), data(r).get("chars"),
+              one_line(data(r).get("head"))[:160]])
+         for r in pick(records, "prompt_sent", "cmd_sent") if on_day(r)],
+        DRILL_CAP,
+    )
+    # 新闻的往返单独一条：`问于` 和 `答于` 并排，「第一回合收到新闻、第几回合才问出去、
+    # 第几回合才生效」三个数才在一行里。两条记录都有 `day`，加入的 `round` 就是这一步
+    # 要的证据（v22 之前 `news_read`/`news_read_failed` 只有 `day`，没有回合）。
+    drill(
+        "drill · 第 %d 天新闻往返　列：回合 当天第几回合 事件 第几次问 关键词字数 生效条数 换掉几条 回答开头" % day,
+        [tsv([data(r).get("round"), in_day(data(r).get("round") or 0), r.get("event"),
+              data(r).get("attempt"), data(r).get("keyword"), data(r).get("readings"),
+              data(r).get("replaced"), one_line(data(r).get("head"))[:120]])
+         for r in pick(records, "news_read_ask", "news_read", "news_read_failed") if on_day(r)],
         DRILL_CAP,
     )
 

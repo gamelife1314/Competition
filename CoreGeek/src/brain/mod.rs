@@ -79,6 +79,18 @@ pub fn decide_with(state: &mut BotState, raw_body: &[u8]) -> Result<String, Stri
 
     let sanitized = crate::validate::sanitize(&turn, plan.commands);
 
+    // What today earned, counted off the commands that are about to go out. See
+    // [`crate::state::DayEarn`] for why it is counted here and not off
+    // `mine_pick`. The tally is written out once, on the day's last round, so
+    // the day-1 question 「挖了什么、卖了多少钱」 has one line to answer it
+    // instead of a `mine_pick` per round walked.
+    let day_earned: Vec<RoleCommand> = sanitized.values().cloned().collect();
+    state.earn.note(&turn, &day_earned);
+    if turn.is_day && turn.in_day_round == crate::model::DAY_ROUNDS - 1 {
+        let record = state.earn.record(&turn);
+        crate::log::event("day_earn", record);
+    }
+
     // Last round's command map, captured before it is overwritten: both the
     // failure join below and the volley review read it.
     let previous_issued = std::mem::take(&mut state.last_issued);
@@ -479,11 +491,38 @@ fn log_round(
         .map(|robot| (robot.id, robot.kind.score()))
         .collect();
     state.prev_wall_hp = Some(wall_hp);
+    // The LLM traffic. `round`/`day` are here because they were NOT: these two
+    // records carried a head and a `ts` and nothing else, so the one question a
+    // reader has of them — "which round did the prompt actually go out on, and
+    // did the script run that round or three rounds later" — could not be asked.
+    // `chars` is the whole length against the head's 300-char window: the round
+    // record's `promptChars`/`execChars` say a prompt went out, these two say
+    // what was in it, and neither is much use without the other.
+    // Drained here rather than read: the purpose belongs to the round that asked
+    // for it, so a later round with no prompt must not inherit one.
+    let purpose = state.last_prompt.take().map(|winner| winner.word());
     if let Some(text) = prompt {
-        crate::log::event("prompt_sent", json!({"head": crate::log::brief(text, 300)}));
+        crate::log::event(
+            "prompt_sent",
+            json!({
+                "round": turn.round_no,
+                "day": turn.day,
+                "purpose": purpose,
+                "chars": text.chars().count(),
+                "head": crate::log::brief(text, 300),
+            }),
+        );
     }
     if let Some(cmd) = execute_cmd {
-        crate::log::event("cmd_sent", json!({"head": crate::log::brief(cmd, 300)}));
+        crate::log::event(
+            "cmd_sent",
+            json!({
+                "round": turn.round_no,
+                "day": turn.day,
+                "chars": cmd.chars().count(),
+                "head": crate::log::brief(cmd, 300),
+            }),
+        );
     }
 }
 

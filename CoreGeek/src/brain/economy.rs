@@ -36,7 +36,11 @@ pub const DUSK_ROUND: i64 = 55;
 /// Safety margin: a mining trip must return this many rounds before dusk so
 /// the worker has time to walk through the gate and reach its post. A trip
 /// that arrives at R55 is a worker stuck outside the ring at nightfall.
-const DUSK_TRIP_MARGIN: i64 = 5;
+///
+/// Public because it is the day's own "time to walk home" — `day::far_edge_cutoff`
+/// measures the far shoulder's deadline with it rather than inventing a second
+/// margin that could drift from this one.
+pub const DUSK_TRIP_MARGIN: i64 = 5;
 
 /// Shop price of WeaponUpgradeVoucher1 — the funding goal of the main weapon.
 pub const WEAPON_VOUCHER1_PRICE: i64 = 100;
