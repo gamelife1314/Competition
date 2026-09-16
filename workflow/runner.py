@@ -1180,7 +1180,7 @@ def phase_improve(state):
         return True
 
     # --- 收集失败场次的诊断数据 ---
-    loss_battles = []
+    all_battles = []
     for pk_id in sorted(issue_pending_pks):
         pk_dir = LOGS_DIR / f"pk{pk_id}"
         meta_file = pk_dir / "meta.json"
@@ -1211,8 +1211,11 @@ def phase_improve(state):
 
         if our_score is not None and opp_score is not None:
             if our_score > opp_score:
-                continue  # 跳过胜利
-            result_cn = "负" if our_score < opp_score else "平"
+                result_cn = "胜"
+            elif our_score < opp_score:
+                result_cn = "负"
+            else:
+                result_cn = "平"
         else:
             continue
 
@@ -1232,35 +1235,38 @@ def phase_improve(state):
             except:
                 pass
 
-        loss_battles.append({
+        all_battles.append({
             "pk_id": pk_id,
             "opponent_name": opponent_name,
             "our_score": our_score,
             "opp_score": opp_score,
+            "result_cn": result_cn,
             "collect_text": collect_text,
             "coach_text": coach_text,
             "receipt": receipt,
         })
 
-    if not loss_battles:
-        log("  本批无失败场次，无需改进")
+    if not all_battles:
+        log("  本批无对战数据，无需改进")
         _improve_advance(state)
         return True
 
-    log(f"  本批 {len(loss_battles)} 场失败，生成改进方向 ...")
+    loss_count = sum(1 for b in all_battles if b["result_cn"] == "负")
+    win_count = sum(1 for b in all_battles if b["result_cn"] == "胜")
+    log(f"  本批 {len(all_battles)} 场（胜 {win_count} / 负 {loss_count}），生成改进方向 ...")
 
     # --- 生成改进方向摘要 ---
     improve_lines = []
     improve_lines.append(f"# 改进方向 — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-    improve_lines.append(f"本批 {len(loss_battles)} 场失败：\n")
-    for b in loss_battles:
+    improve_lines.append(f"本批 {len(all_battles)} 场（胜 {win_count} / 负 {loss_count}）：\n")
+    for b in all_battles:
         improve_lines.append(
-            f"- pk{b['pk_id']}: 负 {b['our_score']}:{b['opp_score']} vs {b['opponent_name']}\n"
+            f"- pk{b['pk_id']}: {b['result_cn']} {b['our_score']}:{b['opp_score']} vs {b['opponent_name']}\n"
         )
     improve_lines.append("\n## 各场诊断数据\n")
-    for b in loss_battles:
+    for b in all_battles:
         improve_lines.append(f"\n### pk{b['pk_id']} vs {b['opponent_name']}\n")
-        improve_lines.append(f"比分: {b['our_score']}:{b['opp_score']}\n")
+        improve_lines.append(f"比分: {b['our_score']}:{b['opp_score']} ({b['result_cn']})\n")
         if b["coach_text"]:
             improve_lines.append(f"\n**教练日志:**\n```\n{b['coach_text'][:2000]}\n```\n")
         if b["collect_text"]:
@@ -1275,8 +1281,8 @@ def phase_improve(state):
     # --- 构建给 codeagent 的 prompt ---
     # 只取前 3 场的摘要（避免 prompt 过长）
     summary_parts = []
-    for b in loss_battles[:3]:
-        part = f"pk{b['pk_id']} 负 {b['our_score']}:{b['opp_score']} vs {b['opponent_name']}"
+    for b in all_battles[:3]:
+        part = f"pk{b['pk_id']} {b['result_cn']} {b['our_score']}:{b['opp_score']} vs {b['opponent_name']}"
         if b["coach_text"]:
             # 取 coach 日志前 500 字符
             part += f"\n教练日志:\n{b['coach_text'][:500]}"
@@ -1287,21 +1293,23 @@ def phase_improve(state):
 
     battle_summary = "\n\n---\n\n".join(summary_parts)
 
-    prompt = f"""Based on the following battle analysis data from lost matches, improve the CoreGeek bot strategy code.
+    prompt = f"""Based on the following battle analysis data from recent matches (including both wins and losses), improve the CoreGeek bot strategy code.
 
-## Lost Battles Summary
+## Recent Battles Summary ({win_count} wins / {loss_count} losses)
 
 {battle_summary}
 
 ## Instructions
 
-1. Analyze the failure patterns from the coach logs and six-table data above
-2. Identify the top 1-2 most impactful improvements to the Rust strategy code in CoreGeek/src/
-3. Make the code changes directly — edit the relevant files
-4. Run `cargo build --release` to verify compilation
-5. Run `cargo test --release -p coregeek --lib --tests` to verify tests pass
-6. Do NOT create documentation files or add comments unless directly related to the fix
-7. Focus on strategy improvements: combat targeting, economy spending, night defense, task system
+1. Analyze the patterns from the coach logs and six-table data above — look at BOTH wins and losses
+2. For losses: identify what went wrong and how to fix it
+3. For wins: identify what worked well and whether the margin could be larger
+4. Identify the top 1-2 most impactful improvements to the Rust strategy code in CoreGeek/src/
+5. Make the code changes directly — edit the relevant files
+6. Run `cargo build --release` to verify compilation
+7. Run `cargo test --release -p coregeek --lib --tests` to verify tests pass
+8. Do NOT create documentation files or add comments unless directly related to the fix
+9. Focus on strategy improvements: combat targeting, economy spending, night defense, task system
 
 The code is a Rust game bot. Key files:
 - CoreGeek/src/brain/combat.rs — night combat targeting
@@ -1393,8 +1401,8 @@ Make the minimal effective change. Commit is not needed — the workflow will ha
     # --- git commit + push ---
     log("  提交改动 ...")
     run_cmd("git add -A", cwd=str(ROOT_DIR))
-    commit_msg = f"improve: auto-optimize based on {len(loss_battles)} lost battles (pk{loss_battles[0]['pk_id']}"
-    if len(loss_battles) > 1:
+    commit_msg = f"improve: auto-optimize based on {len(all_battles)} battles ({win_count}W/{loss_count}L, pk{all_battles[0]['pk_id']}"
+    if len(all_battles) > 1:
         commit_msg += f" etc"
     commit_msg += ")"
     code, _, commit_err = run_cmd(
@@ -1421,12 +1429,12 @@ Make the minimal effective change. Commit is not needed — the workflow will ha
         state["last_code_update_time"] = datetime.now().isoformat()
         log(f"  更新 last_commit: {new_commit[:12]}")
 
-    # --- 清理并进入 GOBATTLE ---
+    # --- 清理并进入 PULLCODE ---
     state["issue_pending_pks"] = []
-    state["phase"] = "GOBATTLE"
+    state["phase"] = "PULLCODE"
     state["gobattle_failures"] = 0
     state["no_update_count"] = 0
-    log("  IMPROVE 阶段完成，进入 GOBATTLE 发起挑战")
+    log("  IMPROVE 阶段完成，进入 PULLCODE 拉取代码并检查更新")
     save_state(state)
     return True
 

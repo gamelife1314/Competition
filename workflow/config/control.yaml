@@ -20,7 +20,7 @@ issue_submit_enabled: 0
 
 # IMPROVE 开关：1 = ANALYZE 后自动优化代码、编译、提交、发起挑战（默认打开）
 #              0 = 跳过自动改进，走 ISSUESUBMIT 流程
-improve_enabled: 0
+improve_enabled: 1
 
 # ==================== PULLCODE 阶段 ====================
 
@@ -36,10 +36,10 @@ battle_wait_timeout: 2100
 # ==================== GOBATTLE 阶段 ====================
 
 # 白天单次发起对战上限（挑战排名前 N 名队伍）
-max_battles_per_round: 32
+max_battles_per_round: 16
 
 # 夜间单次发起对战上限（夜间可以多发起）
-max_battles_per_round_night: 48
+max_battles_per_round_night: 2
 
 # 对战夜间时段（24 小时制，含起点不含终点，支持跨午夜）
 # 例如 20 ~ 10 表示 20:00 到次日 10:00 为夜间
