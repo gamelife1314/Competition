@@ -251,7 +251,7 @@ pub fn wall_daily_cap(day: i64, ring_ever_complete: bool, primary_open: usize) -
 /// rest for wall repair kits, medicine and upgrades — never all three slots
 /// at once (battle pk575557 spent 75g on three towers and had nothing left).
 pub fn tower_build_reserve(tower_count: usize, gap_count: usize) -> i64 {
-    ((3 - tower_count as i64).max(0)).min(gap_count as i64) * WEAPON_BUILD_COST
+    ((2 - tower_count as i64).max(0)).min(gap_count as i64) * WEAPON_BUILD_COST
 }
 
 pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
@@ -847,18 +847,19 @@ fn worker_day(
         // the day's plan would differ between two runs on the same board. The
         // coordinate tiebreak is the one the rest of the planner uses.
         doors.sort_by_key(|site| (chebyshev(role.pos, *site), site.x, site.y));
-        // Past the hard deadline the ring outranks the straggler: a role walled
-        // out can cut its way back in (the night recall's demolition hatch),
-        // while an open ring cannot be closed again before morning.
-        let forced = turn.in_day_round >= HARD_SEAL_ROUND;
+        // Doors are economy cuts, not structural gaps. A door that would trap
+        // a controller outside is left open: the controller walks through it
+        // instead of demolishing a wall cell that the last round can never
+        // re-wall (measured in day1_sim: R198 sealed the door at (12,26),
+        // the trapped controller demolished (11,26) at R198 and R200, and the
+        // R200 removal was never re-walled). Step 3's forced seal still
+        // closes structural gaps; doors are the one opening that is never
+        // forced.
         if let Some(site) = doors.into_iter().find(|site| {
             turn.is_land(*site)
                 && !claimed.contains(site)
-                // The designated gate is also the preferred door: if step 3
-                // already sealed it this round, `door_cells` still lists it —
-                // never wall a cell that already has our wall in it.
                 && !turn.walls().iter().any(|wall| wall.pos == *site)
-                && (forced || !wall_would_trap(turn, pairs, state, *site))
+                && !wall_would_trap(turn, pairs, state, *site)
         }) {
             claimed.insert(site);
             if chebyshev(role.pos, site) == 1 {
@@ -3368,9 +3369,96 @@ fn guns_stay_mannable(
     footprint: &[Pos],
     guns: &[Pos],
 ) -> bool {
-    let Some(gate) = gate else {
-        return true; // no anchor: not a verdict this test can make
+    // Only guns ON ring-1 (the corridor between station and wall ring) can
+    // block each other. A tower far from the station is outside the sealed
+    // shell and its controller operates from outside — it never participates
+    // in the corridor blocking that stranded tower 20040 in pk613040.
+    let ring1_guns: Vec<Pos> = guns
+        .iter()
+        .copied()
+        .filter(|gun| footprint_distance(*gun, footprint) == 1)
+        .collect();
+    if ring1_guns.is_empty() {
+        return true; // no gun in the corridor: nothing to block
+    }
+    // When the wall ring is not built yet (gate is None), the day's gate is
+    // undecided. Test against every ring-2 cell that could become the gate and
+    // accept only if at least one keeps every gun mannable — the wall crew
+    // chooses the gate, and a placement that works for SOME gate is safe if
+    // that gate is the one the crew leaves open.
+    let gates: Vec<Pos> = match gate {
+        Some(g) => vec![g],
+        None => ring_cells(footprint, 2)
+            .into_iter()
+            .filter(|pos| turn.is_land(*pos) && !blocked.contains(pos))
+            .collect(),
     };
+    if gates.is_empty() {
+        return true; // no ring-2 cell at all: not a verdict this test can make
+    }
+    // Operating cells (ring-1 neighbours) of each ring-1 gun. At dusk every
+    // gun's controller parks on one of these, and a cell with a controller on
+    // it is not passable for anyone else. Battle pk613040 lost tower 20040 for
+    // the entire night because the station's 2×2 footprint split the ring-1
+    // corridor into two halves, the controllers of the two guns in the other
+    // half blocked the only two passages, and the third gun's controller was
+    // sealed in a corner it could never leave.
+    //
+    // The check: does there exist an arrival order and stand assignment such
+    // that each controller can reach its stand from the gate when only the
+    // previously-arrived controllers' stands are blocked?
+    let gun_stands: Vec<Vec<Pos>> = ring1_guns
+        .iter()
+        .map(|gun| {
+            crate::model::neighbours(*gun)
+                .iter()
+                .copied()
+                .filter(|cell| {
+                    turn.is_land(*cell)
+                        && !blocked.contains(cell)
+                        && footprint_distance(*cell, footprint) <= 1
+                })
+                .collect()
+        })
+        .collect();
+    // A gun with no stands at all is never mannable.
+    if gun_stands.iter().any(|s| s.is_empty()) {
+        return false;
+    }
+    gates.iter().any(|&gate| {
+        // BFS from the gate through walkable cells (not blocked, not ring-2
+        // which is sealed at dusk). Each gun needs at least one stand in the
+        // reachable set — the operator can walk to it from the gate.
+        //
+        // This is deliberately simpler than an ordered-arrival assignment
+        // search: the `pick` closure already calls `guns_stay_mannable` a
+        // second time with the new gun's operator parked at a trial stand,
+        // which is the check that catches one operator's stand blocking
+        // another's path. Doing the full assignment here too rejects valid
+        // sites where the gate connects to ring-1 through a single cell that
+        // is also a gun's stand — the station footprint splits the corridor,
+        // and the search exhausts itself trying to assign that chokepoint to
+        // two guns at once, even though the operators arrive sequentially
+        // and the second walks through the first's stand before it is
+        // occupied.
+        let seen = bfs_reachable(turn, gate, blocked, footprint);
+        gun_stands.iter().all(|stands| {
+            stands.iter().any(|stand| {
+                *stand == gate || seen.contains(stand)
+            })
+        })
+    })
+}
+
+/// BFS from `gate` through cells that are walkable inside the sealed shell:
+/// land, not in `blocked`, and not at ring-2 distance (sealed at dusk, except
+/// the gate itself).
+fn bfs_reachable(
+    turn: &Turn,
+    gate: Pos,
+    blocked: &HashSet<Pos>,
+    footprint: &[Pos],
+) -> HashSet<Pos> {
     let walkable = |cell: Pos| {
         cell == gate
             || (turn.is_land(cell)
@@ -3389,11 +3477,7 @@ fn guns_stay_mannable(
             frontier.push(next);
         }
     }
-    guns.iter().all(|gun| {
-        crate::model::neighbours(*gun)
-            .iter()
-            .any(|stand| *stand != gate && seen.contains(stand))
-    })
+    seen
 }
 
 /// Would putting a tower on `site` strand a ROLE in the ring-1 corridor?

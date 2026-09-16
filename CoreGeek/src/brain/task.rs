@@ -667,7 +667,8 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     let left = state.task.timeout_round.saturating_sub(turn.round_no);
 
     prompt.push_str("请帮我写一段 shell 或 python 脚本，我会在沙盒环境中执行它。\n");
-    prompt.push_str("沙盒环境：可运行 shell 和 python3，不能联网。\n\n");
+    prompt.push_str("沙盒环境：可运行 shell 和 python3，不能联网。\n");
+    prompt.push_str("Please output all script comments, variable names, and text output in English to avoid character encoding issues.\n\n");
     prompt.push_str("任务描述：\n");
     prompt.push_str(&state.task.description);
     prompt.push_str("\n\n");
@@ -706,6 +707,12 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
         "read" => {
             prompt.push_str("根据上面的任务描述，写一段 shell 或 python 脚本读取任务内容。\n");
             prompt.push_str("脚本需要找到任务文件并完整读取它的内容。不要凭文件名猜答案，先读题，拿到内容之后下一轮再写脚本查数据。\n");
+            prompt.push_str("\n文件查找指南（按速度从快到慢）：\n");
+            prompt.push_str("- 优先使用 shell 的 find 命令：`find /tmp/selfEvolutionTask/ -type f`\n");
+            prompt.push_str("- 如果上面没找到，递归搜索当前目录：`find . -type f -name '*.txt' -o -name '*.json' -o -name '*.md'`\n");
+            prompt.push_str("- shell 优先于 python（find 比 os.walk 快得多），避免不加 -maxdepth 的全盘 find。\n");
+            prompt.push_str("- 找到文件后用 `cat` 读取全部内容，不要只看文件名猜答案。\n");
+            prompt.push_str("\n请用英文输出脚本中的注释和变量名，避免中文编码问题。\n");
             prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
         }
 
@@ -760,11 +767,12 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
             // for multiple rounds AFTER reading the task file.
             if state.task.no_answer_rounds > 0 {
                 prompt.push_str(&format!(
-                    "⚠ 已连续 {} 轮没有 ANSWER，剩余 {} 回合。不要再重读文件，直接根据已有结果计算并提交。\n",
+                    "上次执行完成但没有打印 `ANSWER:` 行。连续 {} 次没有答案，剩余 {} 回合。\n",
                     state.task.no_answer_rounds, left,
                 ));
+                prompt.push_str("不要再用 find 重复探索文件，直接根据已有结果计算并提交。\n");
                 if state.task.no_answer_rounds >= 2 {
-                    prompt.push_str("即使没把握也要提交最可能的值——写错有通过率，空手是 0 分。\n");
+                    prompt.push_str("本轮必须打印 ANSWER 行，即使没把握也要提交最可能的值——写错有通过率，空手是 0 分。\n");
                 }
                 prompt.push('\n');
             }
@@ -803,7 +811,7 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
             }
 
             if !state.task.rejection_feedback.is_empty() {
-                prompt.push_str("\n判题器原话反馈：\n");
+                prompt.push_str("\n判题器对你已提交答案的原话反馈：\n");
                 for feedback in &state.task.rejection_feedback {
                     prompt.push_str("- ");
                     prompt.push_str(&truncate(feedback, 300));

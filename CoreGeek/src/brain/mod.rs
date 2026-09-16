@@ -732,6 +732,15 @@ pub fn walk_or_remove_wall(
     if let Some(cmd) = walk_toward(turn, role, stands, claimed) {
         return Some(cmd);
     }
+    // On the very last day round, a wall cut here can never be re-walled —
+    // the next round is night and the seal step is done. The controller
+    // holds outside rather than opening a hole the night must keep. The
+    // unconditional night recall (night.rs) brings it in after dark.
+    // (Measured in day1_sim: R200 demolished (11,26), the removal was
+    // never re-walled, and the door stayed open all night.)
+    if turn.is_day && turn.in_day_round >= crate::model::DAY_ROUNDS - 1 {
+        return None;
+    }
     // A route that exists once this round's CLAIMS are ignored is a route
     // that exists next round: hold rather than tear a wall down for a
     // one-round collision with a teammate's reservation. Claims are intents

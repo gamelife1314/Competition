@@ -380,10 +380,10 @@ fn post_better(a: PostRank, b: PostRank) -> bool {
 fn post_upgrade(turn: &Turn, current: &Unit, candidate: &Unit) -> bool {
     let now = post_rank(turn, current);
     let new = post_rank(turn, candidate);
-    if new.exposure >= now.exposure + PIONEER_SAFE_MARGIN {
+    if new.exposure >= now.exposure.saturating_add(PIONEER_SAFE_MARGIN) {
         return true; // materially further from the enemy bearing
     }
-    if new.exposure + PIONEER_SAFE_MARGIN <= now.exposure {
+    if new.exposure.saturating_add(PIONEER_SAFE_MARGIN) <= now.exposure {
         return false; // materially closer to it: not worth the reach
     }
     new.short_range < now.short_range
