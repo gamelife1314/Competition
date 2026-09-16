@@ -841,6 +841,13 @@ impl BotState {
                 serde_json::json!({"channel": "news", "chars": turn.llm_resp.len()}),
             );
             news::on_llm_resp(self, turn.day, &turn.llm_resp);
+            // Merged prompt: if treasure was also awaiting (both asked in one
+            // prompt), process the treasure part of the response too.
+            if matches!(self.treasure.phase, TreasurePhase::AskedLlm { .. })
+                && self.treasure.phase != TreasurePhase::Done
+            {
+                crate::brain::treasure::on_llm_resp(self, &turn.llm_resp, turn.round_no);
+            }
             return;
         }
         if self.task.active {

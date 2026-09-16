@@ -45,7 +45,15 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::
         Err(_) => return Ok(json_response(EMPTY_RESPONSE)),
     };
 
+    // Print the platform request and our response to stdout so the user can
+    // see task processing results in real time.
+    if let Ok(text) = std::str::from_utf8(&body) {
+        println!("[REQ {} bytes] {}", body.len(), crate::log::brief(text, 500));
+    } else {
+        println!("[REQ {} bytes] <binary>", body.len());
+    }
     let out = brain::respond(&body);
+    println!("[RESP {} bytes] {}", out.len(), crate::log::brief(&out, 500));
     Ok(json_response(&out))
 }
 

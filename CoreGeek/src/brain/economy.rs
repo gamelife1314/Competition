@@ -310,11 +310,11 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     // 3. Station upgrade: survival score (score3 caps at 550). Ranked against
     //    the walls by HP per gold rather than by fiat.
     //
-    //    Offense-first (issues #201-#205): the station voucher sits at priority
-    //    0 only when weapons are maxed (3 towers, all L2); otherwise it is
-    //    priority 2, behind the weapon voucher (priority 0) and wall upgrades
-    //    (priority 1). Survival comes from killing enemies with firepower, not
-    //    from tanking with base HP — the base is the fallback, not the plan.
+    //    Parallel upgrades (user request): weapon → wall → station priority,
+    //    but all upgrading in parallel — don't max one before starting another.
+    //    Station goes to priority 0 when weapons are maxed, priority 1 (parallel
+    //    with walls) once at least one weapon is upgraded, and priority 2
+    //    (behind walls) before any weapon upgrade exists.
     if let Some(station) = turn.station() {
         let voucher = match station.level {
             1 => "StationUpgradeVoucher1",
@@ -324,7 +324,14 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         if !voucher.is_empty() && stock_of(turn, voucher) == 0 {
             let weapons_maxed = turn.towers().len() >= 3
                 && turn.towers().iter().all(|t| t.level >= 2);
-            let station_priority = if weapons_maxed { 0 } else { 2 };
+            let any_weapon_upgraded = turn.towers().iter().any(|t| t.level >= 2);
+            let station_priority = if weapons_maxed {
+                0
+            } else if any_weapon_upgraded {
+                1
+            } else {
+                2
+            };
             needs.push(upgrade_need(turn, voucher, 1, station_priority, latest(6)));
         }
     }
@@ -650,18 +657,16 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     let mut intents = intent_list(turn, state, reserve);
     let cashout = turn.in_day_round >= DUSK_ROUND - DUSK_CASHOUT_LEAD;
 
-    // Dusk weapon-voucher protection (issues #201-#205): if a
-    // WeaponUpgradeVoucher is still wanted and not yet in hand, every gold
-    // coin counts toward reaching its 100g price. Buying Medicine (10g) or
-    // WallFixer (10g) each round drained the purse from 96 to 36 while the
-    // voucher sat at the head of the list unaffordable — the team died with
-    // 64g it never converted to firepower, 3×L1 towers, 0 weapon upgrades.
+    // Dusk upgrade-voucher protection (issues #201-#205 + user request):
+    // During the cash-out window, if ANY upgrade voucher is still wanted but
+    // not yet in hand, consumables (Medicine/WallFixer) must not drain the
+    // purse below the voucher price. The team died with 64g and 0 weapon
+    // upgrades because 10g consumables reset the accumulation every round.
     //
-    // During the cash-out window we block consumable purchases that would push
-    // the purse below the weapon voucher price, so the collect→sell→buy loop
-    // can close the gap instead of being reset by a 10-gold bandage every
-    // round. Once the voucher IS in hand (or all weapons are maxed) the block
-    // lifts and consumables flow normally.
+    // "采集的矿石必须要能负担自己买的商品" — if you want a 100g voucher but only
+    // have 90g, don't buy junk; wait, accumulate, then convert to combat power
+    // before night. Once the voucher is in hand (or the upgrade is maxed) the
+    // block lifts and consumables flow normally.
     let weapon_voucher_pending = cashout
         && turn.towers().iter().any(|t| t.level < 2)
         && stock_of(turn, "WeaponUpgradeVoucher1") == 0
@@ -671,6 +676,29 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         .get("WeaponUpgradeVoucher1")
         .copied()
         .unwrap_or(100);
+    // Extend the guard to wall and station vouchers: any pending upgrade
+    // voucher blocks consumables from eating the fund.
+    let wall_voucher_pending = cashout
+        && turn.walls().len() >= RING_WALLS_FOR_UPGRADE
+        && (stock_of(turn, "WallUpgradeVoucher1") == 0 || stock_of(turn, "WallUpgradeVoucher2") == 0)
+        && turn.walls().iter().any(|w| w.level < 2);
+    let station_voucher_pending = cashout
+        && turn.station().map_or(false, |s| s.level < 3)
+        && (stock_of(turn, "StationUpgradeVoucher1") == 0 || stock_of(turn, "StationUpgradeVoucher2") == 0);
+    let any_voucher_pending = weapon_voucher_pending
+        || wall_voucher_pending
+        || station_voucher_pending;
+    // The highest-priority pending voucher price — consumables must not push
+    // the purse below this threshold.
+    let voucher_floor = if weapon_voucher_pending {
+        weapon_voucher_price
+    } else if wall_voucher_pending {
+        turn.weapon_shop.get("WallUpgradeVoucher1").copied().unwrap_or(20)
+    } else if station_voucher_pending {
+        turn.weapon_shop.get("StationUpgradeVoucher1").copied().unwrap_or(100)
+    } else {
+        0
+    };
 
     if cashout {
         // Dusk cash-out: rank by combat power per gold (descending), then by
@@ -706,13 +734,13 @@ pub fn shopping_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
         if price <= 0 || price == i64::MAX {
             continue;
         }
-        // Dusk weapon-voucher guard: skip consumables that would drain the
-        // purse below the voucher price while the voucher is still pending.
+        // Dusk upgrade-voucher guard: skip consumables that would drain the
+        // purse below the highest-priority pending voucher price.
         // "Cannot take it with you" — gold hoarded at dusk buys nothing if the
-        // base falls, so the weapon upgrade is the priority, not the bandage.
-        if weapon_voucher_pending && is_night_readiness(&need.name) {
+        // base falls, so the upgrade is the priority, not the bandage.
+        if any_voucher_pending && is_night_readiness(&need.name) {
             let gold_after = remaining - price * need.num;
-            if gold_after < weapon_voucher_price && remaining < weapon_voucher_price {
+            if gold_after < voucher_floor && remaining < voucher_floor {
                 continue;
             }
         }

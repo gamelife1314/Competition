@@ -280,6 +280,83 @@ pub fn build_prompt(day: i64, text: &str, keyword: &[Outlook], correction: Optio
     prompt
 }
 
+/// Merged prompt: asks BOTH the news price-trend question AND the treasure
+/// hunt question in one LLM call (user request: "用一个 prompt 向大模型发起
+/// 两个提问"). Fires on the day's first round when both consumers need an
+/// answer, saving one LLM round-trip and letting the treasure line start
+/// immediately instead of waiting for the news read to complete.
+pub fn build_merged_prompt(
+    day: i64,
+    news_text: &str,
+    keyword: &[Outlook],
+    news_correction: Option<&str>,
+    legends: &[(i64, String)],
+    treasure_correction_item: bool,
+    treasure_correction_time: bool,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("请回答以下两个问题，在一个 JSON 对象中返回全部答案。\n\n");
+
+    // --- Question 1: News → ore price trend ---
+    prompt.push_str("## 问题一：矿石价格走势\n");
+    prompt.push_str("以下是游戏世界中今天的官方新闻。请推理它对矿石价格走势的影响。\n");
+    prompt.push_str("矿石共三种：iron(铁)、stone(石)、copper(铜)。\n");
+    prompt.push_str(
+        "请对每种受影响的矿石给出：direction（rise 涨价 / fall 跌价 / flat 不变）、\
+         days（该走势预计持续几个游戏日，1-5）、confidence（0-100）。\n",
+    );
+    prompt.push_str(
+        "判据取自新闻本身：矿区停工、塌方、检修、减产、供应紧缺 → 涨；\
+         复产、复工、增产、供应充足、需求下降 → 跌。\n\
+         新闻与矿石价格无关时，outlooks 给空数组。\n",
+    );
+    prompt.push_str(&format!(
+        "\n新闻（第{day}天）：\n{}\n",
+        crate::log::brief(news_text, 600)
+    ));
+    if keyword.is_empty() {
+        prompt.push_str("\n关键词初判：这段文字里没有读出方向。\n");
+    } else {
+        prompt.push_str("\n关键词初判（仅供参考，你可以不同意）：\n");
+        for outlook in keyword {
+            prompt.push_str(&format!(
+                "  {} {} ({}%)\n",
+                outlook.ore,
+                direction_word(outlook.direction),
+                outlook.confidence
+            ));
+        }
+    }
+    if let Some(note) = news_correction {
+        prompt.push_str(&format!("\n注意：{note}\n"));
+    }
+
+    // --- Question 2: Treasure → altar position, items, opening day ---
+    prompt.push_str("\n## 问题二：宝藏祭坛推理\n");
+    prompt.push_str("以下是游戏世界中逐日流传的民间传闻，其中隐藏着一个祭坛宝藏的线索。\n");
+    prompt.push_str("请推理出：宝藏祭坛坐标（地图 41x32，原点左下角）、开启所需的献祭物品组合、以及宝藏开启的游戏日。\n");
+    prompt.push_str("可用献祭物品（英文名必须原样使用）：AcientTablet(古符石板), StarSand(星辰之沙), FlameBreath(烈焰之息), FrostPotion(寒霜药剂), ThornAmulet(荆棘护符), IronWhistle(回音铁哨)。\n");
+    prompt.push_str("献祭物品是多重集合：若线索指向同一种物品的多个（例如“门需三钥”指三件同类物品），请在 items 中重复列出该物品名。\n\n");
+    prompt.push_str("全部传闻：\n");
+    for (lday, text) in legends {
+        prompt.push_str(&format!("DAY{lday}: {}\n", crate::brain::task::truncate(text, 400)));
+    }
+    if treasure_correction_item {
+        prompt.push_str("\n注意：上次献祭的物品组合被判定错误（结果码3）。请重新审视传闻中关于物品数量与种类的全部细节，给出不同的组合。\n");
+    }
+    if treasure_correction_time {
+        prompt.push_str("\n注意：上次按你给出的坐标与物品献祭，被判定“无宝藏或宝藏暂未开启”（结果码2）。可能是坐标错误或开启时间未到，请重新推理祭坛位置与开启日。\n");
+    }
+
+    // --- Output format ---
+    prompt.push_str(
+        "\n只输出一个 JSON 对象，不要输出其它内容，格式：\n\
+         {\"outlooks\":[{\"ore\":\"iron\",\"direction\":\"rise\",\"days\":3,\"confidence\":80}],\
+         \"pos\":{\"x\":20,\"y\":16},\"items\":[\"StarSand\",\"IronWhistle\"],\"openDay\":5}\n",
+    );
+    prompt
+}
+
 /// What the model answered, or `None` when the answer is not a price reading.
 ///
 /// `None` is the fallback's trigger: the keyword scan's reading stands. An empty

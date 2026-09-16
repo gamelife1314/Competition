@@ -1298,6 +1298,71 @@ fn worker_day(
     }
 }
 
+/// Merged prompt: when BOTH the news read and the treasure ask want the
+/// round's prompt slot, send a single prompt that asks both questions (user
+/// request: "用一个 prompt 向大模型发起两个提问"). This saves one LLM
+/// round-trip and lets the treasure line start immediately instead of waiting
+/// for the news read to complete.
+///
+/// Returns `true` if a merged prompt was sent, `false` if either consumer
+/// doesn't need asking (in which case the individual `news::plan_prompt` /
+/// `treasure::plan_ask` calls handle it as before).
+fn plan_merged_prompt(turn: &Turn, state: &mut BotState, plan: &mut Plan) -> bool {
+    if plan.prompt.is_some() {
+        return false;
+    }
+    // Both consumers must want the slot.
+    let news_wants = state.news.wants_reading()
+        && state.official_seen.get(&turn.day).is_some();
+    let treasure_wants = state.treasure.phase == crate::state::TreasurePhase::Idle
+        && state.treasure.legends.len() >= 2
+        && turn.day >= 2;
+    if !(news_wants && treasure_wants) {
+        return false;
+    }
+    // Check the LLM budget via the News purpose (highest priority — never
+    // stood down).
+    if !state.request_prompt(crate::state::PromptPurpose::News, turn) {
+        return false;
+    }
+    // Build the merged prompt.
+    let news_text = state.official_seen.get(&turn.day).cloned().unwrap_or_default();
+    let keyword = news::price_outlook(turn.day, &news_text);
+    let news_correction = state.news.correction.clone();
+    let legends: Vec<(i64, String)> = state.treasure.legends.iter().cloned().collect();
+    let treasure_wrong_items = state.treasure.wrong_item_rounds > 0;
+    let treasure_time_feedback = state.treasure.time_feedback;
+
+    crate::log::event(
+        "merged_prompt_ask",
+        serde_json::json!({
+            "day": turn.day,
+            "round": turn.round_no,
+            "keyword": keyword.len(),
+            "legends": legends.len(),
+        }),
+    );
+    plan.prompt = Some(news::build_merged_prompt(
+        turn.day,
+        &news_text,
+        &keyword,
+        news_correction.as_deref(),
+        &legends,
+        treasure_wrong_items,
+        treasure_time_feedback,
+    ));
+    // Set BOTH phases to AskedLlm so both response handlers process the answer.
+    state.news.attempts += 1;
+    state.news.phase = news::ReadPhase::AskedLlm {
+        round: turn.round_no,
+    };
+    state.treasure.time_feedback = false;
+    state.treasure.phase = crate::state::TreasurePhase::AskedLlm {
+        round: turn.round_no,
+    };
+    true
+}
+
 fn pioneer_day(
     turn: &Turn,
     state: &mut BotState,
@@ -1321,18 +1386,23 @@ fn pioneer_day(
     // It sits above the recall on purpose: the news read is a team-level channel,
     // not a role command, so it costs the pioneer no movement — a day whose
     // pioneer is recalled at dawn is still a day whose mining is priced.
-    news::plan_prompt(turn, state, plan);
-    // The altar's ASK, in the same breath and for the same reason: the prompt
-    // slot is one per round and it is a property of the ROUND, not of whichever
-    // action the pioneer ends up taking. Leaving it at step 6 — below the task
-    // accept — meant a pioneer standing beside a task point returned before the
-    // ask was reached, so the plan (and with it `window_due`, which needs a plan
-    // to see a window at all) waited on a round the task line left free.
-    // 「顺序上不能固定」: the news still owns the slot when there is news
-    // (`request_prompt` refuses the treasure while the read is reserved); the
-    // treasure takes it when there is not; the task line is last and loses only
-    // the rounds those two need.
-    treasure::plan_ask(turn, state, plan);
+    // Merged prompt: when both news and treasure need asking, send one prompt
+    // with both questions (user request: "用一个 prompt 向大模型发起两个提问").
+    // Falls back to individual prompts when only one consumer needs the slot.
+    if !plan_merged_prompt(turn, state, plan) {
+        news::plan_prompt(turn, state, plan);
+        // The altar's ASK, in the same breath and for the same reason: the prompt
+        // slot is one per round and it is a property of the ROUND, not of whichever
+        // action the pioneer ends up taking. Leaving it at step 6 — below the task
+        // accept — meant a pioneer standing beside a task point returned before the
+        // ask was reached, so the plan (and with it `window_due`, which needs a plan
+        // to see a window at all) waited on a round the task line left free.
+        // 「顺序上不能固定」: the news still owns the slot when there is news
+        // (`request_prompt` refuses the treasure while the read is reserved); the
+        // treasure takes it when there is not; the task line is last and loses only
+        // the rounds those two need.
+        treasure::plan_ask(turn, state, plan);
+    }
 
     // 0. Dusk recall. The gate seal waits for EVERY role to be inside the ring,
     //    and the pioneer is the one role whose work — task points, treasure,

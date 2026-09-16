@@ -22,8 +22,9 @@ const ALL_ITEMS: [&str; 6] = [
 
 /// Gold that must survive a treasure-item purchase (P2-1). The summon is a
 /// gamble — result code 3 consumes the sacrifice items for nothing — so it
-/// may never eat the night's medicine money. Ten gold is one Medicine.
-const TREASURE_GOLD_FLOOR: i64 = 10;
+/// may never eat the night's medicine money. Fifteen gold covers one treasure
+/// item (user request: "必须把团队经济上预留 15 金币用于买东西开启宝藏").
+const TREASURE_GOLD_FLOOR: i64 = 15;
 
 /// Shop price assumed for a sacrifice item the shop has not quoted.
 const TREASURE_ITEM_PRICE: i64 = 15;
