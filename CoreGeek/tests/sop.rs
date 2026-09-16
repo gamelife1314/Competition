@@ -357,6 +357,7 @@ fn sop(task_type: &str, keywords: &[&str], template: &str) -> SopEntry {
     SopEntry {
         task_type: task_type.into(),
         keywords: keywords.iter().map(|kw| kw.to_string()).collect(),
+        description: format!("统计{}", keywords.join("、")),
         template: template.into(),
         ..Default::default()
     }

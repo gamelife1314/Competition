@@ -2040,6 +2040,7 @@ fn a_rejection_keeps_the_cached_sop_on_the_first_strike() {
     state.sop_cache.push(coregeek::state::SopEntry {
         task_type: "自进化类1".into(),
         keywords: vec!["count".into(), "files".into()],
+        description: "count files".into(),
         template: "ls | wc -l".into(),
         ..Default::default()
     });
@@ -2095,6 +2096,7 @@ fn the_used_template_is_evicted_only_on_the_second_consecutive_strike() {
     state.sop_cache.push(coregeek::state::SopEntry {
         task_type: "自进化类1".into(),
         keywords: vec!["count".into(), "files".into()],
+        description: "count files".into(),
         template: "ls | wc -l".into(),
         ..Default::default()
     });
@@ -2158,6 +2160,7 @@ fn a_confirmed_success_clears_the_templates_strikes() {
     state.sop_cache.push(coregeek::state::SopEntry {
         task_type: "自进化类1".into(),
         keywords: vec!["count".into(), "files".into()],
+        description: "count files".into(),
         template: "ls | wc -l".into(),
         rejections: 1,
         last_rejected: Some("ls | wc -l".into()),
@@ -3142,6 +3145,7 @@ fn sop(task_type: &str, description: &str, template: &str) -> coregeek::state::S
     coregeek::state::SopEntry {
         task_type: task_type.into(),
         keywords: coregeek::state::keywords_of(description),
+        description: description.into(),
         template: template.into(),
         ..Default::default()
     }

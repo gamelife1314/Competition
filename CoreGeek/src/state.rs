@@ -220,6 +220,9 @@ pub struct DiscoveredSchema {
 pub struct SopEntry {
     pub task_type: String,
     pub keywords: Vec<String>,
+    /// The original task description when this SOP was cached. Used for text
+    /// similarity matching (Jaro-Winkler) against new task descriptions.
+    pub description: String,
     /// The script that produced an answer. It is also the entry's cache key —
     /// every strike, eviction and `last_rejected` comparison is made against
     /// this string.
@@ -1416,6 +1419,7 @@ impl BotState {
         Some(SopEntry {
             task_type: self.task.task_type.clone(),
             keywords,
+            description: self.task.description.clone(),
             template: script,
             ..Default::default()
         })
@@ -1447,10 +1451,18 @@ impl BotState {
     /// reference. The LLM adapts it to the new task description instead of
     /// re-reading the task file and re-exploring from scratch.
     ///
-    /// Matching is by task FINGERPRINT — the same task type *and* a keyword
-    /// overlap of at least half the smaller keyword set — never by task type
-    /// alone. When the fingerprint is missing the caller falls back to a fresh
-    /// LLM call from scratch.
+    /// Matching is two-dimensional:
+    /// 1. **Text similarity** — Jaro-Winkler between the cached entry's
+    ///    description and the new description (via `strsim`). Tasks like
+    ///    "统计北京人口" and "统计上海人口" score ~0.95; unrelated tasks
+    ///    score < 0.7.
+    /// 2. **Keyword overlap** — at least 3 shared keywords, covering half
+    ///    the smaller set. Catches cases where the descriptions differ in
+    ///    phrasing but share the same core concepts.
+    ///
+    /// Both must pass. The entry with the highest text similarity wins.
+    const SOP_SIMILARITY_THRESHOLD: f64 = 0.7;
+
     pub fn find_sop(&self, task_type: &str, description: &str) -> Option<String> {
         let keywords = keywords_of(description);
         if keywords.is_empty() {
@@ -1460,19 +1472,28 @@ impl BotState {
             .iter()
             .rev()
             .filter(|entry| entry.task_type == task_type)
-            .map(|entry| {
+            .filter_map(|entry| {
+                // Text similarity: Jaro-Winkler between cached description
+                // and new description. High score = same task with different
+                // parameters (e.g., "北京" vs "上海").
+                let similarity = strsim::jaro_winkler(&entry.description, description);
+                if similarity < Self::SOP_SIMILARITY_THRESHOLD {
+                    return None;
+                }
+                // Keyword overlap: at least 3 shared keywords, covering
+                // half the smaller set. This catches phrasing differences.
                 let overlap = entry
                     .keywords
                     .iter()
                     .filter(|kw| keywords.contains(*kw))
                     .count();
-                (entry, overlap)
+                if !(overlap >= 3 && overlap * 2 >= entry.keywords.len().min(keywords.len())) {
+                    return None;
+                }
+                Some((entry, similarity, overlap))
             })
-            .filter(|(entry, overlap)| {
-                *overlap >= 3 && *overlap * 2 >= entry.keywords.len().min(keywords.len())
-            })
-            .max_by_key(|(_, overlap)| *overlap)
-            .and_then(|(entry, overlap)| {
+            .max_by_key(|(_, sim, _)| (*sim * 100.0) as usize)
+            .and_then(|(entry, similarity, overlap)| {
                 // Reuse with feedback, not blind replay: a template carrying a
                 // strike may run again only when binding produces DIFFERENT
                 // bytes — new parameters, new task input. Replaying the exact
@@ -1484,7 +1505,11 @@ impl BotState {
                 {
                     crate::log::event(
                         "sop_replay_skipped",
-                        serde_json::json!({"taskType": task_type, "overlap": overlap}),
+                        serde_json::json!({
+                            "taskType": task_type,
+                            "similarity": similarity,
+                            "overlap": overlap,
+                        }),
                     );
                     return None;
                 }
@@ -1492,6 +1517,7 @@ impl BotState {
                     "sop_reuse",
                     serde_json::json!({
                         "taskType": task_type,
+                        "similarity": similarity,
                         "overlap": overlap,
                         "bound": true,
                     }),
