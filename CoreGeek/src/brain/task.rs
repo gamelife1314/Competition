@@ -631,7 +631,7 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     let left = state.task.timeout_round.saturating_sub(turn.round_no);
 
     prompt.push_str("请帮我写一段 shell 或 python 脚本，我会在沙盒环境中执行它。\n");
-    prompt.push_str("沙盒环境：可运行 shell 和 python3，不能联网。任务文件在 /tmp/selfEvolutionTask/ 下（可能有多层子目录）。\n\n");
+    prompt.push_str("沙盒环境：可运行 shell 和 python3，不能联网。\n\n");
     prompt.push_str("任务描述：\n");
     prompt.push_str(&state.task.description);
     prompt.push_str("\n\n");
@@ -658,13 +658,8 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     match phase {
         // ---- Round 1: find and read the task file ----
         "read" => {
-            prompt.push_str("请写一段脚本：\n");
-            prompt.push_str("1. 用 `find /tmp/selfEvolutionTask/ -maxdepth 4 -type f` 找到任务文件。\n");
-            prompt.push_str("2. `cat` 完整读取任务文件内容。如果引用了其他文件（API_DOCS.md、spec.md、check 脚本等），也一并读取。\n");
-            prompt.push_str("3. 从文件内容中提取任务要求的输出字段，打印 `echo \"FIELDS: 字段1, 字段2\"`。\n");
-            prompt.push_str("4. 如果文件声明了输出结构，打印 `echo \"SCHEMA: <原文JSON>\"`。\n");
-            prompt.push_str("\n本轮不需要打印 ANSWER——先读题，下一轮再根据文件内容查询数据。\n");
-            prompt.push_str("不要凭文件名猜内容（`task_1_beijing` 不代表答案是「北京世界遗产 7 个」）。\n");
+            prompt.push_str("根据上面的任务描述，写一段 shell 或 python 脚本读取任务内容。\n");
+            prompt.push_str("脚本需要找到任务文件并完整读取它的内容。不要凭文件名猜答案，先读题，拿到内容之后下一轮再写脚本查数据。\n");
             prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
         }
 
