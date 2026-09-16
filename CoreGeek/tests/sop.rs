@@ -130,10 +130,12 @@ fn a_command_the_sandbox_ran_is_reused_even_when_its_answer_was_rejected() {
         Some("ls | wc -l"),
         "the command that answered is the one the sandbox ran"
     );
+    // Only a successful task caches its script: a wrong answer is not reusable,
+    // and replaying it for a different task of the same kind poisons the cache.
     state.finish_task(false, "timeout");
     assert!(
-        !state.sop_cache.is_empty(),
-        "a script the sandbox ran is worth reusing next task"
+        state.sop_cache.is_empty(),
+        "a rejected answer is not cached: only success earns the SOP"
     );
 
     // A session whose only verdicts were refusals caches nothing.
@@ -420,7 +422,9 @@ fn sop_reuse_requires_a_matching_fingerprint_not_just_the_type() {
 }
 
 #[test]
-fn cached_sop_runs_without_an_llm_round_trip() {
+fn cached_sop_triggers_llm_with_reuse_context() {
+    // The new SOP flow: a cached script is passed to the LLM as reference.
+    // The LLM adapts it to the new task, rather than replaying it directly.
     let turn = turn_from(task_world(6));
     let mut state = BotState::default();
     state.task.active = true;
@@ -440,11 +444,17 @@ fn cached_sop_runs_without_an_llm_round_trip() {
     let mut plan = Plan::default();
     coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
 
-    let cmd = plan.execute_cmd.expect("the cached script is executed");
-    assert!(cmd.contains("上海"), "bound at execution time: {cmd}");
     assert!(
-        plan.prompt.is_none(),
-        "a reused SOP must not spend an LLM call"
+        plan.prompt.is_some(),
+        "SOP reuse triggers an LLM call with the cached script as reference"
+    );
+    assert!(
+        plan.execute_cmd.is_none(),
+        "no direct execution: the LLM writes the adapted script"
+    );
+    assert!(
+        state.task.sop_reuse_script.is_some(),
+        "the cached script is stored for the prompt"
     );
 }
 
@@ -1443,24 +1453,17 @@ fn what_the_judger_receives_is_always_a_json_document() {
 }
 
 // ---------------------------------------------------------------------------
-// P1-3: the two-stage SOP — an explore template and an answer template.
+// SOP reuse: a cached script is passed to the LLM as reference, not replayed
+// directly. The LLM adapts it to the new task description.
 // ---------------------------------------------------------------------------
 
 use coregeek::state::keywords_of;
 
-/// A cached pair: `explore` reconnaissance in front of the answering script.
-fn sop_pair(task_type: &str, description: &str, explore: &str, answer: &str) -> SopEntry {
-    SopEntry {
-        task_type: task_type.into(),
-        keywords: keywords_of(description),
-        template: answer.into(),
-        explore: Some(explore.into()),
-        ..Default::default()
-    }
-}
-
 #[test]
-fn a_cached_pair_runs_the_exploration_before_the_answer() {
+fn a_cached_sop_triggers_an_llm_call_with_reuse_context() {
+    // The new SOP flow: find a cached script → set sop_reuse_script → build a
+    // prompt that includes the cached script as reference. The LLM adapts it
+    // instead of re-reading the task file from scratch.
     let turn = turn_from(task_world(6));
     let mut state = BotState::default();
     state.task.active = true;
@@ -1468,91 +1471,41 @@ fn a_cached_pair_runs_the_exploration_before_the_answer() {
     state.task.accepted_round = 6;
     state.task.timeout_round = 260;
     state.task.task_type = "自进化类1".into();
-    state.task.description = "任务：统计城市名：北京 的人口".into();
+    state.task.description = "任务：统计城市名：北京 的人口排名".into();
     state.task.stage = TaskStage::Planning;
-    state.sop_cache.push(sop_pair(
+    state.sop_cache.push(sop(
         "自进化类1",
-        "统计城市名：北京 的人口",
-        "find /tmp/selfEvolutionTask -maxdepth 4",
+        &["城市名", "人口", "统计", "排名"],
         "python3 report.py --city {{城市名}}",
     ));
 
     let pioneer = turn.role_by_id(10011).unwrap();
     let mut plan = Plan::default();
     coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
-    assert_eq!(
-        plan.execute_cmd.as_deref(),
-        Some("find /tmp/selfEvolutionTask -maxdepth 4"),
-        "stage 1 is the reconnaissance, not the answer"
+    assert!(
+        plan.prompt.is_some(),
+        "SOP reuse triggers an LLM call, not direct replay"
     );
-    assert!(plan.prompt.is_none(), "no LLM call: the pair is cached");
+    assert!(
+        plan.execute_cmd.is_none(),
+        "no direct execution: the LLM writes the adapted script"
+    );
     assert_eq!(
-        state.task.sop_pending_answer.as_deref(),
-        Some("python3 report.py --city 北京"),
-        "stage 2 is bound and queued behind it"
+        state.task.sop_reuse_script.as_deref(),
+        Some("python3 report.py --city {{城市名}}"),
+        "the cached script is stored for the prompt to include"
     );
     assert_eq!(
         state.task.sop_used_template.as_deref(),
         Some("python3 report.py --city {{城市名}}"),
-        "a later rejection is charged to the entry that ran"
-    );
-
-    // The reconnaissance came back without an answer — which is what
-    // reconnaissance does. The queued answer goes out next, still with no LLM
-    // round trip: 2 rounds, not a replay of the whole exploration.
-    coregeek::brain::task::on_cmd_result(
-        &mut state,
-        "[exitCode:0]\nFIELDS: city, population\n(no answer yet)",
-    );
-    assert!(matches!(state.task.stage, TaskStage::Planning));
-    assert_eq!(state.task.discovered_fields, vec!["city", "population"]);
-
-    let mut plan = Plan::default();
-    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
-    assert_eq!(
-        plan.execute_cmd.as_deref(),
-        Some("python3 report.py --city 北京"),
-        "stage 2 answers"
-    );
-    assert!(plan.prompt.is_none(), "still no LLM round trip");
-    assert!(
-        state.task.sop_pending_answer.is_none(),
-        "the queued answer is consumed exactly once"
+        "a later rejection is charged to the entry that matched"
     );
 }
 
 #[test]
-fn a_pair_without_an_exploration_still_runs_in_one_command() {
-    // The single-script SOP is unchanged: a pair whose session answered with
-    // its first command has no stage 1, and the answer goes out immediately.
-    let turn = turn_from(task_world(6));
-    let mut state = BotState::default();
-    state.task.active = true;
-    state.task.session_id = 1;
-    state.task.accepted_round = 6;
-    state.task.timeout_round = 260;
-    state.task.task_type = "自进化类1".into();
-    state.task.description = "任务：统计城市名：上海 的人口排名".into();
-    state.task.stage = TaskStage::Planning;
-    state.sop_cache.push(sop(
-        "自进化类1",
-        &["城市名", "人口", "统计", "排名"],
-        "echo {{城市名}}",
-    ));
-
-    let pioneer = turn.role_by_id(10011).unwrap();
-    let mut plan = Plan::default();
-    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
-    assert_eq!(plan.execute_cmd.as_deref(), Some("echo 上海"));
-    assert!(state.task.sop_pending_answer.is_none());
-}
-
-#[test]
-fn a_session_that_explored_before_answering_caches_the_pair() {
-    // The cache is built from evidence, not from a guess about which command
-    // "looks like" reconnaissance: `cmd_history` is in send order, and the
-    // command immediately before the one that answered is the exploration that
-    // made it possible.
+fn a_session_that_answered_caches_the_script() {
+    // cache_sop stores the script that produced the answer. No separate
+    // explore stage is cached — the LLM adapts the answer script directly.
     let mut state = BotState::default();
     state.task.active = true;
     state.task.session_id = 1;
@@ -1569,14 +1522,10 @@ fn a_session_that_explored_before_answering_caches_the_pair() {
     state.cache_sop();
 
     assert_eq!(state.sop_cache.len(), 1);
-    assert_eq!(
-        state.sop_cache[0].explore.as_deref(),
-        Some("find /tmp/selfEvolutionTask -maxdepth 4")
-    );
     assert_eq!(state.sop_cache[0].template, "python3 report.py --city 北京");
 
-    // A session that answered with its FIRST command explored nothing separate:
-    // there is no stage 1 to replay, and inventing one would be a guess.
+    // A session that answered with its FIRST command: same behavior, the
+    // answering script is the template.
     let mut state = BotState::default();
     state.task.active = true;
     state.task.session_id = 2;
@@ -1586,44 +1535,13 @@ fn a_session_that_explored_before_answering_caches_the_pair() {
     state.task.best_answer = "2200".into();
     state.task.sop_cmd = Some("python3 report.py --city 北京".into());
     state.cache_sop();
-    assert_eq!(state.sop_cache[0].explore, None);
+    assert_eq!(state.sop_cache[0].template, "python3 report.py --city 北京");
 }
 
 #[test]
-fn an_unbindable_exploration_still_lets_the_answer_run() {
-    // Stage 1 is an optimisation. If its parameters cannot be resolved from the
-    // new description, the answer script alone is still the fast path — failing
-    // the whole pair would throw away a perfectly good answer script.
-    let turn = turn_from(task_world(6));
-    let mut state = BotState::default();
-    state.task.active = true;
-    state.task.session_id = 1;
-    state.task.accepted_round = 6;
-    state.task.timeout_round = 260;
-    state.task.task_type = "自进化类1".into();
-    state.task.description = "任务：统计城市名：北京 的人口排名".into();
-    state.task.stage = TaskStage::Planning;
-    state.sop_cache.push(sop_pair(
-        "自进化类1",
-        "统计城市名：北京 的人口排名",
-        "cat /tmp/{{不存在的参数}}/task.md",
-        "echo {{城市名}}",
-    ));
-
-    let pioneer = turn.role_by_id(10011).unwrap();
-    let mut plan = Plan::default();
-    coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan);
-    assert_eq!(
-        plan.execute_cmd.as_deref(),
-        Some("echo 北京"),
-        "the answer script alone is used when stage 1 cannot be bound"
-    );
-}
-
-#[test]
-fn a_rejected_pair_is_still_evicted_entry_by_entry() {
-    // P1-3 keeps the existing per-entry strike eviction: the pair is charged
-    // like any other SOP, and two consecutive strikes evict exactly that entry.
+fn a_rejected_sop_is_still_evicted_entry_by_entry() {
+    // Per-entry strike eviction: a rejection charges the used template, and
+    // two consecutive strikes evict exactly that entry.
     let mut state = BotState::default();
     state.task.active = true;
     state.task.session_id = 1;
@@ -1634,10 +1552,9 @@ fn a_rejected_pair_is_still_evicted_entry_by_entry() {
     state.task.stage = TaskStage::WaitingSubmit { attempts: 0 };
     state.task.sop_used_template = Some("python3 report.py --city {{城市名}}".into());
     state.task.cmd_history = vec!["python3 report.py --city 北京".into()];
-    state.sop_cache.push(sop_pair(
+    state.sop_cache.push(sop(
         "自进化类1",
-        "统计城市名：北京 的人口",
-        "find /tmp/selfEvolutionTask -maxdepth 4",
+        &["城市名", "人口", "统计"],
         "python3 report.py --city {{城市名}}",
     ));
 
@@ -1662,14 +1579,13 @@ fn a_rejected_pair_is_still_evicted_entry_by_entry() {
     state.observe(&rejected(7));
     assert_eq!(state.sop_cache.len(), 1, "one strike keeps the entry");
     assert_eq!(state.sop_cache[0].rejections, 1);
-    assert_eq!(state.sop_cache[0].explore.is_some(), true);
 
     state.task.stage = TaskStage::WaitingSubmit { attempts: 0 };
     state.task.sop_used_template = Some("python3 report.py --city {{城市名}}".into());
     state.observe(&rejected(8));
     assert!(
         state.sop_cache.is_empty(),
-        "a second consecutive strike evicts the pair, exploration included"
+        "a second consecutive strike evicts the entry"
     );
 }
 

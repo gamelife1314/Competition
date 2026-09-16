@@ -341,34 +341,13 @@ pub fn plan_pioneer(
             None
         }
         TaskStage::Planning => {
-            // STAGE 2 OF A TWO-STAGE SOP (P1-3). A pair that carried an
-            // exploration script when it was cached queued its answer behind
-            // it; this is that answer, taken the round the exploration has
-            // finished. Checked before the fast path so a fresh `find_sop`
-            // cannot restart the exploration the pair just completed.
-            if let Some(answer) = state.task.sop_pending_answer.take() {
-                state.task.stage = TaskStage::HavePlan { cmd: answer };
-                return plan_pioneer(turn, state, pioneer, plan);
-            }
-            // SOP fast path: a cached pair whose fingerprint matches this task
-            // AND whose parameters bind to this description runs first.
-            if state.task.cmd_history.is_empty() {
-                if let Some(pair) = state.find_sop(&state.task.task_type, &state.task.description) {
-                    // A later rejection is charged against exactly the entry
-                    // that ran (P1-3), so remember which template produced
-                    // these bytes.
-                    state.task.sop_used_template = Some(pair.template);
-                    state.task.stage = match pair.explore {
-                        // Stage 1 first, answer queued behind it: the second
-                        // task of a kind costs 2–3 rounds instead of a replay
-                        // of the whole exploration.
-                        Some(explore) => {
-                            state.task.sop_pending_answer = Some(pair.answer);
-                            TaskStage::HavePlan { cmd: explore }
-                        }
-                        None => TaskStage::HavePlan { cmd: pair.answer },
-                    };
-                    return plan_pioneer(turn, state, pioneer, plan);
+            // SOP fast path: a cached script from a similar task is given to
+            // the LLM as reference. The LLM adapts it to this task instead of
+            // re-reading the task file and re-exploring from scratch.
+            if state.task.sop_reuse_script.is_none() && state.task.cmd_history.is_empty() {
+                if let Some(template) = state.find_sop(&state.task.task_type, &state.task.description) {
+                    state.task.sop_used_template = Some(template.clone());
+                    state.task.sop_reuse_script = Some(template);
                 }
             }
             if plan.prompt.is_none() && state.request_prompt(PromptPurpose::Task, turn) {
@@ -638,8 +617,16 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
 
     // ---- Determine what this round should do ----
 
-    let phase = if has_rejection {
+    let has_sop = state.task.sop_reuse_script.is_some();
+    let has_schema_issues = !state.task.schema_gaps.is_empty()
+        || !state.task.schema_extras.is_empty();
+    let phase = if has_rejection || has_schema_issues {
         "fix"
+    } else if has_sop && !has_results {
+        // We have a cached script from a similar task. Skip the read phase
+        // and go straight to solving: give the LLM the old script + new
+        // question, let it adapt.
+        "reuse"
     } else if !has_results {
         // Round 1: no command has been run yet. The task description says
         // "请阅读 task_X.md" — so the first script should find and cat it.
@@ -660,6 +647,21 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
         "read" => {
             prompt.push_str("根据上面的任务描述，写一段 shell 或 python 脚本读取任务内容。\n");
             prompt.push_str("脚本需要找到任务文件并完整读取它的内容。不要凭文件名猜答案，先读题，拿到内容之后下一轮再写脚本查数据。\n");
+            prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
+        }
+
+        // ---- SOP reuse: cached script from a similar task ----
+        "reuse" => {
+            if let Some(script) = &state.task.sop_reuse_script {
+                prompt.push_str("我之前遇到过类似的任务，当时用的脚本是：\n\n");
+                prompt.push_str("```\n");
+                prompt.push_str(script);
+                prompt.push_str("\n```\n\n");
+            }
+            prompt.push_str("请根据上面的任务描述和这个脚本，写一段新的脚本来完成本次任务。\n");
+            prompt.push_str("- 可以复用脚本的结构和逻辑，修改其中与任务相关的参数（城市名、日期、文件路径等）。\n");
+            prompt.push_str("- 答案必须由脚本实时计算，不能从训练数据猜测。\n");
+            prompt.push_str("- 最后一行打印 `echo \"ANSWER: <结果>\"`，多字段用 JSON。\n");
             prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
         }
 
@@ -752,12 +754,16 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
             prompt.push_str("- 命令开头已自动加好 locale 和 CRLF 修复。\n");
         }
 
-        // ---- Answer was rejected: fix it ----
+        // ---- Answer was rejected or has schema issues: fix it ----
         "fix" => {
-            prompt.push_str(&format!(
-                "之前提交的答案被判错 {} 次，上次答案：{}。\n\n",
-                state.task.rejections, state.task.best_answer
-            ));
+            if state.task.rejections > 0 {
+                prompt.push_str(&format!(
+                    "之前提交的答案被判错 {} 次，上次答案：{}。\n\n",
+                    state.task.rejections, state.task.best_answer
+                ));
+            } else if !state.task.best_answer.is_empty() {
+                prompt.push_str(&format!("上次答案：{}。\n\n", state.task.best_answer));
+            }
 
             if !state.task.schema_gaps.is_empty() {
                 prompt.push_str(&format!(
@@ -772,11 +778,13 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
                 ));
             }
 
-            prompt.push_str("\n判题器原话反馈：\n");
-            for feedback in &state.task.rejection_feedback {
-                prompt.push_str("- ");
-                prompt.push_str(&truncate(feedback, 300));
-                prompt.push('\n');
+            if !state.task.rejection_feedback.is_empty() {
+                prompt.push_str("\n判题器原话反馈：\n");
+                for feedback in &state.task.rejection_feedback {
+                    prompt.push_str("- ");
+                    prompt.push_str(&truncate(feedback, 300));
+                    prompt.push('\n');
+                }
             }
 
             // Feed back the last command output for context.

@@ -164,11 +164,11 @@ pub struct TaskSession {
     /// SOP fast path. A rejection is charged against exactly this entry
     /// (P1-3) — never against templates that did not run.
     pub sop_used_template: Option<String>,
-    /// Stage 2 of a two-stage SOP (P1-3): the cached answer script queued
-    /// behind the reconnaissance command the pair ran first. Consumed on the
-    /// next planning round, so a session that took the fast path runs
-    /// `explore` → `answer` and never re-enters the exploration.
-    pub sop_pending_answer: Option<String>,
+    /// A cached script from a previous successful task of the same kind, shown
+    /// to the LLM as reference so it can adapt the script to this task instead
+    /// of re-reading the task file and re-exploring from scratch. Set once at
+    /// session open by `find_sop`; cleared when the session ends.
+    pub sop_reuse_script: Option<String>,
     /// Consecutive sandbox runs that returned without an `ANSWER:` line.
     ///
     /// The population issues #113-#115 are made of: sessions that spent their
@@ -212,51 +212,24 @@ pub struct DiscoveredSchema {
     pub required: Vec<String>,
 }
 
-/// A cached SOP bound to a live task, with both stages resolved.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SopMatch {
-    /// The cache key of the entry that matched (`SopEntry::template`). A later
-    /// rejection is charged against exactly this entry.
-    pub template: String,
-    /// Stage 1 — reconnaissance. Runs first; `answer` is queued behind it.
-    pub explore: Option<String>,
-    /// Stage 2 — the script that produced an answer last time.
-    pub answer: String,
-}
-
 /// A cached, parameterised script for one task fingerprint. The body keeps
 /// `{{name}}` placeholders where the values that differ between two tasks of
-/// the same kind go, so replaying it on a *different* task cannot silently
-/// reuse the old task's inputs.
+/// the same kind go, so the LLM can see what to change when adapting it to a
+/// new task of the same kind.
 #[derive(Debug, Clone, Default)]
 pub struct SopEntry {
     pub task_type: String,
     pub keywords: Vec<String>,
-    /// Stage 2 of the pair: the script that produced an answer. It is also the
-    /// entry's cache key — every strike, eviction and `last_rejected` comparison
-    /// is made against this string.
+    /// The script that produced an answer. It is also the entry's cache key —
+    /// every strike, eviction and `last_rejected` comparison is made against
+    /// this string.
     pub template: String,
-    /// Stage 1 of the pair (P1-3): the reconnaissance command the cached
-    /// session ran BEFORE the one that answered.
-    ///
-    /// A task of a kind we have never seen is explored in full — the sandbox
-    /// has to be searched, the task file found and the output schema read
-    /// before any answer exists. Once a session has done that work, the words
-    /// it did it with are as reusable as the answer script: replaying the
-    /// reconnaissance first (one cached command, no LLM round trip) and then
-    /// the answer gives the second task of that kind a 2–3 round session
-    /// instead of a repeat of the whole exploration. `None` when the session
-    /// answered with its first command — there is no separate exploration to
-    /// replay then, and the answer script alone is the whole pair.
-    pub explore: Option<String>,
-    /// Consecutive rejections charged against answers this template produced
-    /// (P1-3). One strike keeps the entry — reuse with feedback, because a
-    /// single rejection can be the task's input differing, not the script's
-    /// logic; the second consecutive strike evicts it. A template whose
-    /// answer was never judged wrong is never touched, and a rejection earned
-    /// by an LLM-written script is never charged to a template that did not
-    /// run — the old behaviour wiped every template of the type on any
-    /// rejection, which is how good SOPs kept dying with bad tasks.
+    /// Consecutive rejections charged against answers this template produced.
+    /// One strike keeps the entry — reuse with feedback, because a single
+    /// rejection can be the task's input differing, not the script's logic;
+    /// the second consecutive strike evicts it. A template whose answer was
+    /// never judged wrong is never touched, and a rejection earned by an
+    /// LLM-written script is never charged to a template that did not run.
     pub rejections: i32,
     /// The bound script the judger last rejected. Reuse is only allowed when
     /// binding produces DIFFERENT bytes (new parameters, new task input):
@@ -273,26 +246,6 @@ impl SopEntry {
     /// question confidently.
     pub fn bind(&self, description: &str) -> Option<String> {
         bind_template(&self.template, description)
-    }
-
-    /// Bind BOTH stages of the pair to a new task (P1-3).
-    ///
-    /// `None` when the answer script cannot be bound — the pair is then
-    /// unusable and the LLM takes the task, exactly as before. An `explore`
-    /// stage that cannot be bound is dropped rather than failing the pair: it
-    /// is an optimisation, and answering from the cached answer script alone is
-    /// still the fast path. A template WITHOUT placeholders binds verbatim, so
-    /// a pair cached from a task whose inputs never varied still replays.
-    pub fn bind_pair(&self, description: &str) -> Option<SopMatch> {
-        let answer = self.bind(description)?;
-        Some(SopMatch {
-            template: self.template.clone(),
-            explore: self
-                .explore
-                .as_ref()
-                .and_then(|template| bind_template(template, description)),
-            answer,
-        })
     }
 }
 
@@ -1460,25 +1413,10 @@ impl BotState {
         if keywords.is_empty() {
             return None;
         }
-        // Stage 1 is whatever the session ran BEFORE the command that
-        // answered (P1-3). `cmd_history` is in send order and holds one entry
-        // per command the sandbox actually ran, so the command immediately
-        // before the answering one is the reconnaissance that made it
-        // possible — the `find`/`cat` round that read the task file and printed
-        // the schema. A session that answered with its first command has none,
-        // and the pair is then just the answer script.
-        let explore = self
-            .task
-            .cmd_history
-            .iter()
-            .rposition(|command| *command == script)
-            .filter(|index| *index > 0)
-            .map(|index| self.task.cmd_history[index - 1].clone());
         Some(SopEntry {
             task_type: self.task.task_type.clone(),
             keywords,
             template: script,
-            explore,
             ..Default::default()
         })
     }
@@ -1505,15 +1443,15 @@ impl BotState {
         }
     }
 
-    /// A cached script bound to `description`, ready to execute.
+    /// A cached script template for a similar task, to be passed to the LLM as
+    /// reference. The LLM adapts it to the new task description instead of
+    /// re-reading the task file and re-exploring from scratch.
     ///
     /// Matching is by task FINGERPRINT — the same task type *and* a keyword
     /// overlap of at least half the smaller keyword set — never by task type
-    /// alone. The same type covers tasks whose inputs differ, and replaying
-    /// the wrong one produces a confidently wrong answer, which costs the
-    /// whole task reward. When the fingerprint or a parameter binding is
-    /// missing the caller falls back to a fresh LLM call.
-    pub fn find_sop(&self, task_type: &str, description: &str) -> Option<SopMatch> {
+    /// alone. When the fingerprint is missing the caller falls back to a fresh
+    /// LLM call from scratch.
+    pub fn find_sop(&self, task_type: &str, description: &str) -> Option<String> {
         let keywords = keywords_of(description);
         if keywords.is_empty() {
             return None;
@@ -1535,14 +1473,14 @@ impl BotState {
             })
             .max_by_key(|(_, overlap)| *overlap)
             .and_then(|(entry, overlap)| {
-                let pair = entry.bind_pair(description)?;
-                // Reuse with feedback, not blind replay (P1-3): a template
-                // carrying a strike may run again only when binding produced
-                // DIFFERENT bytes — new parameters, new task input. Replaying
-                // the exact script the judger already rejected is the same
-                // wrong answer with extra steps, so the LLM takes this one.
+                // Reuse with feedback, not blind replay: a template carrying a
+                // strike may run again only when binding produces DIFFERENT
+                // bytes — new parameters, new task input. Replaying the exact
+                // script the judger already rejected is the same wrong answer
+                // with extra steps, so the LLM takes this one.
+                let bound = entry.bind(description)?;
                 if entry.rejections > 0
-                    && entry.last_rejected.as_deref() == Some(pair.answer.as_str())
+                    && entry.last_rejected.as_deref() == Some(bound.as_str())
                 {
                     crate::log::event(
                         "sop_replay_skipped",
@@ -1556,13 +1494,9 @@ impl BotState {
                         "taskType": task_type,
                         "overlap": overlap,
                         "bound": true,
-                        // P1-3: whether this reuse is the compressed two-stage
-                        // path or the single-script one is the whole question
-                        // "did the pair actually save the exploration".
-                        "staged": pair.explore.is_some(),
                     }),
                 );
-                Some(pair)
+                Some(entry.template.clone())
             })
     }
 
