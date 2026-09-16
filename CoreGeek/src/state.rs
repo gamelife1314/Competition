@@ -1544,6 +1544,17 @@ impl BotState {
             && self.official_seen.contains_key(&turn.day)
     }
 
+    /// Is the altar's window the round's business (P2-3)?
+    ///
+    /// The treasure's own predicate, asked with the pioneer this round actually
+    /// has: `summonTreasure` is a pioneer action (`validate` admits it for no
+    /// other kind), so a board with no pioneer has no race to run.
+    fn treasure_race_on(&self, turn: &Turn) -> bool {
+        turn.pioneer()
+            .map(|pioneer| crate::brain::treasure::window_due(turn, self, pioneer))
+            .unwrap_or(false)
+    }
+
     /// Take the round's prompt on behalf of `purpose`, if it may have it.
     ///
     /// The ranking is the owner's, and each step is where it is for a reason
@@ -1570,6 +1581,12 @@ impl BotState {
     /// the ARGUMENT: a lower purpose is refused while a higher one still has an
     /// ask to make today.
     ///
+    /// The order is not a constant (「顺序上不能固定」). The altar's window moves
+    /// it: while `treasure::window_due` holds — the window is open, or the
+    /// shopping for it has to happen now — the task line is stood down
+    /// entirely, and the same fact moves the ACTIONS in `day::pioneer_day`.
+    /// See the clause-by-clause comment in the body.
+    ///
     /// The budget itself is unchanged: 接口文档's three calls per game day, and
     /// calls made while a self-evolution session is running are neither limited
     /// nor counted — so a session's own request is always granted, exactly as
@@ -1579,7 +1596,33 @@ impl BotState {
         if !free_window && !self.is_prompt_free() {
             return false;
         }
-        if purpose != PromptPurpose::News && self.news_read_reserved(turn) {
+        // THE RANKING IS A FUNCTION OF THE ROUND, NOT A CHAIN.
+        //
+        // 「顺序上不能固定」 — the owner, re-reading 任务书. Each purpose is stood
+        // down only while the ones above it actually have this round's business,
+        // and each clause below is that condition rather than a fixed position:
+        //
+        // * **News** is never stood down. It prices every vein the crew walks to
+        //   this afternoon (「价格趋势直接决定了我们采集哪些矿，至关重要」) and it
+        //   costs the pioneer no movement, so it does not compete with the altar
+        //   — it runs alongside it, in a channel the altar does not use.
+        // * **Treasure** is stood down only by an unread day's news, which is
+        //   what it has always been. It holds nothing while its own window is
+        //   live: the line only asks before it has a plan (`Idle`), and a plan
+        //   is what a window is made of, so the round that matters most to the
+        //   treasure is one it does not spend a prompt on.
+        // * **Task** waits for both — 「自进化任务可以晚点接」 — and it also waits
+        //   while the altar's window is due: 「宝藏只能召唤一次要抢」. A session
+        //   advanced now is the session `day::pioneer_day` abandons for the
+        //   altar in this same round, and a task point comes back after its
+        //   30-round refresh while the altar does not come back at all. The two
+        //   cannot disagree, because they read the same predicate.
+        let stood_down = match purpose {
+            PromptPurpose::News => false,
+            PromptPurpose::Treasure => self.news_read_reserved(turn),
+            PromptPurpose::Task => self.news_read_reserved(turn) || self.treasure_race_on(turn),
+        };
+        if stood_down {
             return false;
         }
         if !free_window {

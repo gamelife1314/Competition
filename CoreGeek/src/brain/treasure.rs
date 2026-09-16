@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use crate::brain::task::truncate;
+use crate::brain::{economy, task::truncate};
 use crate::brain::Plan;
 use crate::model::{chebyshev, Turn, Unit};
 use crate::protocol::{Pos, RoleCommand};
@@ -126,6 +126,145 @@ pub fn holds_altar(turn: &Turn, state: &BotState, pioneer: &Unit) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The window: 「宝藏只能召唤一次要抢」
+// ---------------------------------------------------------------------------
+//
+// 任务书 5.2: 一张地图宝藏只有一个, 宝藏地点/开启条件/开启时间 all have to be
+// inferred, a legal summon CONSUMES the offering whatever the outcome, and
+// 「若同一回合内双方均满足宝藏开启条件并且都正确使用了召唤宝藏指令，则双方均获得
+// 宝藏奖励」. Every one of those is a reason the window is a RACE and not an
+// errand: a round the pioneer spends on something else is a round the opponent
+// can take the altar in, and there is no second altar.
+//
+// The planner had no urgency at all — `plan_pioneer` walks and summons, and
+// nothing anywhere said "now". Worse, `day::pioneer_day` reaches the task
+// accept before it reaches the treasure, so a pioneer that took a
+// self-evolution task on the opening day did not arrive late; it never went.
+// `window_due` is the missing urgency, and it is measured in the pioneer's own
+// walk rather than in a round number chosen by hand.
+
+/// Day-rounds of working daylight left in the current day.
+///
+/// `in_day_round` is 0-based over `ROUNDS_PER_DAY` and `economy::DUSK_ROUND` is
+/// where the day's errands stop: from dusk the recall owns the evening and the
+/// pioneer is already walking home, so a walk that cannot finish before it is a
+/// walk the night takes back.
+fn daylight_left(turn: &Turn) -> i64 {
+    (economy::DUSK_ROUND - turn.in_day_round).max(0)
+}
+
+/// The sacrifice the pioneer still has to buy: one `(name, count)` per distinct
+/// item it is short of. Items are a MULTISET — 任务书 5.2's 不能多、不能少 is
+/// checked by the judger — so the count is per name, not per list entry.
+fn missing_items(pioneer: &Unit, plan: &TreasurePlan) -> Vec<(String, i64)> {
+    let mut missing: Vec<(String, i64)> = Vec::new();
+    for item in &plan.items {
+        if missing.iter().any(|(name, _)| name == item) {
+            continue;
+        }
+        let need = plan.items.iter().filter(|other| *other == item).count() as i64;
+        let have = pioneer.count_item(item) as i64;
+        if have < need {
+            missing.push((item.clone(), need - have));
+        }
+    }
+    missing
+}
+
+/// The nearest cell the pioneer can shop from — the same stand set
+/// `plan_pioneer` buys from, so the two cannot disagree about where the counter
+/// is.
+fn nearest_shop_stand(turn: &Turn, from: Pos) -> Option<Pos> {
+    turn.weapon_shops()
+        .iter()
+        .flat_map(|shop| crate::model::neighbours(*shop))
+        .filter(|pos| turn.is_land(*pos))
+        .min_by_key(|pos| (chebyshev(from, *pos), pos.x, pos.y))
+}
+
+/// Rounds the pioneer needs to be standing beside the altar with the sacrifice
+/// in its pack, from where it stands now: the walk, or — when the offering is
+/// short — the detour through the counter.
+fn rounds_to_summon(turn: &Turn, pioneer: &Unit, plan: &TreasurePlan) -> i64 {
+    let missing = missing_items(pioneer, plan);
+    if missing.is_empty() {
+        return chebyshev(pioneer.pos, plan.pos) as i64;
+    }
+    match nearest_shop_stand(turn, pioneer.pos) {
+        Some(shop) => {
+            chebyshev(pioneer.pos, shop) as i64
+                + missing.len() as i64
+                + chebyshev(shop, plan.pos) as i64
+        }
+        // No counter on the board: what the pioneer carries is all there is.
+        None => chebyshev(pioneer.pos, plan.pos) as i64,
+    }
+}
+
+/// Rounds of SHOPPING the sacrifice still owes: the walk to the counter and one
+/// round per kind bought. `0` when the pack already holds the offering.
+///
+/// This is the half of the errand that survives the night. The dusk recall
+/// walks the pioneer home, so a step taken toward the altar today is a step it
+/// takes again tomorrow; the items in its pack are the only progress that is
+/// still there in the morning.
+fn shopping_rounds(turn: &Turn, pioneer: &Unit, plan: &TreasurePlan) -> i64 {
+    let missing = missing_items(pioneer, plan);
+    if missing.is_empty() {
+        return 0;
+    }
+    match nearest_shop_stand(turn, pioneer.pos) {
+        Some(shop) => chebyshev(pioneer.pos, shop) as i64 + missing.len() as i64,
+        None => 0,
+    }
+}
+
+/// Is the altar's window open — or close enough that walking there NOW is the
+/// difference between taking the treasure and losing it?
+///
+/// The horizon is a WALK measured against the daylight that is left, because
+/// the night is a wall: the dusk recall walks the pioneer home, so a step taken
+/// toward the altar today is a step it takes again tomorrow and the only
+/// progress the night does not undo is the offering in its pack. Two arms fall
+/// out of that, and both are the pioneer's own numbers rather than a round
+/// count chosen by hand:
+///
+/// * **The window is open** (`open_day` has arrived). Due while the whole
+///   errand — the counter trip included (`rounds_to_summon`) — still fits in
+///   the daylight that is left before the recall (`daylight_left`). A live
+///   window is therefore due from the first round of its opening day, which is
+///   the point: 任务书 5.2's same-round rule means the opponent's summon can
+///   land on any of those rounds.
+/// * **The eve of it** (`open_day` is tomorrow). Due while the sacrifice is
+///   still short and the counter trip fits in the daylight that is left
+///   (`shopping_rounds`): buying the offering is the one part of the errand
+///   that has to happen BEFORE the window rather than in it, and the day before
+///   is the last day on which it can happen at all. A window further out is not
+///   imminent — nothing the pioneer does today would still be true tomorrow —
+///   so those days leave the task line alone.
+///
+/// `Idle` is deliberately not due: a `code 3` verdict drops the plan, so the
+/// line has no altar to race for and the round belongs to the re-ask. `Done` is
+/// the treasure taken — or emptied by the other side, which is the same thing
+/// from here — or the line out of attempts.
+pub fn window_due(turn: &Turn, state: &BotState, pioneer: &Unit) -> bool {
+    if !matches!(
+        state.treasure.phase,
+        TreasurePhase::HavePlan | TreasurePhase::Summoned { .. }
+    ) {
+        return false;
+    }
+    let Some(plan) = &state.treasure.plan else {
+        return false;
+    };
+    if turn.day >= plan.open_day {
+        return rounds_to_summon(turn, pioneer, plan) <= daylight_left(turn);
+    }
+    let shopping = shopping_rounds(turn, pioneer, plan);
+    plan.open_day - turn.day == 1 && shopping >= 1 && shopping <= daylight_left(turn)
+}
+
 /// Consume a fresh `llmResp` addressed to the treasure hunt.
 pub fn on_llm_resp(state: &mut BotState, resp: &str, round_no: i64) {
     if !matches!(state.treasure.phase, TreasurePhase::AskedLlm { .. }) {
@@ -220,6 +359,56 @@ fn build_prompt(state: &BotState) -> String {
     prompt
 }
 
+/// The ASK half of the treasure line, split out of `plan_pioneer` so it can be
+/// ranked by position instead of by accident.
+///
+/// The question is the same one, in the same window, on the same budget. What
+/// changed (「顺序上不能固定」) is where it sits: as step 6's first arm it sat
+/// BELOW the task accept in `day::pioneer_day`, and `next_task_point` returns a
+/// command the moment a point is acceptable — so a pioneer standing beside a
+/// task point swallowed the round before the ask was ever reached. That does
+/// not just delay the answer; the ask is the only thing that produces a plan,
+/// and a plan is what `window_due` needs to see a window at all. The line could
+/// be held off the altar by a task point it was never going to finish.
+///
+/// `day::pioneer_day` now calls this immediately after `news::plan_prompt`, so
+/// the ranking the prompt slot has always had is the ranking the round actually
+/// applies: the day's price trend when there is a trend to read (the news read
+/// reserves the slot and `request_prompt` refuses the treasure behind it), the
+/// altar when there is not, the task line last — and the task line loses only
+/// the rounds those two need, because the ask is made once per plan.
+///
+/// It issues no command and moves nobody. The ACTIONS stay in `plan_pioneer`.
+pub fn plan_ask(turn: &Turn, state: &mut BotState, plan: &mut Plan) {
+    // A response lost to an LLM error: allow a re-ask later. Folding the stale
+    // reset into the same call is deliberate — the reset alone would hand the
+    // round back to whatever else wanted the slot, and the re-ask would wait on
+    // the same accident that swallowed the first one.
+    if let TreasurePhase::AskedLlm { round } = state.treasure.phase {
+        if turn.round_no.saturating_sub(round) > 4 && state.treasure.ask_attempts < 3 {
+            state.treasure.phase = TreasurePhase::Idle;
+        }
+    }
+    if state.treasure.phase != TreasurePhase::Idle {
+        return;
+    }
+    // Day 1 is excluded (P2-1): the first day belongs to the wall ring and the
+    // towers, and a legend is still arriving every morning — an answer inferred
+    // from one more day of clues is an answer that does not burn 15-gold
+    // sacrifices on a wrong guess (code 3).
+    let enough = state.treasure.legends.len() >= 2 && turn.day >= 2;
+    // The budget and the ranking both live in `request_prompt`. Outside a task
+    // session the ask needs a free slot of the day's three; inside one the
+    // channel is free and uncounted.
+    if enough && plan.prompt.is_none() && state.request_prompt(PromptPurpose::Treasure, turn) {
+        plan.prompt = Some(build_prompt(state));
+        state.treasure.time_feedback = false;
+        state.treasure.phase = TreasurePhase::AskedLlm {
+            round: turn.round_no,
+        };
+    }
+}
+
 /// Pioneer behaviour for the treasure hunt. Returns a movement/action command
 /// or None when the pioneer has nothing treasure-related to do this round.
 pub fn plan_pioneer(
@@ -231,33 +420,13 @@ pub fn plan_pioneer(
 ) -> Option<RoleCommand> {
     match state.treasure.phase.clone() {
         TreasurePhase::Done => None,
-        TreasurePhase::Idle => {
-            // Ask the LLM once we have enough legends and spare budget. Day 1
-            // is excluded (P2-1): the first day belongs to the wall ring and
-            // the towers, and a legend is still arriving every morning — an
-            // answer inferred from one more day of clues is an answer that
-            // does not burn 15-gold sacrifices on a wrong guess (code 3).
-            let enough = state.treasure.legends.len() >= 2 && turn.day >= 2;
-            // The budget and the ranking both live in `request_prompt`: this is
-            // where the treasure sits in 「民间传闻」 — second, behind the day's
-            // price trend and ahead of the task line, and unchanged from what it
-            // has always had otherwise (outside a task session it needs a free
-            // slot of the day's three; the window it asks in is the same one).
-            if enough && plan.prompt.is_none() && state.request_prompt(PromptPurpose::Treasure, turn)
-            {
-                plan.prompt = Some(build_prompt(state));
-                state.treasure.time_feedback = false;
-                state.treasure.phase = TreasurePhase::AskedLlm {
-                    round: turn.round_no,
-                };
-            }
-            None
-        }
-        TreasurePhase::AskedLlm { round } => {
-            // Response lost (LLM error etc.): allow a re-ask later.
-            if turn.round_no.saturating_sub(round) > 4 && state.treasure.ask_attempts < 3 {
-                state.treasure.phase = TreasurePhase::Idle;
-            }
+        // Both prompt-side phases live in `plan_ask`, which `day::pioneer_day`
+        // runs above the task accept. Delegating rather than duplicating keeps
+        // this function correct for a caller that reaches it first — the ask is
+        // idempotent (`plan.prompt.is_none()` and the phase change), so the
+        // second call in a round is a no-op.
+        TreasurePhase::Idle | TreasurePhase::AskedLlm { .. } => {
+            plan_ask(turn, state, plan);
             None
         }
         TreasurePhase::Summoned { round } => {
@@ -274,22 +443,10 @@ pub fn plan_pioneer(
         TreasurePhase::HavePlan => {
             let treasure_plan = state.treasure.plan.clone()?;
             // 1. Collect the sacrifice items (multiset: buy the missing COUNT
-            //    per distinct item, not just one).
-            let mut missing: Vec<(String, i64)> = Vec::new();
-            for item in &treasure_plan.items {
-                if missing.iter().any(|(name, _)| name == item) {
-                    continue;
-                }
-                let need = treasure_plan
-                    .items
-                    .iter()
-                    .filter(|other| *other == item)
-                    .count() as i64;
-                let have = pioneer.count_item(item) as i64;
-                if have < need {
-                    missing.push((item.clone(), need - have));
-                }
-            }
+            //    per distinct item, not just one). The same list `window_due`
+            //    prices the countdown with, so the urgency and the errand can
+            //    never disagree about what is still owed.
+            let missing = missing_items(pioneer, &treasure_plan);
             if !missing.is_empty() {
                 let shops = turn.weapon_shops();
                 let stand = shops

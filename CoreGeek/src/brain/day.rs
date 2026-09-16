@@ -1251,18 +1251,30 @@ fn pioneer_day(
     // The day's news goes to the model before anything else may ask for the
     // round's prompt (P1-1).
     //
-    // POSITION IS THE PRIORITY. `plan.prompt` is one slot per round and the
-    // first writer owns the call, so the owner's ranking is enforced twice: here,
-    // where the news asks before the task line (step 1) and the treasure (step
-    // 6) can get to it, and in `BotState::request_prompt`, where a lower purpose
-    // is refused while the news still has an ask to make today. The owner's
-    // words: 「价格趋势直接决定了我们采集哪些矿，至关重要」, 「自进化任务可以晚点
-    // 接」.
+    // POSITION IS THE PRIORITY, and it is a priority over the ROUND, not over
+    // the actions. `plan.prompt` is one slot per round and the first writer owns
+    // the call, so the owner's ranking is enforced twice: here, where the news
+    // and then the altar's ask take the slot before the task line's actions can
+    // reach step 4 at all, and in `BotState::request_prompt`, where a lower
+    // purpose is refused while a higher one still has an ask to make today. The
+    // owner's words: 「价格趋势直接决定了我们采集哪些矿，至关重要」, 「自进化任务
+    // 可以晚点接」, 「顺序上不能固定」.
     //
     // It sits above the recall on purpose: the news read is a team-level channel,
     // not a role command, so it costs the pioneer no movement — a day whose
     // pioneer is recalled at dawn is still a day whose mining is priced.
     news::plan_prompt(turn, state, plan);
+    // The altar's ASK, in the same breath and for the same reason: the prompt
+    // slot is one per round and it is a property of the ROUND, not of whichever
+    // action the pioneer ends up taking. Leaving it at step 6 — below the task
+    // accept — meant a pioneer standing beside a task point returned before the
+    // ask was reached, so the plan (and with it `window_due`, which needs a plan
+    // to see a window at all) waited on a round the task line left free.
+    // 「顺序上不能固定」: the news still owns the slot when there is news
+    // (`request_prompt` refuses the treasure while the read is reserved); the
+    // treasure takes it when there is not; the task line is last and loses only
+    // the rounds those two need.
+    treasure::plan_ask(turn, state, plan);
 
     // 0. Dusk recall. The gate seal waits for EVERY role to be inside the ring,
     //    and the pioneer is the one role whose work — task points, treasure,
@@ -1285,6 +1297,14 @@ fn pioneer_day(
     //    walk straight back out — the same two-cell oscillation §2.4 measured on
     //    the workers, on the one role whose work is always outside the ring.
     let recalled = dusk_committed(state, turn, pioneer, pioneer_recall_round(turn, pioneer));
+    // Is the altar's window this round's business (P2-3)? One computation, read
+    // in the three places 「顺序上不能固定」 moves: the session it takes the
+    // pioneer off, the altar step it puts above the task accept, and the task
+    // accept it stands down. `window_due` is the treasure's own predicate —
+    // measured in the pioneer's walk, see `treasure::window_due` — and `!recalled`
+    // is the unchanged dusk constraint on top of it: the window does not outrank
+    // being home before nightfall.
+    let altar_due = !recalled && treasure::window_due(turn, state, pioneer);
     // A session that has produced nothing at all after `MAX_STERILE_ROUNDS` is
     // not converging, and the pioneer is worth more on the wall line than on a
     // point nothing is coming out of (issue #15's lesson; issue #26 lost the
@@ -1319,6 +1339,28 @@ fn pioneer_day(
             }),
         );
         state.finish_task(false, "dusk_recall");
+    }
+    // 1. THE ONE-SHOT RACE (P2-3). The altar is the one thing on the board that
+    //    does not come back: 任务书 5.2 — 一张地图宝藏只有一个, a legal summon
+    //    consumes the offering whatever the outcome, and a round spent elsewhere
+    //    is a round the opponent can take it in. A self-evolution session is the
+    //    opposite: 5.3 puts the point back after a 30-round refresh and pays its
+    //    own reward. So a session still running when the window opens is
+    //    ABANDONED for the altar rather than finished — the pioneer is leaving
+    //    the point either way (「离开己方任务点周围一格内」 ends the task), and the
+    //    only choice left is whether it leaves for the treasure or for nothing.
+    if state.task.active && altar_due {
+        crate::log::event(
+            "task_defense_abort",
+            serde_json::json!({
+                "round": turn.round_no,
+                "session": state.task.session_id,
+                "task_kind": state.task.kind.as_str(),
+                "dayRound": turn.in_day_round,
+                "reason": "treasure_race",
+            }),
+        );
+        state.finish_task(false, "treasure_race");
     }
     if state.task.active {
         if let Some(cmd) = task::plan_pioneer(turn, state, pioneer, plan) {
@@ -1393,10 +1435,36 @@ fn pioneer_day(
             }
         }
     }
+    // 3b. THE ALTAR, while its window is live (P2-3). This step exists because
+    //     the order used to be fixed: the task accept (step 4) sat above the
+    //     treasure (step 6) and `next_task_point` returns a command the moment a
+    //     point is acceptable, so a pioneer that took a task on the altar's
+    //     opening day never summoned at all. It did not arrive a round late, it
+    //     never went. 「顺序上不能固定」 — while the window is due, the altar is
+    //     the errand and the task point waits.
+    //
+    //     Below the tower lock on purpose. `preposition_round` (step 3) is what
+    //     puts an operator behind a gun before nightfall, and that is a hard
+    //     constraint: the night recall is its backstop, not its plan. The race
+    //     is also won in the morning — `window_due` measures the walk against
+    //     the daylight that is left, so a window still worth running is one the
+    //     pioneer reaches long before its post comes due — and a pioneer that
+    //     has already locked to its gun has a window it cannot win anyway.
+    if altar_due {
+        if let Some(cmd) = treasure::plan_pioneer(turn, state, pioneer, claimed, plan) {
+            plan.push(pioneer.id, cmd);
+            return;
+        }
+        if treasure::holds_altar(turn, state, pioneer) {
+            return;
+        }
+    }
     // 4. Accept a fresh task when a point is ready (walk there first). Not
     //    once the dusk recall has fired: a task accepted now is a task that
-    //    keeps the pioneer at the point through the seal.
-    if !recalled {
+    //    keeps the pioneer at the point through the seal. And not while the
+    //    altar's window is due (step 3b): a session is fifteen rounds at a point
+    //    the window is about to make the wrong place to stand.
+    if !recalled && !altar_due {
         if let Some(cmd) = state.next_task_point(turn, pioneer, claimed) {
             plan.push(pioneer.id, cmd);
             return;
