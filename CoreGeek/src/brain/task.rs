@@ -616,96 +616,85 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     prompt.push_str("\n\n");
 
     // ---- Determine what this round should do ----
+    //
+    // Three phases:
+    //   read  — first command: find and read the task file, extract FIELDS/SCHEMA
+    //   solve — has execution results: compute the answer from sandbox data
+    //   fix   — answer rejected or schema mismatch: fix the missing/wrong parts
+    //
+    // SOP reuse is not a separate phase: when a cached script exists, it is
+    // shown as context in whichever phase we're in.
 
-    let has_sop = state.task.sop_reuse_script.is_some();
     let has_schema_issues = !state.task.schema_gaps.is_empty()
         || !state.task.schema_extras.is_empty();
     let phase = if has_rejection || has_schema_issues {
         "fix"
-    } else if has_sop && !has_results {
-        // We have a cached script from a similar task. Skip the read phase
-        // and go straight to solving: give the LLM the old script + new
-        // question, let it adapt.
-        "reuse"
     } else if !has_results {
-        // Round 1: no command has been run yet. The task description says
-        // "请阅读 task_X.md" — so the first script should find and cat it.
         "read"
-    } else if !has_fields {
-        // We ran a command but didn't get FIELDS yet. The task file may have
-        // been printed but the model didn't extract fields from it, or the
-        // find/cat failed. Either way: read the file and extract fields.
-        "extract"
     } else {
-        // We have the task file content and know the output fields. Now
-        // write a script to actually compute the answer from sandbox data.
         "solve"
     };
 
+    // SOP reuse context: if we have a cached script from a similar task,
+    // show it to the LLM as reference regardless of phase.
+    if let Some(script) = &state.task.sop_reuse_script {
+        prompt.push_str("我之前遇到过类似的任务，当时用的脚本是：\n\n");
+        prompt.push_str("```\n");
+        prompt.push_str(script);
+        prompt.push_str("\n```\n\n");
+        prompt.push_str("可以参考这个脚本的结构和逻辑，但请根据本次任务的实际需求写新的脚本。\n\n");
+    }
+
     match phase {
-        // ---- Round 1: find and read the task file ----
+        // ---- First command: read the task file ----
         "read" => {
-            prompt.push_str("根据上面的任务描述，写一段 shell 或 python 脚本读取任务内容。\n");
-            prompt.push_str("脚本需要找到任务文件并完整读取它的内容。不要凭文件名猜答案，先读题，拿到内容之后下一轮再写脚本查数据。\n");
-            prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
-        }
-
-        // ---- SOP reuse: cached script from a similar task ----
-        "reuse" => {
-            if let Some(script) = &state.task.sop_reuse_script {
-                prompt.push_str("我之前遇到过类似的任务，当时用的脚本是：\n\n");
-                prompt.push_str("```\n");
-                prompt.push_str(script);
-                prompt.push_str("\n```\n\n");
-            }
-            prompt.push_str("请根据上面的任务描述和这个脚本，写一段新的脚本来完成本次任务。\n");
-            prompt.push_str("- 可以复用脚本的结构和逻辑，修改其中与任务相关的参数（城市名、日期、文件路径等）。\n");
-            prompt.push_str("- 答案必须由脚本实时计算，不能从训练数据猜测。\n");
-            prompt.push_str("- 最后一行打印 `echo \"ANSWER: <结果>\"`，多字段用 JSON。\n");
-            prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
-        }
-
-        // ---- Ran a command but no FIELDS extracted yet ----
-        "extract" => {
-            prompt.push_str("上次执行结果：\n");
-            let start = state.task.result_history.len().saturating_sub(2);
-            for (offset, result) in state.task.result_history[start..].iter().enumerate() {
-                let is_last = start + offset + 1 == state.task.result_history.len();
-                let cap = if is_last {
-                    RESULT_CONTEXT_LAST
-                } else {
-                    RESULT_CONTEXT_PREVIOUS
-                };
-                prompt.push_str(&truncate(result, cap));
+            // If a previous command ran but didn't produce FIELDS, feed back
+            // the result so the LLM can fix the script.
+            if !state.task.result_history.is_empty() {
+                prompt.push_str("上次执行结果：\n");
+                let start = state.task.result_history.len().saturating_sub(2);
+                for (offset, result) in state.task.result_history[start..].iter().enumerate() {
+                    let is_last = start + offset + 1 == state.task.result_history.len();
+                    let cap = if is_last {
+                        RESULT_CONTEXT_LAST
+                    } else {
+                        RESULT_CONTEXT_PREVIOUS
+                    };
+                    prompt.push_str(&truncate(result, cap));
+                    prompt.push('\n');
+                }
                 prompt.push('\n');
             }
-            prompt.push_str("\n请根据上面的执行结果，写一段脚本：\n");
-            prompt.push_str("- 如果任务文件内容已经打印出来，从中提取输出字段并打印 `echo \"FIELDS: ...\"` 和 `echo \"SCHEMA: ...\"`。\n");
-            prompt.push_str("- 如果还没找到/读到任务文件，用 `find` + `cat` 找到并读取它。\n");
-            prompt.push_str("- 如果上次命令报错（路径不存在、权限拒绝等），修正路径或方法后重试。\n");
-            prompt.push_str("\n本轮不需要打印 ANSWER。\n");
+
+            prompt.push_str("根据上面的任务描述，写一段 shell 或 python 脚本读取任务内容。\n");
+            prompt.push_str("- 找到任务文件并完整读取它的内容。\n");
+            prompt.push_str("- 从任务文件中提取输出字段，用 `echo \"FIELDS: 字段1, 字段2\"` 打印。\n");
+            prompt.push_str("- 如果任务文件声明了输出结构（JSON Schema），用 `echo \"SCHEMA: <原文JSON>\"` 打印。\n");
+            prompt.push_str("- 不要凭文件名猜答案，先读题，拿到内容之后下一轮再写脚本查数据。\n");
             prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
         }
 
-        // ---- Task file read, fields known: compute the answer ----
+        // ---- Has execution results: compute the answer ----
         "solve" => {
-            prompt.push_str(&format!(
-                "任务文件已读完，输出字段：{}。\n\n",
-                state.task.discovered_fields.join("、")
-            ));
+            if has_fields {
+                prompt.push_str(&format!(
+                    "任务文件已读完，输出字段：{}。\n\n",
+                    state.task.discovered_fields.join("、")
+                ));
 
-            if let Some(schema) = &state.task.discovered_schema {
-                if !schema.fields.is_empty() {
-                    let required = if schema.required.is_empty() {
-                        schema.fields.clone()
-                    } else {
-                        schema.required.clone()
-                    };
-                    prompt.push_str(&format!(
-                        "输出结构：字段 {}，必填 {}。\n\n",
-                        schema.fields.join("、"),
-                        required.join("、")
-                    ));
+                if let Some(schema) = &state.task.discovered_schema {
+                    if !schema.fields.is_empty() {
+                        let required = if schema.required.is_empty() {
+                            schema.fields.clone()
+                        } else {
+                            schema.required.clone()
+                        };
+                        prompt.push_str(&format!(
+                            "输出结构：字段 {}，必填 {}。\n\n",
+                            schema.fields.join("、"),
+                            required.join("、")
+                        ));
+                    }
                 }
             }
 
