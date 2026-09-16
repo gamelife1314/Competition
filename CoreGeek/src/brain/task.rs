@@ -618,12 +618,11 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     // ---- Determine what this round should do ----
     //
     // Three phases:
-    //   read  — first command: find and read the task file, extract FIELDS/SCHEMA
-    //   solve — has execution results: compute the answer from sandbox data
-    //   fix   — answer rejected or schema mismatch: fix the missing/wrong parts
+    //   read  — first command: LLM writes a script to read the task file
+    //   solve — has execution results: LLM writes a script to compute the answer
+    //   fix   — answer rejected or schema mismatch: LLM writes a script to fix
     //
-    // SOP reuse is not a separate phase: when a cached script exists, it is
-    // shown as context in whichever phase we're in.
+    // SOP reuse: cached script shown as context in whichever phase we're in.
 
     let has_schema_issues = !state.task.schema_gaps.is_empty()
         || !state.task.schema_extras.is_empty();
@@ -646,31 +645,10 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     }
 
     match phase {
-        // ---- First command: read the task file ----
+        // ---- First command: LLM writes a script to read the task file ----
         "read" => {
-            // If a previous command ran but didn't produce FIELDS, feed back
-            // the result so the LLM can fix the script.
-            if !state.task.result_history.is_empty() {
-                prompt.push_str("上次执行结果：\n");
-                let start = state.task.result_history.len().saturating_sub(2);
-                for (offset, result) in state.task.result_history[start..].iter().enumerate() {
-                    let is_last = start + offset + 1 == state.task.result_history.len();
-                    let cap = if is_last {
-                        RESULT_CONTEXT_LAST
-                    } else {
-                        RESULT_CONTEXT_PREVIOUS
-                    };
-                    prompt.push_str(&truncate(result, cap));
-                    prompt.push('\n');
-                }
-                prompt.push('\n');
-            }
-
             prompt.push_str("根据上面的任务描述，写一段 shell 或 python 脚本读取任务内容。\n");
-            prompt.push_str("- 找到任务文件并完整读取它的内容。\n");
-            prompt.push_str("- 从任务文件中提取输出字段，用 `echo \"FIELDS: 字段1, 字段2\"` 打印。\n");
-            prompt.push_str("- 如果任务文件声明了输出结构（JSON Schema），用 `echo \"SCHEMA: <原文JSON>\"` 打印。\n");
-            prompt.push_str("- 不要凭文件名猜答案，先读题，拿到内容之后下一轮再写脚本查数据。\n");
+            prompt.push_str("脚本需要找到任务文件并完整读取它的内容。不要凭文件名猜答案，先读题，拿到内容之后下一轮再写脚本查数据。\n");
             prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
         }
 
