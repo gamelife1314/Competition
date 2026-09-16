@@ -600,120 +600,77 @@ const RESULT_CONTEXT_PREVIOUS: usize = 1200;
 pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     let mut prompt = String::new();
 
-    // ---- Two-phase enforcement ----
+    // ---- Round-by-round task execution ----
     //
-    // pk606150 post-mortem: the LLM saw `task_1_beijing` in the description,
-    // guessed `{"world_heritage_count":7}` from training data, and submitted
-    // at R16 — four rounds BEFORE it actually read the task file at R20. Every
-    // cultural-heritage session failed the same way. The old 14-rule prompt
-    // had zero rules about *reading the task first*; it was all format
-    // mechanics. The fix is structural: the prompt now enforces a strict
-    // two-phase flow.
+    // The flow is multi-round, each round a full LLM round-trip:
+    //   Round N:   we send prompt → LLM returns a script → we put it in
+    //              executeCmd → judger runs it in the sandbox.
+    //   Round N+1: judger returns lastCmdResult → we feed it back to LLM →
+    //              LLM returns next script → executeCmd → ...
+    //   Until an ANSWER is produced, then we submit.
     //
-    // Phase 1 (reconnaissance): `discovered_fields` is empty → find+cat the
-    //   task file, print FIELDS/SCHEMA, **FORBID ANSWER**. Not having an
-    //   answer here is correct behaviour, not a failure — so the
-    //   `no_answer_rounds` panic does NOT fire in this phase.
+    // pk606150 post-mortem: the old 14-rule prompt was a wall of format
+    // mechanics dumped on every round. The LLM saw `task_1_beijing`, guessed
+    // `{"world_heritage_count":7}` from training data, and submitted at R16
+    // — 4 rounds before it actually read the task file at R20. The prompt
+    // never said "read the file first"; it said "print FIELDS/SCHEMA/ANSWER
+    // in this exact format" and the LLM obliged with a fabricated answer.
     //
-    // Phase 2 (execution): `discovered_fields` is set → the task file has
-    //   been read, now compute the real answer from sandbox data and print
-    //   ANSWER. Reconnaissance is forbidden — the content is already in
-    //   `result_history`.
+    // The fix: each round's prompt says what THAT ROUND should do, in plain
+    // language. No rule dumps. The state machine's `discovered_fields` tracks
+    // whether the task file has been read (a FIELDS line was echoed), and the
+    // prompt branches accordingly:
+    //   - No result history → "write a script to find and read the task file"
+    //   - Has results but no FIELDS → "extract fields from what you just read"
+    //   - Has FIELDS but no ANSWER → "query the sandbox and compute the answer"
+    //   - Has ANSWER but rejected → "fix per the judger's feedback"
 
-    let recon_done = !state.task.discovered_fields.is_empty();
+    let has_results = !state.task.result_history.is_empty();
+    let has_fields = !state.task.discovered_fields.is_empty();
+    let has_rejection = !state.task.rejection_feedback.is_empty();
+    let left = state.task.timeout_round.saturating_sub(turn.round_no);
 
-    prompt.push_str("你在一个隔离沙盒中执行任务，沙盒可运行基础 shell 与 python3（无外网）。\n");
-    prompt.push_str(
-        "环境说明：任务相关文件（如 task_X.md、输入数据）通常放在 /tmp/selfEvolutionTask/ 目录下。\n",
-    );
+    prompt.push_str("你的脚本将在隔离沙盒中执行（shell + python3，无外网）。\n");
+    prompt.push_str("任务文件通常在 /tmp/selfEvolutionTask/ 下（可能有多层子目录）。\n\n");
     prompt.push_str("任务描述：\n");
     prompt.push_str(&state.task.description);
     prompt.push_str("\n\n");
 
-    let left = state.task.timeout_round.saturating_sub(turn.round_no);
+    // ---- Determine what this round should do ----
 
-    if !recon_done {
-        // ============================================================
-        // PHASE 1: RECONNAISSANCE — read the task file, nothing else.
-        // ============================================================
-        prompt.push_str("## 阶段一：读题（本轮只做这一件事）\n\n");
-        prompt.push_str("你还没有读过任务文件。**本轮禁止打印 ANSWER**——你不知道题目要什么，任何答案都是猜测。\n\n");
-        prompt.push_str("请执行以下步骤：\n");
-        prompt.push_str("1. `find /tmp/selfEvolutionTask/ -maxdepth 4 -type f` 找到任务文件（可能在多层子目录里）。\n");
-        prompt.push_str("2. `cat <完整路径>` **完整读取**任务文件——不要只看文件名就猜内容，必须把文件内容 cat 出来。\n");
-        prompt.push_str("3. 如果任务文件引用了其他文件（如 API_DOCS.md、spec.md、check 脚本），也一并 cat 读取。\n");
-        prompt.push_str("4. 从任务文件原文中提取输出字段，打印 `echo \"FIELDS: 字段1, 字段2\"`（字段名以任务文件原文为准）。\n");
-        prompt.push_str("5. 如果任务文件里写明了输出结构（JSON Schema 或字段类型表），打印 `echo \"SCHEMA: <原文JSON>\"`。\n");
-        prompt.push_str("\n**不要做的事**：\n");
-        prompt.push_str("- 不要打印 ANSWER（你还没读题，猜出来的值一定是错的）。\n");
-        prompt.push_str("- 不要凭文件名猜测内容（`task_1_beijing` 不代表答案就是「北京世界遗产 7 个」——沙盒里的数据和你的训练数据不同）。\n");
-        prompt.push_str("- 不要 `cd` 到没确认过的路径（`cd` 失败会导致后续命令全部写到错误位置）。\n");
-        prompt.push_str("- 不要用 `set -e`（中途任何命令失败都会丢掉后面所有输出）。\n");
-        prompt.push_str("- 不要 `find /`（不带 maxdepth 扫全盘会超时）。如果 /tmp/selfEvolutionTask/ 不存在，用 `find / -maxdepth 4 -name \"task*\" 2>/dev/null | head -50` 定位。\n");
-        prompt.push_str("\n命令开头已自动加好 UTF-8 locale 和 CRLF 修复，不要再写这些准备步骤。\n");
-        prompt.push_str(&format!("\n任务剩余 {} 回合。读完题之后下一轮就能算答案，不要着急。\n", left));
+    let phase = if has_rejection {
+        "fix"
+    } else if !has_results {
+        // Round 1: no command has been run yet. The task description says
+        // "请阅读 task_X.md" — so the first script should find and cat it.
+        "read"
+    } else if !has_fields {
+        // We ran a command but didn't get FIELDS yet. The task file may have
+        // been printed but the model didn't extract fields from it, or the
+        // find/cat failed. Either way: read the file and extract fields.
+        "extract"
     } else {
-        // ============================================================
-        // PHASE 2: EXECUTION — compute and answer.
-        // ============================================================
-        prompt.push_str("## 阶段二：答题（你已经读完了任务文件）\n\n");
-        prompt.push_str(&format!(
-            "任务文件确认的输出字段：{}。ANSWER 的 JSON 必须恰好包含这些字段，不多不少。\n\n",
-            state.task.discovered_fields.join("、")
-        ));
+        // We have the task file content and know the output fields. Now
+        // write a script to actually compute the answer from sandbox data.
+        "solve"
+    };
 
-        // The declared schema from the task file (P1-2).
-        if let Some(schema) = &state.task.discovered_schema {
-            if !schema.fields.is_empty() {
-                let required = if schema.required.is_empty() {
-                    schema.fields.clone()
-                } else {
-                    schema.required.clone()
-                };
-                prompt.push_str(&format!(
-                    "任务文件声明的输出结构：字段 {}；其中必填 {}。\n\n",
-                    schema.fields.join("、"),
-                    required.join("、")
-                ));
-            }
+    match phase {
+        // ---- Round 1: find and read the task file ----
+        "read" => {
+            prompt.push_str("请写一段脚本：\n");
+            prompt.push_str("1. 用 `find /tmp/selfEvolutionTask/ -maxdepth 4 -type f` 找到任务文件。\n");
+            prompt.push_str("2. `cat` 完整读取任务文件内容。如果引用了其他文件（API_DOCS.md、spec.md、check 脚本等），也一并读取。\n");
+            prompt.push_str("3. 从文件内容中提取任务要求的输出字段，打印 `echo \"FIELDS: 字段1, 字段2\"`。\n");
+            prompt.push_str("4. 如果文件声明了输出结构，打印 `echo \"SCHEMA: <原文JSON>\"`。\n");
+            prompt.push_str("\n本轮不需要打印 ANSWER——先读题，下一轮再根据文件内容查询数据。\n");
+            prompt.push_str("不要凭文件名猜内容（`task_1_beijing` 不代表答案是「北京世界遗产 7 个」）。\n");
+            prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
         }
 
-        prompt.push_str("**核心规则：答案必须由脚本在沙盒中实时计算，绝对不能从训练数据猜测或硬编码。**\n");
-        prompt.push_str("你训练数据里的「北京世界遗产 7 个」在沙盒里可能已经过时——必须 `curl`/`python` 调用沙盒 API 或运行 `check` 脚本拿到真实结果。\n\n");
-
-        prompt.push_str("请执行以下步骤：\n");
-        prompt.push_str("1. 根据你读到的任务文件内容，编写脚本完成任务（调 API、改配置、运行 check 脚本等）。\n");
-        prompt.push_str("2. 脚本从沙盒拿到真实结果后，最后一行打印 `echo \"ANSWER: <结果>\"`。\n");
-        prompt.push_str("3. 多字段答案用 JSON，字段名与上面的 FIELDS 完全一致。\n\n");
-
-        // Compact format reference — only the rules that matter for answering.
-        prompt.push_str("格式要求：\n");
-        prompt.push_str("- `ANSWER:` 后面只放任务要求的值，不要加 `status`/`note`/`task_id` 等多余字段。\n");
-        prompt.push_str("- 不要用 `<...>` 占位符或中文描述代替真实值。\n");
-        prompt.push_str("- Python 处理中文参数（如城市名）时，URL 必须用 `urllib.parse.quote` 编码。\n");
-        prompt.push_str("- 脚本可复用：可变参数写成 `{{参数名}}` 占位符，不要写死具体取值。\n");
-        prompt.push_str("- 15 秒硬超时：不要 `sleep`、不要重试循环、不要扫全盘、不要访问外网。\n");
-        prompt.push_str("- `FIELDS:`/`SCHEMA:`/`ANSWER:` 必须用 `echo` 打印，不要写裸行。\n");
-        prompt.push_str("- 任务自带的 `check` 脚本可能报 `bad interpreter: /bin/sh^M`——用 `bash <脚本>` 运行，答案往往在它的输出里。\n");
-        prompt.push_str("- 命令开头已自动加好环境预处理，不要再写准备步骤。\n");
-
-        // The reconnaissance-is-done pressure: only fires in phase 2, and only
-        // when the model has failed to produce an answer for multiple rounds
-        // AFTER reading the task file.
-        if state.task.no_answer_rounds > 0 {
-            prompt.push_str(&format!(
-                "\n⚠ 你已读完任务文件但连续 {} 轮没有打印 ANSWER，任务剩余 {} 回合。\n",
-                state.task.no_answer_rounds, left,
-            ));
-            prompt.push_str("**不要再 find/ls/cat 重读任务文件**——内容已经在下面「上次执行输出」里了。直接根据已读到的内容计算并打印 ANSWER。\n");
-            if state.task.no_answer_rounds >= 2 {
-                prompt.push_str("再不提交必然超时得 0 分。即使没有十足把握，也要给出最可能的值——写错还有通过率，空手而归是 0 分。\n");
-            }
-        }
-
-        // Rejection feedback and retry context.
-        if !state.task.result_history.is_empty() {
-            prompt.push_str("\n上次执行输出：\n");
+        // ---- Ran a command but no FIELDS extracted yet ----
+        "extract" => {
+            prompt.push_str("上次执行结果：\n");
             let start = state.task.result_history.len().saturating_sub(2);
             for (offset, result) in state.task.result_history[start..].iter().enumerate() {
                 let is_last = start + offset + 1 == state.task.result_history.len();
@@ -725,46 +682,132 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
                 prompt.push_str(&truncate(result, cap));
                 prompt.push('\n');
             }
+            prompt.push_str("\n请根据上面的执行结果，写一段脚本：\n");
+            prompt.push_str("- 如果任务文件内容已经打印出来，从中提取输出字段并打印 `echo \"FIELDS: ...\"` 和 `echo \"SCHEMA: ...\"`。\n");
+            prompt.push_str("- 如果还没找到/读到任务文件，用 `find` + `cat` 找到并读取它。\n");
+            prompt.push_str("- 如果上次命令报错（路径不存在、权限拒绝等），修正路径或方法后重试。\n");
+            prompt.push_str("\n本轮不需要打印 ANSWER。\n");
+            prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
         }
 
-        if state.task.rejections > 0 {
+        // ---- Task file read, fields known: compute the answer ----
+        "solve" => {
             prompt.push_str(&format!(
-                "\n注意：之前提交的答案被判错 {} 次，上次答案：{}。请重新分析题目要求的字段与格式。\n",
+                "任务文件已读完，输出字段：{}。\n\n",
+                state.task.discovered_fields.join("、")
+            ));
+
+            if let Some(schema) = &state.task.discovered_schema {
+                if !schema.fields.is_empty() {
+                    let required = if schema.required.is_empty() {
+                        schema.fields.clone()
+                    } else {
+                        schema.required.clone()
+                    };
+                    prompt.push_str(&format!(
+                        "输出结构：字段 {}，必填 {}。\n\n",
+                        schema.fields.join("、"),
+                        required.join("、")
+                    ));
+                }
+            }
+
+            // Feed back the last command's output.
+            if !state.task.result_history.is_empty() {
+                prompt.push_str("上次执行结果：\n");
+                let start = state.task.result_history.len().saturating_sub(2);
+                for (offset, result) in state.task.result_history[start..].iter().enumerate() {
+                    let is_last = start + offset + 1 == state.task.result_history.len();
+                    let cap = if is_last {
+                        RESULT_CONTEXT_LAST
+                    } else {
+                        RESULT_CONTEXT_PREVIOUS
+                    };
+                    prompt.push_str(&truncate(result, cap));
+                    prompt.push('\n');
+                }
+                prompt.push('\n');
+            }
+
+            prompt.push_str("请根据任务文件的内容和上面的执行结果，写一段脚本：\n");
+            prompt.push_str("- 调用沙盒内的 API / 运行 check 脚本 / 修改配置文件，拿到真实结果。\n");
+            prompt.push_str("- **答案必须由脚本实时计算，不能从训练数据猜测**——沙盒里的数据和你的训练数据可能不同。\n");
+            prompt.push_str("- 最后一行打印 `echo \"ANSWER: <结果>\"`，多字段用 JSON，字段名与 FIELDS 一致。\n");
+            prompt.push_str("- 脚本可复用：可变参数用 `{{参数名}}` 占位符，同类任务下次只换参数。\n\n");
+
+            // Pressure: only if the model has failed to produce an answer
+            // for multiple rounds AFTER reading the task file.
+            if state.task.no_answer_rounds > 0 {
+                prompt.push_str(&format!(
+                    "⚠ 已连续 {} 轮没有 ANSWER，剩余 {} 回合。不要再重读文件，直接根据已有结果计算并提交。\n",
+                    state.task.no_answer_rounds, left,
+                ));
+                if state.task.no_answer_rounds >= 2 {
+                    prompt.push_str("即使没把握也要提交最可能的值——写错有通过率，空手是 0 分。\n");
+                }
+                prompt.push('\n');
+            }
+
+            // Compact sandbox pitfalls — only the ones that actually kill scripts.
+            prompt.push_str("注意事项：\n");
+            prompt.push_str("- 15 秒超时：不要 sleep / 重试循环 / find / 不带 maxdepth / 访问外网。\n");
+            prompt.push_str("- 中文参数 URL 编码：`from urllib.parse import quote; url = f\"...?city={quote('北京')}\"`\n");
+            prompt.push_str("- check 脚本报 `bad interpreter` 时用 `bash <脚本>` 运行。\n");
+            prompt.push_str("- 不要 `set -e`，不要 `cd` 到未确认路径，不要多写 status/note 字段。\n");
+            prompt.push_str("- 命令开头已自动加好 locale 和 CRLF 修复。\n");
+        }
+
+        // ---- Answer was rejected: fix it ----
+        "fix" => {
+            prompt.push_str(&format!(
+                "之前提交的答案被判错 {} 次，上次答案：{}。\n\n",
                 state.task.rejections, state.task.best_answer
             ));
-        }
 
-        if !state.task.schema_gaps.is_empty() {
-            prompt.push_str(&format!(
-                "\n上次答案缺少字段：{}。请补全。\n",
-                state.task.schema_gaps.join("、")
-            ));
-        }
-        if !state.task.schema_extras.is_empty() {
-            prompt.push_str(&format!(
-                "\n上次答案多出了任务未要求的字段：{}。请删除。\n",
-                state.task.schema_extras.join("、")
-            ));
-        }
+            if !state.task.schema_gaps.is_empty() {
+                prompt.push_str(&format!(
+                    "缺少字段：{}\n",
+                    state.task.schema_gaps.join("、")
+                ));
+            }
+            if !state.task.schema_extras.is_empty() {
+                prompt.push_str(&format!(
+                    "多余字段：{}\n",
+                    state.task.schema_extras.join("、")
+                ));
+            }
 
-        // The judger's own rejection text, verbatim and last (P0-1).
-        if !state.task.rejection_feedback.is_empty() {
             prompt.push_str("\n判题器原话反馈：\n");
             for feedback in &state.task.rejection_feedback {
                 prompt.push_str("- ");
                 prompt.push_str(&truncate(feedback, 300));
                 prompt.push('\n');
             }
-            prompt.push_str(
-                "请严格按判题器原话修正：点名缺哪个键就补哪个键，说哪个键值不符就只重算那一个值。\n",
-            );
+
+            // Feed back the last command output for context.
+            if !state.task.result_history.is_empty() {
+                prompt.push_str("\n上次执行结果：\n");
+                let start = state.task.result_history.len().saturating_sub(2);
+                for (offset, result) in state.task.result_history[start..].iter().enumerate() {
+                    let is_last = start + offset + 1 == state.task.result_history.len();
+                    let cap = if is_last {
+                        RESULT_CONTEXT_LAST
+                    } else {
+                        RESULT_CONTEXT_PREVIOUS
+                    };
+                    prompt.push_str(&truncate(result, cap));
+                    prompt.push('\n');
+                }
+            }
+
+            prompt.push_str("\n请写一段脚本修正答案：\n");
+            prompt.push_str("- 按判题器点名的键逐字修正：缺哪个补哪个，值不符的重算那一个。\n");
+            prompt.push_str("- 判题器没提到的字段保持原样，不要增删。\n");
+            prompt.push_str("- 最后一行打印 `echo \"ANSWER: <修正后的结果>\"`。\n");
+            prompt.push_str(&format!("\n任务剩余 {} 回合。\n", left));
         }
 
-        // Self-check before submitting.
-        prompt.push_str("\n提交前自检：\n");
-        prompt.push_str("1. 最后一行是 `echo \"ANSWER: ...\"` 吗？\n");
-        prompt.push_str("2. 值里有占位符或中文描述吗？\n");
-        prompt.push_str("3. JSON 字段与 FIELDS 完全一致吗？\n");
+        _ => {}
     }
 
     prompt
