@@ -251,7 +251,7 @@ pub fn wall_daily_cap(day: i64, ring_ever_complete: bool, primary_open: usize) -
 /// rest for wall repair kits, medicine and upgrades — never all three slots
 /// at once (battle pk575557 spent 75g on three towers and had nothing left).
 pub fn tower_build_reserve(tower_count: usize, gap_count: usize) -> i64 {
-    ((2 - tower_count as i64).max(0)).min(gap_count as i64) * WEAPON_BUILD_COST
+    ((3 - tower_count as i64).max(0)).min(gap_count as i64) * WEAPON_BUILD_COST
 }
 
 pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {

@@ -356,7 +356,12 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     });
     let controllers = turn.controllable().len() as i64;
     let medicine = stock_of(turn, "Medicine");
-    let want_medicine = if injured || readiness || turn.day == 1 {
+    // D1 strategy: skip Medicine — focus all gold on 3 towers + weapon upgrade
+    // vouchers. Controllers start at full HP and D1 night is survivable with
+    // 3 towers providing full firepower.
+    let want_medicine = if turn.day == 1 {
+        0
+    } else if injured || readiness {
         controllers.max(1)
     } else {
         0
@@ -392,9 +397,9 @@ pub fn intent_list(turn: &Turn, state: &BotState, reserve: i64) -> Vec<Need> {
     // (2 kits before the first complete ring, 4 after) and so are the priorities,
     // so the 25-gold third-tower reserve and the 100-gold weapon voucher are
     // exactly as protected as they were; a 2-kit day-1 stock is 20 gold.
-    let want_fixers = if damaged_walls > 0 {
+    let want_fixers = if damaged_walls > 0 && turn.day > 1 {
         damaged_walls.min(6)
-    } else if (readiness || turn.day == 1) && !walls.is_empty() {
+    } else if readiness && turn.day > 1 && !walls.is_empty() {
         // P1-4 续航包：2–4 kits a day. A ring that has been closed before is
         // the ring the night tears open (issue #21: 17→7) — and the kits are
         // the only wall HP available during the night itself.
@@ -1143,23 +1148,12 @@ pub fn may_build_weapon(turn: &Turn, _state: &BotState) -> bool {
     if turn.towers().len() >= 3 || turn.gold < WEAPON_BUILD_COST {
         return false;
     }
-    // Day 1 base-protection: when the station is still L1 and no upgrade
-    // voucher has been bought, block the THIRD tower early in the day so the
-    // 25g can go toward the 100g StationUpgradeVoucher1. Two towers are always
-    // allowed — the first night needs firepower. The block lifts at the
-    // fallback window (`DUSK_ROUND - FALLBACK_LEAD`): by then the voucher is
-    // either bought or out of reach tonight, and the 25g is better spent on a
-    // third gun for tonight's defense than held for a purchase that cannot
-    // happen before dark (issues #201-#205 vs. P0-2's two-gun matches).
-    if turn.day == 1
-        && turn.towers().len() >= 2
-        && turn.station().map_or(false, |s| s.level == 1)
-        && stock_of(turn, "StationUpgradeVoucher1") == 0
-        && turn.gold - WEAPON_BUILD_COST < WEAPON_VOUCHER1_PRICE
-        && turn.in_day_round < DUSK_ROUND - FALLBACK_LEAD - GUARD_LEAD
-    {
-        return false;
-    }
+    // Day 1 strategy: build all 3 towers immediately, then mine for upgrade
+    // vouchers. The previous D1 third-tower block reserved 25g toward the
+    // 100g WeaponUpgradeVoucher1, but the user strategy is: 3 towers first
+    // (75g total), then mine → earn → buy upgrade vouchers. 3 towers give
+    // full nighttime firepower on D1 night, which is more important than
+    // hoarding 25g early.
     true
 }
 
