@@ -658,30 +658,30 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     let has_rejection = !state.task.rejection_feedback.is_empty();
     let left = state.task.timeout_round.saturating_sub(turn.round_no);
 
-    prompt.push_str("请帮我写一段 shell 或 python 脚本，我会在沙盒环境中执行它。\n");
-    prompt.push_str("沙盒环境：可运行 shell 和 python3，不能联网。\n");
-    prompt.push_str("Please output all script comments, variable names, and text output in English to avoid character encoding issues.\n\n");
+    prompt.push_str("Please write a shell or python script for me to execute in a sandbox environment.\n");
+    prompt.push_str("Sandbox: shell and python3 available, no internet access.\n");
+    prompt.push_str("Output all script comments, variable names, and text in English to avoid encoding issues.\n\n");
 
     // ---- Task description ----
-    prompt.push_str("## 任务描述\n\n");
+    prompt.push_str("## Task Description\n\n");
     prompt.push_str(&state.task.description);
     prompt.push_str("\n\n");
 
     // ---- SOP reuse: cached script from a similar task ----
     if let Some(script) = &state.task.sop_reuse_script {
-        prompt.push_str("## 参考脚本\n\n");
-        prompt.push_str("我之前遇到过类似的任务，当时用的脚本是：\n\n");
+        prompt.push_str("## Reference Script\n\n");
+        prompt.push_str("I previously solved a similar task with this script:\n\n");
         prompt.push_str("```\n");
         prompt.push_str(script);
         prompt.push_str("\n```\n");
-        prompt.push_str("可以参考这个脚本的结构和逻辑，但请根据本次任务的实际需求写新的脚本。\n\n");
+        prompt.push_str("You may reference its structure and logic, but write a new script for this task.\n\n");
     }
 
     // ---- Discovered schema (if the LLM echoed FIELDS/SCHEMA) ----
     if !state.task.discovered_fields.is_empty() {
         prompt.push_str(&format!(
-            "## 已知输出字段\n{}\n\n",
-            state.task.discovered_fields.join("、")
+            "## Known Output Fields\n{}\n\n",
+            state.task.discovered_fields.join(", ")
         ));
     }
     if let Some(schema) = &state.task.discovered_schema {
@@ -692,29 +692,29 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
                 schema.required.clone()
             };
             prompt.push_str(&format!(
-                "## 输出结构\n字段：{}\n必填：{}\n\n",
-                schema.fields.join("、"),
-                required.join("、")
+                "## Output Schema\nFields: {}\nRequired: {}\n\n",
+                schema.fields.join(", "),
+                required.join(", ")
             ));
         }
     }
 
     // ---- Rejection feedback (if the judger rejected a previous answer) ----
     if has_rejection {
-        prompt.push_str("## 判题器反馈\n\n");
+        prompt.push_str("## Judger Feedback\n\n");
         if state.task.rejections > 0 {
             prompt.push_str(&format!(
-                "之前提交的答案被判错 {} 次，上次答案：{}。\n\n",
+                "The previous answer was rejected {} time(s). Last answer: {}.\n\n",
                 state.task.rejections, state.task.best_answer
             ));
         }
         if !state.task.schema_gaps.is_empty() {
-            prompt.push_str(&format!("缺少字段：{}\n", state.task.schema_gaps.join("、")));
+            prompt.push_str(&format!("Missing fields: {}\n", state.task.schema_gaps.join(", ")));
         }
         if !state.task.schema_extras.is_empty() {
-            prompt.push_str(&format!("多余字段：{}\n", state.task.schema_extras.join("、")));
+            prompt.push_str(&format!("Extra fields: {}\n", state.task.schema_extras.join(", ")));
         }
-        prompt.push_str("\n判题器对你已提交答案的原话反馈：\n");
+        prompt.push_str("\nJudger's verbatim feedback on your submitted answer:\n");
         for feedback in &state.task.rejection_feedback {
             prompt.push_str("- ");
             prompt.push_str(&truncate(feedback, 300));
@@ -725,7 +725,7 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
 
     // ---- All prior execution results (the conversation history) ----
     if !state.task.result_history.is_empty() {
-        prompt.push_str("## 历史执行结果\n\n");
+        prompt.push_str("## Execution History\n\n");
         let start = state.task.result_history.len().saturating_sub(3);
         for (idx, result) in state.task.result_history[start..].iter().enumerate() {
             let round_num = start + idx + 1;
@@ -735,44 +735,44 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
             } else {
                 RESULT_CONTEXT_PREVIOUS
             };
-            prompt.push_str(&format!("### 第 {} 次执行\n", round_num));
+            prompt.push_str(&format!("### Execution #{}\n", round_num));
             prompt.push_str(&truncate(result, cap));
             prompt.push_str("\n\n");
         }
     }
 
     // ---- File finding guide (always available, not just in a "read" phase) ----
-    prompt.push_str("## 文件查找指南（按速度从快到慢）\n");
-    prompt.push_str("- `find /tmp/selfEvolutionTask/ -type f` — 优先搜索此目录\n");
-    prompt.push_str("- `find . -type f -name '*.txt' -o -name '*.json' -o -name '*.md'` — 递归当前目录\n");
-    prompt.push_str("- shell 的 `find` 优先于 python 的 `os.walk`\n");
-    prompt.push_str("- 找到文件后用 `cat` 读取全部内容\n\n");
+    prompt.push_str("## File Finding Guide (fastest first)\n");
+    prompt.push_str("- `find /tmp/selfEvolutionTask/ -type f` — search this directory first\n");
+    prompt.push_str("- `find . -type f -name '*.txt' -o -name '*.json' -o -name '*.md'` — recursive current directory\n");
+    prompt.push_str("- Shell `find` is faster than python `os.walk`\n");
+    prompt.push_str("- After finding a file, use `cat` to read its full content\n\n");
 
     // ---- Sandbox pitfalls ----
-    prompt.push_str("## 沙盒注意事项\n");
-    prompt.push_str("- 15 秒超时：不要 sleep / 重试循环 / find 不带 maxdepth / 访问外网。\n");
-    prompt.push_str("- 中文参数 URL 编码：`from urllib.parse import quote; url = f\"...?city={quote('北京')}\"`\n");
-    prompt.push_str("- check 脚本报 `bad interpreter` 时用 `bash <脚本>` 运行。\n");
-    prompt.push_str("- 不要 `set -e`，不要 `cd` 到未确认路径，不要多写 status/note 字段。\n");
-    prompt.push_str("- 命令开头已自动加好 locale 和 CRLF 修复。\n\n");
+    prompt.push_str("## Sandbox Pitfalls\n");
+    prompt.push_str("- 15s timeout: no sleep, no retry loops, no find without maxdepth, no internet.\n");
+    prompt.push_str("- URL-encode Chinese params: `from urllib.parse import quote; url = f\"...?city={quote('北京')}\"`\n");
+    prompt.push_str("- If check script reports `bad interpreter`, run with `bash <script>`.\n");
+    prompt.push_str("- Do not `set -e`, do not `cd` to unconfirmed paths, do not add extra status/note fields.\n");
+    prompt.push_str("- Locale and CRLF fix are already prepended to your command.\n\n");
 
     // ---- What to do this round ----
-    prompt.push_str("## 本轮任务\n\n");
-    prompt.push_str(&format!("任务剩余 {} 回合。\n", left));
-    prompt.push_str("请根据上面的任务描述、历史执行结果和判题器反馈（如有），写一段脚本执行下一步操作。\n");
-    prompt.push_str("你可以：读取任务文件、读取 API 文档、查询 API、运行 check 脚本、修改文件、计算答案等。\n");
-    prompt.push_str("**答案必须由脚本实时计算，不能从训练数据猜测**——沙盒里的数据和你的训练数据可能不同。\n");
-    prompt.push_str("当你确定拿到正确结果时，最后一行打印 `echo \"ANSWER: <结果>\"`，多字段用 JSON。\n\n");
+    prompt.push_str("## This Round\n\n");
+    prompt.push_str(&format!("Rounds remaining: {}.\n", left));
+    prompt.push_str("Based on the task description, execution history, and judger feedback (if any), write a script for the next step.\n");
+    prompt.push_str("You can: read task files, read API docs, query APIs, run check scripts, modify files, compute answers, etc.\n");
+    prompt.push_str("**The answer must be computed by the script in real-time, not guessed from training data** — sandbox data may differ from your training data.\n");
+    prompt.push_str("When you have the correct result, print `echo \"ANSWER: <result>\"` as the last line. Use JSON for multi-field answers.\n\n");
 
     // ---- Stall pressure (only after multiple answer-less rounds) ----
     if state.task.no_answer_rounds > 0 {
         prompt.push_str(&format!(
-            "上次执行完成但没有打印 `ANSWER:` 行。连续 {} 次没有答案，剩余 {} 回合。\n",
+            "The last execution completed but did not print an `ANSWER:` line. {} consecutive answer-less round(s), {} rounds remaining.\n",
             state.task.no_answer_rounds, left,
         ));
-        prompt.push_str("不要再用 find 重复探索文件，直接根据已有结果计算并提交。\n");
+        prompt.push_str("Do not repeat file exploration with find. Compute and submit based on existing results.\n");
         if state.task.no_answer_rounds >= 2 {
-            prompt.push_str("本轮必须打印 ANSWER 行，即使没把握也要提交最可能的值——写错有通过率，空手是 0 分。\n");
+            prompt.push_str("You MUST print an ANSWER line this round, even if unsure — a wrong answer has a pass rate, no answer is 0 points.\n");
         }
         prompt.push('\n');
     }

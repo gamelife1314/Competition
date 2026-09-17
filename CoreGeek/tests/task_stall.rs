@@ -154,11 +154,11 @@ fn the_task_file_the_script_already_read_reaches_the_retry() {
         "the reconnaissance echo travels with it"
     );
     assert!(
-        prompt.contains("没有打印 `ANSWER:` 行"),
+        prompt.contains("did not print an `ANSWER:` line"),
         "and the retry is told what was actually missing: the answer marker"
     );
     assert!(
-        prompt.contains("不要再用 find"),
+        prompt.contains("Do not repeat file exploration with find"),
         "the exploration the last three rounds repeated is called off by name"
     );
 }
@@ -172,22 +172,22 @@ fn the_second_answerless_round_stops_asking_and_starts_insisting() {
     absorb(&mut state, &reconnaissance_result(0));
     let first = build_prompt(&state, &turn_from(board(40)));
     assert!(
-        !first.contains("本轮必须打印 ANSWER 行"),
+        !first.contains("You MUST print an ANSWER line"),
         "the first answer-less round is a warning, not an ultimatum"
     );
 
     absorb(&mut state, &reconnaissance_result(0));
     let second = build_prompt(&state, &turn_from(board(41)));
     assert!(
-        second.contains("本轮必须打印 ANSWER 行"),
+        second.contains("You MUST print an ANSWER line"),
         "the second one says the round is the task's last chance to score"
     );
     assert!(
-        second.contains("连续 2 次"),
+        second.contains("2 consecutive answer-less round(s)"),
         "and it says how long the loop has been running"
     );
     assert!(
-        second.contains("剩余 19 回合"),
+        second.contains("Rounds remaining: 19"),
         "with the budget left, so the trade is visible: {second}"
     );
 }
@@ -202,11 +202,11 @@ fn a_session_that_never_stalls_gets_no_stall_text() {
     state.task.stage = TaskStage::Planning;
     let prompt = build_prompt(&state, &turn_from(board(40)));
     assert!(
-        !prompt.contains("没有打印 `ANSWER:` 行"),
+        !prompt.contains("did not print an `ANSWER:` line"),
         "the stall paragraph belongs to sessions that stalled"
     );
     assert!(
-        !prompt.contains("本轮必须打印 ANSWER 行"),
+        !prompt.contains("You MUST print an ANSWER line"),
         "and so does the ultimatum"
     );
 }

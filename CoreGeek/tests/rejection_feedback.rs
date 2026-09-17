@@ -91,7 +91,7 @@ fn a_rejection_is_kept_verbatim_and_reaches_the_next_prompt() {
         "the retry prompt does not carry the judger's rejection: {prompt}"
     );
     assert!(
-        prompt.contains("判题器对你已提交答案的原话反馈"),
+        prompt.contains("Judger's verbatim feedback"),
         "the rejection is not labelled as the judger's own words: {prompt}"
     );
 }
@@ -148,7 +148,7 @@ fn a_rejection_with_no_text_degrades_to_todays_behaviour() {
     assert_eq!(state.task.stage, TaskStage::Planning, "the retry was not armed");
     let prompt = build_prompt(&state, &turn);
     assert!(
-        !prompt.contains("判题器对你已提交答案的原话反馈"),
+        !prompt.contains("Judger's verbatim feedback"),
         "an empty verdict still added a feedback section to the prompt"
     );
 }

@@ -1826,7 +1826,7 @@ fn build_prompt_includes_task_environment_path() {
 
 #[test]
 fn build_prompt_budgets_the_sandbox_clock() {
-    // The 15-second timeout warning appears in the solve phase, where the
+    // The 15-second timeout warning appears in the prompt, where the
     // script does real work and is most likely to hit it.
     let mut state = BotState::default();
     state.task.description = "请统计 /tmp 下的文件数量".into();
@@ -1835,12 +1835,12 @@ fn build_prompt_budgets_the_sandbox_clock() {
     let turn = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
     let prompt = coregeek::brain::task::build_prompt(&state, &turn);
     assert!(
-        prompt.contains("15 秒"),
-        "solve phase states the judger's hard timeout"
+        prompt.contains("15s timeout"),
+        "prompt states the judger's hard timeout"
     );
     assert!(
         prompt.contains("sleep"),
-        "solve phase warns against sleep"
+        "prompt warns against sleep"
     );
 }
 
