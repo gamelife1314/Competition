@@ -21,7 +21,7 @@
 //! cases are caught, and the real answers the old rule protected still are
 //! not.
 
-use coregeek::brain::task::{is_failure_answer, partial_answer, submittable_answer};
+use coregeek::brain::task::{is_failure_answer, partial_answer};
 use coregeek::state::BotState;
 
 /// The three shapes the batch actually submitted, plus the ones a model
@@ -269,22 +269,5 @@ fn a_template_never_becomes_the_deadline_submission() {
         partial_answer(&state),
         None,
         "the task file's template is not a partial answer"
-    );
-}
-
-/// The wrapper rule still does its job on the answers that survive: a
-/// single-key object around a field the task never named is our formatting,
-/// and issue #15 lost a task to it.
-#[test]
-fn the_surviving_answers_are_still_shaped_before_submission() {
-    assert_eq!(
-        submittable_answer("查询城市天气并输出 JSON", r#"{"token":"fc1e78eb"}"#),
-        "fc1e78eb",
-        "a one-key wrapper around a field the task never named is ours to drop"
-    );
-    assert_eq!(
-        submittable_answer("输出字段 city 与 count", r#"{"city":"Nanjing","count":2}"#),
-        r#"{"city":"Nanjing","count":2}"#,
-        "a multi-field answer is submitted untouched"
     );
 }

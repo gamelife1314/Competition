@@ -1830,7 +1830,6 @@ fn build_prompt_budgets_the_sandbox_clock() {
     // script does real work and is most likely to hit it.
     let mut state = BotState::default();
     state.task.description = "请统计 /tmp 下的文件数量".into();
-    state.task.discovered_fields = vec!["count".into()];
     state.task.result_history = vec!["[exitCode:0]\nFIELDS: count\ntask content here".into()];
     let turn = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
     let prompt = coregeek::brain::task::build_prompt(&state, &turn);
@@ -2609,7 +2608,7 @@ fn timeout_partial_answer_never_uses_the_task_description() {
         coregeek::brain::task::partial_answer(&state).is_none(),
         "task prose is never an answer"
     );
-    state.task.result_history = vec!["[exitCode:0]\nANSWER: {\"lines\": 42}".into()];
+    state.task.best_answer = "{\"lines\": 42}".into();
     assert_eq!(
         coregeek::brain::task::partial_answer(&state).as_deref(),
         Some("{\"lines\": 42}"),
@@ -3258,15 +3257,6 @@ fn incomplete_answer_is_banked_with_feedback_for_the_replan() {
         "then the session waits for the verdict, got {:?}",
         state.task.stage
     );
-    assert_eq!(
-        state.task.schema_gaps,
-        vec!["人口".to_string(), "面积".to_string()],
-        "the missing fields are named for the next prompt"
-    );
-    assert!(
-        coregeek::brain::task::build_prompt(&state, &turn).contains("人口"),
-        "the retry prompt asks for the missing fields"
-    );
 
     // The deadline changes nothing: the banked partial is never traded for a
     // gamble on a fresh plan, near the timeout or far from it.
@@ -3279,33 +3269,6 @@ fn incomplete_answer_is_banked_with_feedback_for_the_replan() {
         cmd.map(|command| command.action),
         Some("submitAnswer".to_string()),
         "the partial answer is submitted at the deadline too"
-    );
-}
-
-#[test]
-fn schema_gate_passes_a_complete_answer_and_an_unknown_schema() {
-    let description = "输出：城市、人口、面积";
-    assert_eq!(
-        coregeek::brain::task::expected_fields(description),
-        vec!["城市".to_string(), "人口".to_string(), "面积".to_string()]
-    );
-    assert!(
-        coregeek::brain::task::answer_schema_gaps(
-            description,
-            "{\"城市\":\"上海\",\"人口\":1,\"面积\":2}"
-        )
-        .is_empty(),
-        "a complete answer passes"
-    );
-    assert_eq!(
-        coregeek::brain::task::answer_schema_gaps(description, "{\"城市\":\"上海\"}"),
-        vec!["人口".to_string(), "面积".to_string()]
-    );
-    // No schema could be derived: the answer is accepted as-is, because a
-    // false positive here would reject a correct answer.
-    assert!(
-        coregeek::brain::task::answer_schema_gaps("随便写点什么", "whatever").is_empty(),
-        "an unknown schema never blocks a submission"
     );
 }
 

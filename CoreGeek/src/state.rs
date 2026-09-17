@@ -116,44 +116,9 @@ pub struct TaskSession {
     pub point_closed_round: Option<i64>,
     pub post_submit_error: bool,
     /// The judger's own words about the answers it rejected, in arrival order
-    /// and deduplicated.
-    ///
-    /// Every rejection comes back as a coarse `errorCode` (2 = "答案错误，不正确
-    /// **或不完全正确**") plus one `description` that says WHICH way it was
-    /// wrong — `MissingNamedInput: city`, `键值比对不通过: $/token: 缺少键`. That
-    /// description was parsed into `Turn::error_descriptions` and written to the
-    /// log, and then dropped; `build_prompt` retried on `schema_gaps` /
-    /// `discovered_fields` instead, both of which are *guesses* at the schema
-    /// derived from a placeholder description or from the LLM's own `FIELDS:`
-    /// line. So the one authoritative piece of feedback the judger ever gives
-    /// never reached the retry, and three rejected answers were three blind
-    /// rewrites (docs/FAILURE-ANALYSIS-2026-09-14.md §3.1). This is that text,
-    /// replayed verbatim into the next prompt.
+    /// and deduplicated. Replayed verbatim into the next prompt so the LLM can
+    /// correct the specific error the judger named.
     pub rejection_feedback: Vec<String>,
-    /// Fields the task text asked for that the produced answer did not carry.
-    /// Fed back into the next prompt so the retry can close the gap.
-    pub schema_gaps: Vec<String>,
-    /// Fields the answer carried that the task never asked for. The judger
-    /// scores the object against the schema it named, so an invented field is
-    /// wrong on its own (`{"city":…,"task_id":…,"status":"completed"}` — issue
-    /// #22's session 5). Fed back into the next prompt like `schema_gaps`.
-    pub schema_extras: Vec<String>,
-    /// The output schema the sandbox task file actually demands, echoed back
-    /// by the script itself through a `FIELDS:` line (P0-2). The placeholder
-    /// `phaseTask` text ("请阅读task_X.md，获取任务信息") names no fields, so the
-    /// description-derived `expected_fields` is only a fallback guess — the
-    /// schema lives inside the sandbox and this is the channel that reads it.
-    pub discovered_fields: Vec<String>,
-    /// The output schema the sandbox task file declared, echoed back on a
-    /// `SCHEMA: <json>` line (P1-2).
-    ///
-    /// `FIELDS:` names the fields; this says which of them are mandatory and
-    /// is the only signal strong enough to reject an answer for missing a
-    /// SINGLE field — `expected_fields` guesses from the task text, and a
-    /// one-field guess that is wrong rejects a correct answer. Absent line,
-    /// absent schema: everything downstream degrades to the `FIELDS:` and
-    /// description behaviour unchanged.
-    pub discovered_schema: Option<DiscoveredSchema>,
     /// Consecutive `[JUDGER_ERROR]` verdicts that name `executeCmd` as
     /// unavailable. That error is the judger telling us the task's execution
     /// window is shut — issue #17's two sessions fired four and one command
@@ -206,21 +171,6 @@ pub struct TaskSession {
     /// written.
     pub score_reward: i64,
     pub gold_reward: i64,
-}
-
-/// The answer schema a sandbox script read out of the task file and echoed on
-/// a `SCHEMA:` line (P1-2).
-///
-/// A `FIELDS:` line is a bare list; this is the schema itself. Where the two
-/// disagree the schema wins, and it is the only source that may reject an
-/// answer for missing a single field.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DiscoveredSchema {
-    /// Every field the answer may carry — the extras check reads this.
-    pub fields: Vec<String>,
-    /// The subset the answer must carry — the missing-field check reads this.
-    /// Empty means "every field is required".
-    pub required: Vec<String>,
 }
 
 /// A cached, parameterised script for one task fingerprint. The body keeps
