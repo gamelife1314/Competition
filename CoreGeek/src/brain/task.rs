@@ -578,12 +578,18 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
         }
     }
 
-    // ---- File finding guide (always available, not just in a "read" phase) ----
-    prompt.push_str("## File Finding Guide (fastest first)\n");
-    prompt.push_str("- `find /tmp/selfEvolutionTask/ -type f` — search this directory first\n");
-    prompt.push_str("- `find . -type f -name '*.txt' -o -name '*.json' -o -name '*.md'` — recursive current directory\n");
-    prompt.push_str("- Shell `find` is faster than python `os.walk`\n");
-    prompt.push_str("- After finding a file, use `cat` to read its full content\n\n");
+    // ---- Role boundary ----
+    prompt.push_str("## Your Role\n");
+    prompt.push_str("You write scripts to QUERY data and COMPUTE results only. **Do NOT write code to submit answers** — the system handles submission for you. If the task file mentions a submit endpoint, ignore that part; you only need to query/compute and print the result.\n\n");
+
+    // ---- Suggested workflow ----
+    prompt.push_str("## Suggested Workflow\n");
+    prompt.push_str("1. **Read**: `find /tmp/selfEvolutionTask/ -type f` then `cat` the task file AND any API docs (e.g. `API_DOCS.md`). Read BOTH in the same round.\n");
+    prompt.push_str("2. **Query**: Write a `curl` command (preferred, simpler) or python script to query the API. Read the API docs first to get the correct endpoint path and auth method.\n");
+    prompt.push_str("3. **Verify**: Check the query result. If it failed (401/404), fix the endpoint/auth and retry — do NOT print an empty answer.\n");
+    prompt.push_str("4. **Verify**: Review the query result — does it look correct? Are the fields populated with real data (not all zeros or empty)? If the data looks wrong, retry the query before proceeding.\n");
+    prompt.push_str("5. **Answer**: When you are confident the result is correct, print `echo \"ANSWER: <result>\"` as the last line. The system will submit it for you. Use JSON for multi-field answers.\n");
+    prompt.push_str("- For engineering-fix tasks: run `./check` after fixing. If it prints `TOKEN: xxx`, print `echo \"ANSWER: xxx\"` with that token value.\n\n");
 
     // ---- Sandbox pitfalls ----
     prompt.push_str("## Sandbox Pitfalls\n");
@@ -591,13 +597,13 @@ pub fn build_prompt(state: &BotState, turn: &Turn) -> String {
     prompt.push_str("- URL-encode Chinese params: `from urllib.parse import quote; url = f\"...?city={quote('北京')}\"`\n");
     prompt.push_str("- If check script reports `bad interpreter`, run with `bash <script>`.\n");
     prompt.push_str("- Do not `set -e`, do not `cd` to unconfirmed paths, do not add extra status/note fields.\n");
+    prompt.push_str("- Do NOT write code that POSTs to a submit endpoint — just query and print ANSWER.\n");
     prompt.push_str("- Locale and CRLF fix are already prepended to your command.\n\n");
 
     // ---- What to do this round ----
     prompt.push_str("## This Round\n\n");
     prompt.push_str(&format!("Rounds remaining: {}.\n", left));
     prompt.push_str("Based on the task description, execution history, and judger feedback (if any), write a script for the next step.\n");
-    prompt.push_str("You can: read task files, read API docs, query APIs, run check scripts, modify files, compute answers, etc.\n");
     prompt.push_str("**The answer must be computed by the script in real-time, not guessed from training data** — sandbox data may differ from your training data.\n");
     prompt.push_str("Put your script in a fenced code block (```bash or ```python). When you have the correct result, print `echo \"ANSWER: <result>\"` as the last line of the script. Use JSON for multi-field answers.\n\n");
 
