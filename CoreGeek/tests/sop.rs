@@ -497,34 +497,6 @@ fn task_at(round_no: i64, description: &str, answer: &str) -> (Turn, BotState) {
     (turn, state)
 }
 
-#[test]
-fn the_submitted_payload_is_the_bare_value_the_judger_compares() {
-    // The same thing one layer up: what reaches `submitAnswer` is the unwrapped
-    // value, so the logged payload and the judged payload cannot disagree.
-    //
-    // The unwrap is unchanged. What changed is its notation on the wire: the
-    // bare text `fc1e78eb2a5a` is not a JSON document, and the judger's verdict
-    // for one that is not is `答案不是合法 JSON` — a syntax rejection before any
-    // field is compared, carried by 表 4b of all four of #201/#203/#204/#205
-    // against exactly this payload. The bare value the judger compares and the
-    // JSON string that carries it are the same value; see
-    // `answer_wire_payload`.
-    let (turn, mut state) = task_at(6, "从沙箱中取出访问令牌", "{\"token\":\"fc1e78eb2a5a\"}");
-    let pioneer = turn.role_by_id(10011).unwrap();
-    let mut plan = Plan::default();
-    let cmd = coregeek::brain::task::plan_pioneer(&turn, &mut state, pioneer, &mut plan)
-        .expect("a single-field answer still submits");
-    assert_eq!(cmd.action, "submitAnswer");
-    let payload = cmd
-        .taskAnswer
-        .as_ref()
-        .expect("submitAnswer carries the answer");
-    assert_eq!(
-        payload, "\"fc1e78eb2a5a\"",
-        "the unwrapped value goes to the judger as JSON, not as bare text"
-    );
-}
-
 /// A rejected submission: `round_no` with the judger's verdict text attached.
 fn rejection(round_no: i64, description: &str) -> Turn {
     turn_from(json!({

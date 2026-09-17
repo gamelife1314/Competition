@@ -638,15 +638,6 @@ pub fn extract_command(resp: &str) -> Option<String> {
         }
     }
     if blocks.is_empty() {
-        // No fences: a short single-line command is still usable.
-        let candidate = resp.trim();
-        if !candidate.is_empty()
-            && candidate.chars().count() <= 160
-            && !candidate.contains('\n')
-            && looks_like_command(candidate)
-        {
-            return Some(candidate.to_string());
-        }
         return None;
     }
     // Prefer python blocks (richer), then bash/sh, then anything.
@@ -666,13 +657,6 @@ fn wrap(lang: &str, code: &str) -> String {
     } else {
         code.to_string()
     }
-}
-
-fn looks_like_command(text: &str) -> bool {
-    const HEADS: [&str; 12] = [
-        "ls", "cat", "curl", "python", "sh", "bash", "echo", "grep", "cd", "./", "pip", "wc",
-    ];
-    HEADS.iter().any(|head| text.starts_with(head))
 }
 
 /// Parse "[exitCode:N]\n<output>" and return the output part.
