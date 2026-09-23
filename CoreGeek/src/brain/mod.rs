@@ -1,5 +1,6 @@
 //! Decision entry point and shared helpers.
 
+pub mod action;
 pub mod coach;
 pub mod combat;
 pub mod day;
