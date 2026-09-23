@@ -520,6 +520,26 @@ pub struct BotState {
     /// Never cleared: the ring can only become breached again.
     pub ring_ever_complete: bool,
 
+    /// Cross-person sync slot (issue #221, comment 1 §6): the absolute round
+    /// the team's buyer expects to stand at the shop counter. The economy
+    /// worker reads it as "my ore must be gold before this round" and sells
+    /// early enough to arrive first. Recomputed every day round by the
+    /// planner; `None` when nothing is being bought.
+    pub buy_deadline: Option<i64>,
+    /// Worker B's single-vein latch (comment 1 §5: 每个矿只能采集10次,
+    /// 尽可能一次性将单个矿采集完). While the latched vein still exists,
+    /// still has hits left and is still safe to work, B walks back to IT
+    /// instead of re-picking a vein every round. Cleared when exhausted,
+    /// gone, or (at night) when a robot comes inside the safety distance.
+    pub vein_latch: Option<Pos>,
+    /// Collects issued per vein. The game limits every vein to 10 collects;
+    /// the latch and the ROI pick both refuse a vein that is spent.
+    pub vein_hits: std::collections::BTreeMap<Pos, i64>,
+    /// Set once worker B has placed (or started walking to) its ONE day-1
+    /// weapon build (comment 1 §5: 如果是DAY1，启动之后帮助A工人建造一座武器
+    /// 再出去). Day-1-only guard; never reset.
+    pub d1_weapon_helped: bool,
+
     /// Compact telemetry baselines used to report deltas rather than dumping
     /// full protocol payloads every round.
     pub prev_total_score: Option<i64>,
@@ -683,6 +703,8 @@ impl BotState {
             self.gate_cell = None;
             // Every dusk commitment was discharged by last night's recall.
             self.dusk_home.clear();
+            // Yesterday's buy plan is discharged; today's planner recomputes.
+            self.buy_deadline = None;
             // A new day's news is a new question, and the day's read starts over
             // with it — including the attempt count, so one bad answer on
             // Monday does not cost the read on Tuesday.

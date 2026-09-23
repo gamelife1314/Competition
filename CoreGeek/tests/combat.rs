@@ -660,22 +660,43 @@ fn night_round_one_response_contains_attack_commands() {
     // sanitize → serialize — because that is what the judger receives. A
     // planner-level check would not catch an attack command silently dropped
     // by validation or mis-serialized away.
-    let payload = night_world(
-        71,
-        vec![
-            gatling(10020, 10, 10, 1),
-            gatling(10021, 14, 10, 1),
-            gatling(10022, 10, 14, 1),
-            worker(10010, 11, 10), // adjacent to 10020
-            worker(10011, 13, 10), // adjacent to 10021
-            worker(10012, 11, 14), // adjacent to 10022
-        ],
-        vec![
+    //
+    // Issue #221 phase 3: the LAST worker (10012) is the economy worker — it
+    // owns its own mainline and keeps working at night instead of pairing onto
+    // a tower, so the third gun is the pioneer's. The enemy station sits NORTH
+    // so the pioneer's post choice (`pioneer_post`, safest = furthest from the
+    // bearing) keeps it on 10022, the gun it is already adjacent to. Phase 4's
+    // L-shape gives one operator several guns and the roster shifts again.
+    let payload = json!({
+        "roundNo": 71,
+        "mapInfo": {"width": 41, "height": 32, "zones": []},
+        "teamOur": {
+            "type": "challenger", "goldNum": 0, "totalScore": 0,
+            "playerTasks": [], "roles": vec![
+                gatling(10020, 10, 10, 1),
+                gatling(10021, 14, 10, 1),
+                gatling(10022, 10, 14, 1),
+                worker(10010, 11, 10), // adjacent to 10020
+                worker(10011, 13, 10), // adjacent to 10021
+                worker(10012, 30, 25), // economy worker — out mining, far from guns and robots
+                json!({
+                    "id": 10013, "pos": {"x": 11, "y": 14}, "roleType": "pioneer",
+                    "health": 200, "attackPower": 0, "attackRange": 0,
+                    "backPackCapability": 40, "backpack": []
+                }), // adjacent to 10022
+            ]
+        },
+        "teamEnemy": {"roles": vec![json!({
+            "id": 20001, "pos": {"x": 10, "y": 0}, "roleType": "station",
+            "health": 10000, "attackPower": 0, "attackRange": 0,
+            "level": 1, "backPackCapability": 0, "backpack": []
+        })]},
+        "robot": {"roles": vec![
             robot(30001, 11, 9, 40, "challenger"),
             robot(30002, 13, 9, 40, "challenger"),
             robot(30003, 9, 13, 40, "challenger"),
-        ],
-    );
+        ]},
+    });
     let out = coregeek::brain::respond(payload.to_string().as_bytes());
     let value: Value = serde_json::from_str(&out).expect("valid JSON response");
     let map = value.get("roleCommandMap").expect("has roleCommandMap");
@@ -788,30 +809,6 @@ fn choose_mine_prefers_stone_when_walls_needed() {
         mine.map(|(pos, _)| pos),
         Some(Pos { x: 10, y: 11 }),
         "stone for the wall line wins"
-    );
-}
-
-#[test]
-fn night_spare_worker_shelters_not_mine() {
-    // A spare worker far from base with a mine right next to it must walk
-    // toward the base — night is for manning weapons and sheltering, never
-    // for mining outside the walls.
-    let turn = turn_from(world_zones(
-        vec![
-            station(10, 20, 1),
-            gatling(10020, 9, 20, 1),
-            worker(10011, 11, 20), // paired: nearest to the tower
-            worker(10010, 30, 30), // spare, far away
-        ],
-        vec![],
-        vec![zone(30, 31, "iron")], // adjacent to the spare
-    ));
-    let mut state = BotState::default();
-    let plan = coregeek::brain::night::plan(&turn, &mut state);
-    let cmd = plan.commands.get(&10010).expect("spare worker acts");
-    assert_eq!(
-        cmd.action, "move",
-        "spare worker shelters instead of mining"
     );
 }
 

@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use crate::brain::{
-    economy, news, night, route, stand_cells, task, tower_stand_cells, treasure,
+    economy, news, route, stand_cells, task, tower_stand_cells, treasure,
     walk_or_remove_wall, walk_toward, Plan,
 };
 use crate::model::{
@@ -101,7 +101,7 @@ fn stone_batch(turn: &Turn, gaps: usize) -> i64 {
 /// Day-rounds after dusk during which a stone carrier may still walk out to
 /// close the last hole in the ring. Long enough for a round trip from any
 /// tower post, short enough that the gun is manned again well before night.
-const SEAL_GRACE: i64 = 8;
+pub(crate) const SEAL_GRACE: i64 = 8;
 /// The day-round past which the gate is sealed whether or not the crew is home.
 ///
 /// `SEAL_GRACE` is the window the seal is *allowed* to spend; this is the point
@@ -180,11 +180,26 @@ const ECONOMY_D1_STONE_SHARE: i64 = 6;
 /// other round from R17 to R56. Used by `worker_day`'s `ring_fits_without_me`,
 /// which is what stops the economy worker standing down while the cells it
 /// would leave behind no longer fit in the afternoon.
-const ROUNDS_PER_RING_CELL: i64 = 2;
+pub(crate) const ROUNDS_PER_RING_CELL: i64 = 2;
 
 pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
+    plan_owned(turn, state, &[], &mut HashSet::new())
+}
+
+/// The day plan with the issue-#221 roster seam: every unit id in `owned` is
+/// dispatched by a role mainline ([`crate::brain::role`]) instead of the legacy
+/// worker loop — this planner skips it entirely (no wall duty, no shopping
+/// errand, no backstop walk) and the caller merges the plans. `owned == &[]`
+/// is exactly the old `plan`, which is what the test crates still drive.
+/// `claimed` is shared with the mainlines so two people never reserve the same
+/// vein or build site.
+pub(crate) fn plan_owned(
+    turn: &Turn,
+    state: &mut BotState,
+    owned: &[i64],
+    mut claimed: &mut HashSet<Pos>,
+) -> Plan {
     let mut plan = Plan::default();
-    let mut claimed: HashSet<Pos> = HashSet::new();
 
     // THE ENTRANCE IS CHOSEN BEFORE ANYTHING ELSE IS PLANNED.
     //
@@ -216,8 +231,13 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     }
 
     let tower_gaps = tower_gaps(turn, state);
-    let pairs = night::stable_pairs(turn, state);
-    update_wall_gate(turn, state, &pairs);
+    // Owned-aware: units dispatched by a role mainline (the economy worker)
+    // are NOT in these pairs. B stays outside the ring after dark on purpose
+    // (comment 1 §6), so B's position must neither hold the gate open nor veto
+    // the last wall as a "trap" — issues #111/#112/#115 sealed the ring with
+    // everyone inside; the new B is deliberately not everyone.
+    let pairs = super::action::fight::stable_pairs_owned(turn, state, owned);
+    update_wall_gate(turn, state, &pairs, owned);
     let wall_gaps = wall_gaps(turn, state);
     // Ring integrity, remembered across days. An EMPTY gap list with walls
     // standing means the shell is closed — the door the economy cut this
@@ -372,10 +392,23 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     let wall_work_done = wall_gaps.is_empty() && !shared_wall_duty;
     let buyer_id: Option<i64> = if budget.intent.is_empty() {
         None
-    } else if wall_work_done && workers.len() >= 2 {
-        workers.first().map(|unit| unit.id)
     } else {
-        workers.last().map(|unit| unit.id)
+        let prefer = if wall_work_done && workers.len() >= 2 {
+            workers.first()
+        } else {
+            workers.last()
+        };
+        // A buyer owned by a role mainline cannot be sent on the legacy trip;
+        // the errand falls to the first worker this planner still commands.
+        prefer
+            .map(|unit| unit.id)
+            .filter(|id| !owned.contains(id))
+            .or_else(|| {
+                workers
+                    .iter()
+                    .map(|unit| unit.id)
+                    .find(|id| !owned.contains(id))
+            })
     };
     // Tower plan telemetry: whether a third weapon is being held back for the
     // 100-gold upgrade, and whether that upgrade is still reachable, is the
@@ -479,6 +512,12 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             .and_then(|id| turn.role_by_id(id).map(|role| role.pos))
             .map(|pos| economy::shop_travel(turn, pos))
             .unwrap_or(-1);
+        // Cross-person sync (issue #221, comment 1 §6/§7): the economy worker
+        // must turn its ore into gold BEFORE the buyer stands at the counter,
+        // or the purchase waits a whole loop. Transitional source: the legacy
+        // buyer's own walk; phase 5 moves the computation to the pioneer's
+        // "buy + return + use" budget, which is what the comment describes.
+        state.buy_deadline = (buyer_dist >= 0).then_some(turn.round_no + buyer_dist);
         crate::log::event(
             "shopping",
             serde_json::json!({
@@ -530,9 +569,14 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
                 "ready": budget.shopping.iter().map(|need| need.name.as_str()).collect::<Vec<_>>(),
             }),
         );
+    } else {
+        state.buy_deadline = None;
     }
 
     for worker in &workers {
+        if owned.contains(&worker.id) {
+            continue; // dispatched by its role mainline, not by this planner
+        }
         worker_day(
             turn,
             state,
@@ -547,6 +591,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             shared_wall_duty,
             ring_at_risk,
             &pairs,
+            owned,
             &mut claimed,
             &mut plan,
         );
@@ -583,7 +628,7 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // Claims are deliberately ignored here. A reservation is etiquette for
     // choosing between two targets; it must never be a reason to do nothing.
     for role in turn.controllable() {
-        if plan.commands.contains_key(&role.id) {
+        if owned.contains(&role.id) || plan.commands.contains_key(&role.id) {
             continue;
         }
         // …except a pioneer holding a task. It is not idle: it is standing
@@ -678,6 +723,7 @@ fn worker_day(
     shared_wall_duty: bool,
     ring_at_risk: bool,
     pairs: &[(i64, i64)],
+    owned: &[i64],
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
 ) {
@@ -710,7 +756,7 @@ fn worker_day(
         let mut gaps = wall_gaps.to_vec();
         gaps.sort_by_key(|site| (Some(*site) != gate, chebyshev(role.pos, *site)));
         if let Some(site) = gaps.into_iter().find(|site| {
-            !wall_would_trap(turn, pairs, state, *site)
+            !wall_would_trap(turn, pairs, state, *site, owned)
                 || turn.in_day_round >= HARD_SEAL_ROUND
         }) {
             let gate = gate == Some(site);
@@ -787,7 +833,7 @@ fn worker_day(
             turn.is_land(*site)
                 && !claimed.contains(site)
                 && !turn.walls().iter().any(|wall| wall.pos == *site)
-                && !wall_would_trap(turn, pairs, state, *site)
+                && !wall_would_trap(turn, pairs, state, *site, owned)
         }) {
             claimed.insert(site);
             if chebyshev(role.pos, site) == 1 {
@@ -950,7 +996,7 @@ fn worker_day(
                         .find(|site| {
                             !claimed.contains(site)
                                 && chebyshev(role.pos, **site) == 1
-                                && !wall_would_trap(turn, pairs, state, **site)
+                                && !wall_would_trap(turn, pairs, state, **site, owned)
                         })
                         .copied()
                     {
@@ -1133,7 +1179,7 @@ fn worker_day(
                 .find(|site| {
                     !claimed.contains(site)
                         && chebyshev(role.pos, **site) == 1
-                        && !wall_would_trap(turn, pairs, state, **site)
+                        && !wall_would_trap(turn, pairs, state, **site, owned)
                 })
                 .copied()
         } else {
@@ -1158,7 +1204,7 @@ fn worker_day(
         // Otherwise commit to the wall line once we carry a batch of stone.
         if load_complete && reserve_met {
             for site in wall_gaps {
-                if claimed.contains(site) || wall_would_trap(turn, pairs, state, *site) {
+                if claimed.contains(site) || wall_would_trap(turn, pairs, state, *site, owned) {
                     continue;
                 }
                 if let Some(cmd) = build_or_walk(turn, role, *site, "wall", claimed) {
@@ -2186,10 +2232,25 @@ pub(crate) fn roles_can_reach(turn: &Turn, pairs: &[(i64, i64)]) -> bool {
 /// far-side-first build order, this guarantees the ring is only ever closed
 /// after everyone has retreated inside — and that the last stone can still
 /// reach the last gap.
-fn wall_would_trap(turn: &Turn, pairs: &[(i64, i64)], state: &BotState, site: Pos) -> bool {
+pub(crate) fn wall_would_trap(
+    turn: &Turn,
+    pairs: &[(i64, i64)],
+    state: &BotState,
+    site: Pos,
+    owned: &[i64],
+) -> bool {
     let mut blocked = turn.blocked_for(-1);
     blocked.insert(site);
     for role in turn.controllable() {
+        // A unit dispatched by its own mainline is OUTSIDE ON PURPOSE (comment
+        // 1 §6: the economy worker does not come home at dusk). Standing beyond
+        // this wall is that unit's plan, not an accident the wall caused, so
+        // it never gets a veto — otherwise the ring's last cell waits forever
+        // for a worker who is never coming back (the seal board finished at
+        // 19/20 with the door open and the worker's own stones two maps away).
+        if owned.contains(&role.id) {
+            continue;
+        }
         // A role with no gun to man is measured against the inside of the ring
         // (see `night_home`): "no tower" is not "no home", and the hole this
         // wall would cut is in ITS way home, not only in a controller's.
@@ -2229,6 +2290,7 @@ fn wall_would_trap(turn: &Turn, pairs: &[(i64, i64)], state: &BotState, site: Po
         let reachable = |blocked: &HashSet<Pos>| {
             turn.controllable()
                 .iter()
+                .filter(|role| !owned.contains(&role.id))
                 .any(|role| can_build(role, gap, blocked))
         };
         // A gap nobody could reach even before this wall is not the wall's
@@ -2288,6 +2350,39 @@ pub(crate) fn outside_cells(turn: &Turn, footprint: &[Pos]) -> Vec<Pos> {
 // ---------------------------------------------------------------------------
 // Build site planning
 // ---------------------------------------------------------------------------
+
+/// The stone the day still owes: wall gaps inside today's budget, the doors
+/// the economy cut (day 2+), and the gate's own dusk stone. Same arithmetic
+/// `plan` runs inline, recomputed from pure queries so a role mainline (issue
+/// #221) can ask it without threading `plan`'s locals. Reads the STORED
+/// `ring_ever_complete`, which `plan` may set a round later — a one-round lag
+/// on the cap latch, never on the gap count.
+pub(crate) fn stone_demand_of(turn: &Turn, state: &BotState) -> i64 {
+    let wall_gaps = wall_gaps(turn, state);
+    let (ring_owed, _) = ring_gap_split(turn, state);
+    let wall_cap = wall_daily_cap(turn.day, state.ring_ever_complete, ring_owed.len());
+    let wall_demand = (wall_gaps.len() as i64).min(wall_cap);
+    let open_doors = if turn.day > 1 {
+        state
+            .door_cells
+            .iter()
+            .filter(|door| !wall_gaps.contains(door))
+            .count() as i64
+    } else {
+        0
+    };
+    let gate_stone = match wall_gate(turn, state) {
+        Some(gate)
+            if turn.is_land(gate)
+                && !state.door_cells.contains(&gate)
+                && !turn.walls().iter().any(|wall| wall.pos == gate) =>
+        {
+            1
+        }
+        _ => 0,
+    };
+    wall_demand + open_doors + gate_stone
+}
 
 #[cfg(test)]
 mod tests {
@@ -2371,7 +2466,7 @@ mod tests {
             "test setup: nobody is cut off yet, so the wall step is running"
         );
         assert!(
-            wall_would_trap(&turn, &[], &state, pos(21, 20)),
+            wall_would_trap(&turn, &[], &state, pos(21, 20), &[]),
             "the one cell that lets the idle role home was about to be walled over"
         );
     }
@@ -2402,7 +2497,7 @@ mod tests {
             "an idle role standing inside the base is not a veto"
         );
         assert!(
-            !wall_would_trap(&turn, &[], &state, pos(20, 20)),
+            !wall_would_trap(&turn, &[], &state, pos(20, 20), &[]),
             "a wall in the open, far from every role's way home, traps nobody"
         );
     }

@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use super::action::fight::{update_withdraw_holdout, THREAT_RADIUS};
+use super::action::fight::{stable_pairs_owned, update_withdraw_holdout, THREAT_RADIUS};
 use crate::brain::{
     break_out, combat, economy, task, tower_stand_cells, walk_or_remove_wall, walk_toward, Plan,
 };
@@ -21,6 +21,15 @@ pub use super::action::fight::{
 
 
 pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
+    plan_owned(turn, state, &[])
+}
+
+/// The night plan with the issue-#221 roster seam: controllers listed in
+/// `owned` are dispatched by a role mainline ([`crate::brain::role`]) and are
+/// excluded from pairing, withdrawal and the spare loop. Transitional cost:
+/// an owned controller's tower goes dark here until phase 4's L-shape lets one
+/// operator work several guns; `owned == &[]` is exactly the old `plan`.
+pub(crate) fn plan_owned(turn: &Turn, state: &mut BotState, owned: &[i64]) -> Plan {
     let mut plan = Plan::default();
     let mut claimed: HashSet<Pos> = HashSet::new();
 
@@ -40,7 +49,10 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // the pairing never hands a gun to a controller the withdrawal rule owns.
     update_withdraw_holdout(turn, state);
 
-    let mut pairs = stable_pairs(turn, state);
+    // Roster seam (issue #221): an owned controller never takes a legacy gun —
+    // excluded from the greedy pass itself, so its tower pairs with whoever is
+    // left instead of going dark.
+    let mut pairs = stable_pairs_owned(turn, state, owned);
     // Fire the towers under the heaviest pressure first: they get first pick
     // of the shared per-round damage simulation (avoids cross-tower overkill).
     pairs.sort_by_cached_key(|(_controller_id, tower_id)| {
@@ -355,8 +367,8 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     // Spare controllers.
     let controllers: Vec<&Unit> = turn.controllable();
     for role in controllers {
-        if paired.contains(&role.id) {
-            continue;
+        if paired.contains(&role.id) || owned.contains(&role.id) {
+            continue; // dispatched by its role mainline
         }
         spare_night(turn, state, role, &mut claimed, &mut plan);
     }

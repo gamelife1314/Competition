@@ -308,7 +308,7 @@ fn gate_record(turn: &Turn, state: &mut BotState) -> Option<Value> {
         x: STATION.0,
         y: STATION.1,
     });
-    coregeek::brain::day::gate_open_record(turn, &pairs, &footprint)
+    coregeek::brain::day::gate_open_record(turn, &pairs, &footprint, &[])
 }
 
 #[test]

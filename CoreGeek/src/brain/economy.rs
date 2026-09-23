@@ -1448,7 +1448,7 @@ pub fn free_slots(role: &Unit) -> i64 {
 /// the worker walks, and the only question is which of two veins pays better
 /// over the same afternoon. Current price is the fallback and stays the answer
 /// on every day with no news, which is most of them.
-fn priced(turn: &Turn, state: &BotState, ore: &str) -> i64 {
+pub fn priced(turn: &Turn, state: &BotState, ore: &str) -> i64 {
     let current = turn.vendor_prices.get(ore).copied().unwrap_or(1);
     crate::brain::news::expected_price(current, state.price_outlook(ore, turn.day))
 }

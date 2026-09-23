@@ -356,7 +356,12 @@ pub(crate) fn wall_gate(turn: &Turn, state: &BotState) -> Option<Pos> {
     crate::brain::route::gate_of(turn, state)
 }
 
-pub(crate) fn update_wall_gate(turn: &Turn, state: &mut BotState, pairs: &[(i64, i64)]) {
+pub(crate) fn update_wall_gate(
+    turn: &Turn,
+    state: &mut BotState,
+    pairs: &[(i64, i64)],
+    owned: &[i64],
+) {
     // The seal checkpoint is dusk on EVERY day, not just the first. The ring is
     // re-opened each morning by `open_door` (the ore is outside it), so without
     // a daily seal the wall line the crew spends the day rebuilding is a wall
@@ -368,7 +373,7 @@ pub(crate) fn update_wall_gate(turn: &Turn, state: &mut BotState, pairs: &[(i64,
         return;
     };
     let footprint = station.footprint();
-    let open = gate_open_record(turn, pairs, &footprint);
+    let open = gate_open_record(turn, pairs, &footprint, owned);
     if let Some(record) = &open {
         // THE HARD DEADLINE. Up to [`HARD_SEAL_ROUND`] a straggler still holds
         // the ring open, which is the whole point of waiting — the crew walks
@@ -431,10 +436,20 @@ pub fn gate_open_record(
     turn: &Turn,
     pairs: &[(i64, i64)],
     footprint: &[Pos],
+    owned: &[i64],
 ) -> Option<serde_json::Value> {
     let mut away: Vec<serde_json::Value> = Vec::new();
     let mut stuck: Vec<i64> = Vec::new();
     for role in turn.controllable() {
+        // A role dispatched by its own mainline is outside ON PURPOSE (comment
+        // 1 §6: the economy worker does not come home at dusk). The seal
+        // exists so the night never catches somebody beyond the ring by
+        // accident — waiting for a role that will never come in holds the
+        // whole ring open until `HARD_SEAL_ROUND`, which is a gate built too
+        // late to matter (the seal board spent the night at 19/20 that way).
+        if owned.contains(&role.id) {
+            continue;
+        }
         if footprint_distance(role.pos, footprint) <= 1 {
             continue; // home: this one is not what the seal is waiting on
         }

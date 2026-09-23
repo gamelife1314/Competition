@@ -123,6 +123,18 @@ pub fn withdrawing(turn: &Turn, role: &Unit) -> bool {
 /// label sent the reader looking for an ordering bug that did not exist and hid
 /// the real one (a gun with nobody to hold it). Both now read this list.
 pub fn pairing_controllers<'a>(turn: &'a Turn, state: &BotState) -> Vec<&'a Unit> {
+    pairing_controllers_owned(turn, state, &[])
+}
+
+/// [`pairing_controllers`] minus the units a role mainline owns (issue #221):
+/// an owned controller never takes a legacy gun, and — this is the point of
+/// the variant — never consumes one in the greedy pass either, so its tower
+/// goes to the next controller instead of going dark with B standing beside it.
+pub(crate) fn pairing_controllers_owned<'a>(
+    turn: &'a Turn,
+    state: &BotState,
+    owned: &[i64],
+) -> Vec<&'a Unit> {
     turn.controllable()
         .into_iter()
         .filter(|role| !(state.task.active && role.kind == UnitKind::Pioneer))
@@ -130,6 +142,7 @@ pub fn pairing_controllers<'a>(turn: &'a Turn, state: &BotState) -> Vec<&'a Unit
         // it shelters and heals as a spare instead of pacing between the gun
         // and the threat radius all night.
         .filter(|role| !state.withdraw_holdout.contains(&role.id))
+        .filter(|role| !owned.contains(&role.id))
         .collect()
 }
 
@@ -175,9 +188,15 @@ pub fn unpaired_of(turn: &Turn, state: &BotState, pairs: &[(i64, i64)]) -> Vec<(
 }
 
 pub fn pairing(turn: &Turn, state: &BotState) -> Vec<(i64, i64)> {
+    pairing_owned(turn, state, &[])
+}
+
+/// [`pairing`] with the issue-#221 roster seam: controllers in `owned` are
+/// invisible to the greedy pass, so their towers pair with whoever is left.
+pub(crate) fn pairing_owned(turn: &Turn, state: &BotState, owned: &[i64]) -> Vec<(i64, i64)> {
     let mut towers = turn.towers();
     towers.sort_by_cached_key(|tower| std::cmp::Reverse(combat::threat_load(turn, tower)));
-    let mut controllers: Vec<&Unit> = pairing_controllers(turn, state);
+    let mut controllers: Vec<&Unit> = pairing_controllers_owned(turn, state, owned);
     let mut pairs: Vec<(i64, i64)> = Vec::new();
     for tower in towers {
         if controllers.is_empty() {
@@ -396,8 +415,25 @@ fn post_upgrade(turn: &Turn, current: &Unit, candidate: &Unit) -> bool {
 /// assignments stable while all members remain usable, but replaces a dead or
 /// newly freed controller in the very next round.
 pub fn stable_pairs(turn: &Turn, state: &mut BotState) -> Vec<(i64, i64)> {
+    stable_pairs_owned(turn, state, &[])
+}
+
+/// [`stable_pairs`] with the issue-#221 roster seam. The owned set is folded
+/// into the cached controller list, so a caller that owns different units
+/// (the night planner vs the day planner's gun-deadline query) can never read
+/// the other's pairing out of the cache.
+pub(crate) fn stable_pairs_owned(
+    turn: &Turn,
+    state: &mut BotState,
+    owned: &[i64],
+) -> Vec<(i64, i64)> {
     let tower_ids: Vec<i64> = turn.towers().iter().map(|tower| tower.id).collect();
-    let controller_ids: Vec<i64> = turn.controllable().iter().map(|role| role.id).collect();
+    let controller_ids: Vec<i64> = turn
+        .controllable()
+        .iter()
+        .map(|role| role.id)
+        .filter(|id| !owned.contains(id))
+        .collect();
     let task_busy = state.task.active;
     // Who is too wounded to hold a gun this round. It belongs in the cache key
     // with the other membership facts: the pairing now depends on it, and a
@@ -432,7 +468,7 @@ pub fn stable_pairs(turn: &Turn, state: &mut BotState) -> Vec<(i64, i64)> {
         } else {
             "task_occupancy"
         };
-        state.night_pairs = pairing(turn, state);
+        state.night_pairs = pairing_owned(turn, state, owned);
         state.night_pair_day = turn.day;
         state.night_pair_tower_ids = tower_ids;
         state.night_pair_controller_ids = controller_ids;

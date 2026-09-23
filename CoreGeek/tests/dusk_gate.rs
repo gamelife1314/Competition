@@ -168,7 +168,13 @@ impl Day {
             .map(|station| station.footprint().to_vec())
             .unwrap_or_default();
         let pairs = night::stable_pairs(&turn, &mut self.state);
-        self.gates.push(gate_open_record(&turn, &pairs, &footprint));
+        // The same owned list `orchestrate::plan` computes: the economy worker
+        // sleeps outside the ring by design (issue #221 comment 1 §6), so the
+        // production seal never waits on it — the harness must recompute the
+        // record the same way or it measures a gate nobody is waiting for.
+        let owned: Vec<i64> =
+            coregeek::brain::role::Roles::of(&turn).economy_worker.into_iter().collect();
+        self.gates.push(gate_open_record(&turn, &pairs, &footprint, &owned));
         for unit in turn.controllable() {
             self.positions.push((self.round, unit.id, unit.pos));
         }
@@ -264,21 +270,33 @@ fn every_role_is_inside_the_ring_before_nightfall() {
     // at the weapon shop issuing `buy Medicine` every round from r52 on) while
     // `wall_gate_open` named it — the gate is the last ring cell and it does not
     // close while any role is outside.
+    //
+    // Issue #221 exempts ONE role from this roll call: the economy worker
+    // (10003) sleeps outside among the veins by design (comment 1 §6 —
+    // distance is its only defence), and the owned-aware seal never waits on
+    // it. The wall crew and the pioneer still must be home before nightfall,
+    // and stay home — a role that steps back out re-opens the gate it just
+    // closed.
+    const ECONOMY: i64 = 10003;
     let day = Day::play_day(two_guns_board());
     let footprint = day.footprint();
+    let outside = |round: i64| {
+        day.outside_on(round)
+            .into_iter()
+            .filter(|(id, _)| *id != ECONOMY)
+            .collect::<Vec<_>>()
+    };
 
     let settled = (1..=DAY_END)
-        .find(|round| day.outside_on(*round).is_empty())
-        .expect("no round of the day had the whole crew inside the ring");
+        .find(|round| outside(*round).is_empty())
+        .expect("no round of the day had the homebound crew inside the ring");
 
-    // Inside before nightfall, and inside from then on — a role that steps back
-    // out re-opens the gate it just closed.
     assert!(
         settled < DAY_END,
         "the crew only came inside on R{settled}, one round before the night"
     );
     for round in settled..=DAY_END {
-        let outside = day.outside_on(round);
+        let outside = outside(round);
         assert!(
             outside.is_empty(),
             "the crew was inside on R{settled} and back outside on R{round}: \
@@ -325,9 +343,14 @@ fn the_walk_home_never_oscillates() {
     //
     // (Consecutive repeats are collapsed first: a role that has arrived and is
     // holding still legitimately reports the same cell every round.)
+    // Issue #221: the economy worker (10003) has no walk home — it sleeps
+    // outside by design (comment 1 §6), so the path-not-cycle property is
+    // measured on the roles that DO come home. B's own anti-oscillation
+    // posture is the camp (`camp_at_gap`), pinned in `economy_worker_b.rs`
+    // and on the `day1_sim` spare board.
     let day = Day::play_day(two_guns_board());
     let footprint = day.footprint();
-    for id in [10002i64, 10003, 10004] {
+    for id in [10002i64, 10004] {
         let mut walked: Vec<Pos> = Vec::new();
         for round in (COMMIT_IN_DAY..DAY_END).map(|in_day| in_day + 1) {
             let Some(pos) = day.pos_at(id, round) else {
@@ -554,12 +577,16 @@ fn the_ring_is_closed_even_when_a_role_never_makes_it_home() {
             sealed_at = Some(round);
         }
     }
-    assert_eq!(
-        sealed_at,
-        Some(HARD_SEAL_IN_DAY + 1),
-        "the gate never took its deadline: a straggler that cannot get home \
-         held the ring open for the whole day, which is the hole the night \
-         walks through"
+    // Issue #221 moved the deadline's meaning: the locked-out role is the
+    // economy worker, and B sleeps outside BY DESIGN (comment 1 §6) — the
+    // owned-aware seal does not wait for it at all, so the ring now closes at
+    // the first dusk checkpoint instead of being forced at the deadline. What
+    // must still never happen (#121-#125) is the seal not landing: a ring
+    // that stays open all night is the hole the night walks through.
+    assert!(
+        matches!(sealed_at, Some(at) if at < HARD_SEAL_IN_DAY + 1),
+        "the gate never sealed ahead of its deadline while the economy worker \
+         was locked out: sealed_at = {sealed_at:?}"
     );
 }
 

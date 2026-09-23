@@ -69,6 +69,20 @@ pub const TREASURE_RESERVE_CAP: i64 = 45;
 ///   never reserve money the team does not have;
 /// * the night's medicine floor is untouched — see [`TREASURE_GOLD_FLOOR`].
 pub fn gold_reserve(turn: &Turn, state: &BotState) -> i64 {
+    let cost = plan_cost(turn, state);
+    if cost <= 0 || turn.gold < cost + TREASURE_GOLD_FLOOR {
+        return 0;
+    }
+    cost
+}
+
+/// What the live treasure plan's missing items would cost, with NO wallet
+/// gate: [`gold_reserve`] asks "can the buyer afford to set this aside" and
+/// answers 0 for a purse too poor to fund it, but the economy worker's T5
+/// sell trigger (comment 1 §6) asks the opposite question — the plan is live
+/// and the purse is BELOW the floor, which is exactly when the ore must
+/// become gold. Behind `gold_reserve` that trigger could never fire.
+pub fn plan_cost(turn: &Turn, state: &BotState) -> i64 {
     if !matches!(state.treasure.phase, TreasurePhase::HavePlan) {
         return 0;
     }
@@ -102,11 +116,7 @@ pub fn gold_reserve(turn: &Turn, state: &BotState) -> i64 {
             cost = cost.saturating_add(price.saturating_mul(missing));
         }
     }
-    let cost = cost.min(TREASURE_RESERVE_CAP);
-    if cost <= 0 || turn.gold < cost + TREASURE_GOLD_FLOOR {
-        return 0;
-    }
-    cost
+    cost.min(TREASURE_RESERVE_CAP)
 }
 
 /// Should the pioneer HOLD its current cell instead of falling through to
