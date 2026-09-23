@@ -18,8 +18,10 @@
 use crate::model::Turn;
 
 // Role mainline modules land here as the phases replace the legacy planners:
-// `wall_worker` (phase 4), `pioneer` (phase 5).
+// `wall_worker` (phase 4 — 4a delegates to the legacy dispatch), `pioneer`
+// (phase 5).
 pub(crate) mod economy_worker;
+pub(crate) mod wall_worker;
 
 /// Which mainline a controllable unit belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

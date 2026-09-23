@@ -199,8 +199,39 @@ pub(crate) fn plan_owned(
     owned: &[i64],
     mut claimed: &mut HashSet<Pos>,
 ) -> Plan {
+    let ctx = round_context(turn, state, owned);
     let mut plan = Plan::default();
+    plan_roles(turn, state, &ctx, owned, owned, &mut claimed, &mut plan);
+    plan
+}
 
+/// The round's shared reads for the day planner (issue #221 phase 4a): every
+/// number the legacy `plan_owned` computed before dispatching any role. The
+/// role mainlines ([`crate::brain::role`]) and the legacy dispatch
+/// ([`plan_roles`]) read the SAME instance, so demand, budget and pairing can
+/// never disagree between the two schedulers inside one round.
+pub(crate) struct RoundCtx {
+    pub(crate) tower_gaps: Vec<(Pos, String)>,
+    pub(crate) wall_gaps: Vec<Pos>,
+    pub(crate) stone_demand: i64,
+    pub(crate) wall_cap: i64,
+    pub(crate) budget: economy::Budget,
+    pub(crate) buyer_id: Option<i64>,
+    pub(crate) economy_id: Option<i64>,
+    pub(crate) shared_wall_duty: bool,
+    pub(crate) ring_at_risk: bool,
+    pub(crate) pairs: Vec<(i64, i64)>,
+}
+
+/// Compute the [`RoundCtx`]. Split out of `plan_owned` with zero behaviour
+/// change (issue #221 phase 4a): the side effects — the daybreak gate latch,
+/// the dusk seal checkpoint, the ring-completion memory, the buy deadline and
+/// the per-round telemetry — run here exactly once, in the order they always
+/// ran. `owned` is the CONTEXT roster: the units invisible to the pairing, the
+/// gate record, the trap vetoes and the buyer pick. It stays `[B]` in phase
+/// 4a — the wall worker's day still delegates to the legacy dispatch, so the
+/// context must keep counting A.
+pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) -> RoundCtx {
     // THE ENTRANCE IS CHOSEN BEFORE ANYTHING ELSE IS PLANNED.
     //
     // Every walk this day is priced through it: which mine is worth working,
@@ -573,28 +604,46 @@ pub(crate) fn plan_owned(
         state.buy_deadline = None;
     }
 
-    for worker in &workers {
-        if owned.contains(&worker.id) {
+    RoundCtx {
+        tower_gaps,
+        wall_gaps,
+        stone_demand,
+        wall_cap,
+        budget,
+        buyer_id,
+        economy_id,
+        shared_wall_duty,
+        ring_at_risk,
+        pairs,
+    }
+}
+
+/// Dispatch the roles the legacy day planner still owns: the worker loop, the
+/// team prompt slot, the pioneer and the closing backstop. Split out of
+/// `plan_owned` with zero behaviour change (issue #221 phase 4a).
+///
+/// Two rosters, because they answer two questions. `skip` is the DISPATCH
+/// exclusion: ids a role mainline commands around this call — the scheduler
+/// runs the wall worker's BEFORE (its legacy claim priority over the pioneer
+/// and B is preserved) and the economy worker's AFTER, exactly as the merged
+/// plan was ordered before the split. `ctx_owned` is the CONTEXT roster that
+/// `worker_day`'s trap vetoes must see identically to [`round_context`]'s
+/// pairing and gate record — for direct `plan_owned` callers the two lists are
+/// the same one, which is what keeps this a pure move.
+pub(crate) fn plan_roles(
+    turn: &Turn,
+    state: &mut BotState,
+    ctx: &RoundCtx,
+    ctx_owned: &[i64],
+    skip: &[i64],
+    mut claimed: &mut HashSet<Pos>,
+    mut plan: &mut Plan,
+) {
+    for worker in &turn.workers() {
+        if skip.contains(&worker.id) {
             continue; // dispatched by its role mainline, not by this planner
         }
-        worker_day(
-            turn,
-            state,
-            worker,
-            &tower_gaps,
-            &wall_gaps,
-            stone_demand,
-            wall_cap,
-            &budget,
-            buyer_id,
-            economy_id,
-            shared_wall_duty,
-            ring_at_risk,
-            &pairs,
-            owned,
-            &mut claimed,
-            &mut plan,
-        );
+        plan_worker_legacy(turn, state, worker, ctx, ctx_owned, &mut *claimed, &mut *plan);
     }
 
     // The day's news/treasure prompt is a team-level channel, not a role
@@ -612,7 +661,7 @@ pub(crate) fn plan_owned(
     }
 
     if let Some(pioneer) = turn.pioneer() {
-        pioneer_day(turn, state, pioneer, &pairs, &mut claimed, &mut plan);
+        pioneer_day(turn, state, pioneer, &ctx.pairs, &mut claimed, &mut plan);
     }
 
     // Backstop. Every step above can decline: the target is claimed by a
@@ -628,7 +677,7 @@ pub(crate) fn plan_owned(
     // Claims are deliberately ignored here. A reservation is etiquette for
     // choosing between two targets; it must never be a reason to do nothing.
     for role in turn.controllable() {
-        if owned.contains(&role.id) || plan.commands.contains_key(&role.id) {
+        if skip.contains(&role.id) || plan.commands.contains_key(&role.id) {
             continue;
         }
         // …except a pioneer holding a task. It is not idle: it is standing
@@ -657,8 +706,41 @@ pub(crate) fn plan_owned(
             plan.push(role.id, cmd);
         }
     }
+}
 
-    plan
+/// The legacy per-worker day dispatch behind the phase-4a delegation in
+/// [`crate::brain::role::wall_worker`]: unfolds one [`RoundCtx`] into
+/// `worker_day`'s argument list. `owned` is the CONTEXT roster (see
+/// [`plan_roles`]) — the list the trap vetoes inside `worker_day` measure
+/// "would somebody be locked out" against, which must stay the same list
+/// [`round_context`] paired and sealed with.
+pub(crate) fn plan_worker_legacy(
+    turn: &Turn,
+    state: &mut BotState,
+    role: &Unit,
+    ctx: &RoundCtx,
+    owned: &[i64],
+    claimed: &mut HashSet<Pos>,
+    plan: &mut Plan,
+) {
+    worker_day(
+        turn,
+        state,
+        role,
+        &ctx.tower_gaps,
+        &ctx.wall_gaps,
+        ctx.stone_demand,
+        ctx.wall_cap,
+        &ctx.budget,
+        ctx.buyer_id,
+        ctx.economy_id,
+        ctx.shared_wall_duty,
+        ctx.ring_at_risk,
+        &ctx.pairs,
+        owned,
+        claimed,
+        plan,
+    );
 }
 
 /// Is this role pinned to a task point this round?
@@ -675,7 +757,7 @@ fn holds_task_point(state: &BotState, role: &Unit) -> bool {
 /// Last resort for a role that produced no command: close on the station.
 /// Returns `None` when holding position is the right answer (already at a gun
 /// or already inside), so the deliberate dusk lock-in is never overridden.
-fn fallback_toward_station(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
+pub(crate) fn fallback_toward_station(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
     let station = turn.station()?;
     let footprint = station.footprint();
     if footprint_distance(role.pos, &footprint) <= 1 {
