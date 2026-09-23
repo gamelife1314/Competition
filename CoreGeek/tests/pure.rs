@@ -44,8 +44,10 @@ fn command_extraction() {
     let cmd = extract_command(resp).unwrap();
     assert!(cmd.starts_with("curl"), "{cmd}");
 
-    let resp = "ls -la /tmp";
-    assert_eq!(extract_command(resp).as_deref(), Some("ls -la /tmp"));
+    // A bare command with no fence is NOT executable any more: the judger
+    // sandbox needs an unambiguous block to run, so prose that merely looks
+    // like a command is treated as no command at all.
+    assert!(extract_command("ls -la /tmp").is_none());
 
     assert!(extract_command("我不确定该怎么做").is_none());
 }

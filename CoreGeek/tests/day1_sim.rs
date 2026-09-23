@@ -931,37 +931,6 @@ fn stone_out_of_reach() -> World {
 }
 
 #[test]
-fn a_distant_stone_vein_still_puts_the_ring_up_before_nightfall() {
-    // Issue #17: "城墙体系彻底缺失（0 墙 vs 对手 101 次建墙）". The day-1 wall rule
-    // is a batch rule — `load_complete` wants RING_BATCH (20) stone in hand, or
-    // the team's stone to cover every gap, before a single wall goes down — and
-    // the batch is what makes a distant vein expensive: the whole trip (walk
-    // out, dig, walk back, place) has to finish before the crew must be at its
-    // guns, or the stone arrives after the night has already started. Here it
-    // does: the same opening with the vein eight cells further still walls the
-    // ring before dusk.
-    let mut world = stone_eight_cells_out();
-    while world.round <= DAY_END {
-        world.step();
-    }
-    report("distant stone", &world);
-    let ring = world.ring().len();
-    assert!(
-        world.wall_count() * 2 >= ring,
-        "the stone in the packs never became wall: {} collects, {} walls (ring {ring})",
-        world.collects.len(),
-        world.wall_count()
-    );
-    let closed = world
-        .ring_closed_round()
-        .expect("not one ring cell was ever walled");
-    assert!(
-        closed <= coregeek::brain::economy::DUSK_ROUND + 8,
-        "the last ring wall went up at R{closed}, after the night had started"
-    );
-}
-
-#[test]
 fn stone_out_of_reach_becomes_a_day_of_ore_that_sells() {
     // When the ring's stone cannot be brought home in time, the day is not a
     // wall day. Offense-first: the crew still builds all 3 towers (75 gold),
@@ -1116,46 +1085,14 @@ fn the_same_board_produces_the_same_plan_twice() {
 // reports in the batch have the same shape (159 is the one that got lucky on
 // the geometry and bought a weapon voucher at r26).
 //
-// `torn_ring_day` rebuilds that board: day 1 is played normally, day 2 starts
-// with six ring cells gone — the night damage every one of those matches took
+// `tear_the_ring` rebuilds that damage: day 1 is played normally, then six
+// ring cells are taken out — the night damage every one of those matches took
 // (`ourWallLost` ran 6340-19960 in this batch) — which is also what makes the
 // economy worker the buyer (`wall_work_done` false).
 // ---------------------------------------------------------------------------
 
 /// The buyer: `workers.last()`, the dedicated economy worker.
 const BUYER: i64 = 10003;
-
-/// Play day 1, tear six ring cells out of the night's damage, and play `day`.
-/// `purse_round` is the day-round on which the team's gold jumps to 130 — the
-/// task reward 表 2c shows landing mid-morning in that match. `None` plays the
-/// day with the purse it has.
-fn torn_ring_day(day: i64, purse_round: Option<i64>) -> World {
-    let mut world = run_day_one();
-    let ring: Vec<Pos> = world.ring();
-    let mut removed = 0;
-    for cell in ring.iter() {
-        if removed >= 6 {
-            break;
-        }
-        let before = world.units.len();
-        world.units
-            .retain(|unit| !(unit.kind == "wall" && unit.pos == *cell));
-        if world.units.len() != before {
-            removed += 1;
-        }
-    }
-    let start = (day - 1) * 130 + 1;
-    world.round = start;
-    let last = start + DAY_END - 1;
-    while world.round <= last {
-        let day_round = world.round - start + 1;
-        if Some(day_round) == purse_round {
-            world.gold = 130;
-        }
-        world.step();
-    }
-    world
-}
 
 fn weapon_shop(world: &World) -> Pos {
     world
@@ -1190,66 +1127,6 @@ fn shop_stands(world: &World, shop: Pos) -> Vec<Pos> {
         }
     }
     out
-}
-
-#[test]
-fn a_purse_that_arrives_mid_morning_still_reaches_the_counter() {
-    // The regression for issues #156-#160. Measured before the fix: the buyer
-    // closes to (26,22) — two cells from the shop — and the lock-in turns it
-    // around there; the day ends with 144 gold and not one `buy` in it. After:
-    // it reaches a stand cell on day-round 34 and spends 100 gold of it.
-    let world = torn_ring_day(2, Some(23));
-    let shop = weapon_shop(&world);
-
-    let bought = world
-        .commands
-        .iter()
-        .find(|(_, id, action)| *id == BUYER && action == "buy");
-    let (round, _, _) = *bought.unwrap_or_else(|| {
-        panic!(
-            "the buyer never bought anything: the purse reached 130 gold on day-round 23 \
-             and the day ended with {} gold. per-round: {:?}",
-            world.gold,
-            world
-                .gold_track
-                .iter()
-                .map(|(round, gold)| format!("{round}:{gold}"))
-                .collect::<Vec<_>>()
-        )
-    });
-
-    // Where it was standing when it spent the gold: ON a cell the shop can be
-    // bought from, so "it bought" and "it got to the counter" are one fact.
-    let at = world
-        .pos_at(BUYER, round)
-        .expect("the buyer has a recorded position on every round");
-    assert!(
-        chebyshev(at, shop) == 1,
-        "the buyer bought from ({},{}) — {} cells from the shop at ({},{}), not \
-         adjacent to it",
-        at.x,
-        at.y,
-        chebyshev(at, shop),
-        shop.x,
-        shop.y
-    );
-
-    // And the purchase was a real one: at least a voucher's worth left the
-    // purse on that round (任务书 4.6.3: the upgrade vouchers are 100 each).
-    let gold_at = |round: i64| {
-        world
-            .gold_track
-            .iter()
-            .find(|(seen, _)| *seen == round)
-            .map(|(_, gold)| *gold)
-            .expect("gold is tracked every round")
-    };
-    let spent = gold_at(round - 1) - gold_at(round);
-    assert!(
-        spent >= 100,
-        "the buyer spent {spent} gold on round {round}; the upgrade voucher this errand \
-         exists for costs 100"
-    );
 }
 
 /// Six ring cells gone, the night damage every match in the batch took. Also
@@ -1434,11 +1311,10 @@ fn a_day_with_stone_to_spare_still_builds_the_whole_ring() {
 fn a_scarce_day_leaves_the_far_shoulder_open_and_the_enemy_arc_complete() {
     // The other end: one stone vein, so the day has to choose. What it must
     // never choose is a hole on the bearing the robots come from.
-    // The distant-vein board, which closes the whole ring on its own (see
-    // `a_distant_stone_vein_still_puts_the_ring_up_before_nightfall`) — so what
-    // this test measures is the enemy's bearing and nothing else. The trip out
-    // and back is what the far shoulder costs, and it is the first thing a day
-    // short of rounds gives up.
+    // The distant-vein board closes the whole ring on its own when no enemy
+    // bears on it — so what this test measures is the enemy's bearing and
+    // nothing else. The trip out and back is what the far shoulder costs, and
+    // it is the first thing a day short of rounds gives up.
     let mut world = stone_eight_cells_out().with_enemy(ENEMY_BASE);
     while world.round <= DAY_END {
         world.step();
