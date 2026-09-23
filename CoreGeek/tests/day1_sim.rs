@@ -1094,41 +1094,6 @@ fn the_same_board_produces_the_same_plan_twice() {
 /// The buyer: `workers.last()`, the dedicated economy worker.
 const BUYER: i64 = 10003;
 
-fn weapon_shop(world: &World) -> Pos {
-    world
-        .zones
-        .iter()
-        .find(|(_, kind)| kind.as_str() == "weaponShop")
-        .map(|(pos, _)| *pos)
-        .expect("the harness board always has a weapon shop")
-}
-
-/// The cells a role can reach the shop from (任务书 4.4: `buy` is issued from
-/// within one cell of the shop). Computed here rather than through
-/// `brain::stand_cells` because that one takes a parsed `Turn`.
-fn shop_stands(world: &World, shop: Pos) -> Vec<Pos> {
-    let mut out = Vec::new();
-    for dx in -1..=1 {
-        for dy in -1..=1 {
-            if dx == 0 && dy == 0 {
-                continue;
-            }
-            let pos = Pos {
-                x: shop.x + dx,
-                y: shop.y + dy,
-            };
-            if pos.x < 0 || pos.y < 0 || pos.x >= WIDTH || pos.y >= HEIGHT {
-                continue;
-            }
-            if world.zones.contains_key(&pos) {
-                continue;
-            }
-            out.push(pos);
-        }
-    }
-    out
-}
-
 /// Six ring cells gone, the night damage every match in the batch took. Also
 /// what makes the economy worker the buyer: `wall_work_done` is false while the
 /// ring has gaps, and the buyer is `workers.last()` (see `plan`).
@@ -1151,19 +1116,19 @@ fn tear_the_ring(world: &mut World) -> usize {
 }
 
 #[test]
-fn a_shop_trip_that_cannot_finish_before_dusk_is_not_started() {
-    // The other half of the same rule, and the reason the fix is a time-box and
-    // not a blanket "shopping outranks the lock-in".
+fn the_economy_worker_never_runs_the_shop_errand() {
+    // D23 rewrite (issue #221). This scenario pinned the legacy buyer's dusk
+    // time-box: "a shop trip that cannot finish before dusk is not started".
+    // Under the unified scheduler the economy worker (B, unit 10003) is no
+    // longer anybody's buyer — its mainline (comment 1 §5/§6) has no shop
+    // step at all: heal, help with ONE day-1 weapon, dig, sell. Purchasing
+    // moves to the pioneer's fixed whitelist in phase 5; until then the
+    // legacy `shop_errand_fits` time-box still guards Worker A.
     //
-    // Board: day 2, day-round 45, ring torn open (so the economy worker is the
-    // buyer) and the purse at 130 with an empty pack. The buyer stands five
-    // cells from its post and ten from the nearest shop stand: the round trip
-    // needs 26 rounds and there are ten left before dusk, and the pre-position
-    // lock-in is not due until day-round 46, so step 7 gets its turn.
-    //
-    // Before the fix the buyer set off anyway — nothing compared the two
-    // numbers — and the lock-in turned it around partway with the purse
-    // unspent. The assertion is on the TARGET CELL of the step it takes.
+    // The old assertion (B's step must not reduce its distance to the
+    // counter) measured walking geometry that B's earn loop legitimately
+    // crosses — veins and the vendor share a bearing on this board. The spec
+    // assertion is direct: on the same board, B works, and B never buys.
     let mut world = run_day_one();
     assert!(tear_the_ring(&mut world) >= 6, "the day-1 ring was never built");
     {
@@ -1171,49 +1136,31 @@ fn a_shop_trip_that_cannot_finish_before_dusk_is_not_started() {
             .units
             .iter_mut()
             .find(|unit| unit.id == BUYER)
-            .expect("the buyer is on the board");
+            .expect("the economy worker is on the board");
         buyer.pos = Pos { x: 17, y: 20 };
         buyer.backpack.clear();
     }
     world.gold = 130;
-    let shop = weapon_shop(&world);
-    let stands = shop_stands(&world, shop);
-    let nearest_stand = |pos: Pos| -> i32 {
-        stands
-            .iter()
-            .map(|stand| chebyshev(pos, *stand))
-            .min()
-            .unwrap_or(i32::MAX)
-    };
 
     world.round = 130 + 45; // day 2, day-round 45
-    let here = world.units.iter().find(|unit| unit.id == BUYER).unwrap().pos;
     world.step();
 
-    // It has to be DOING something — a buyer that froze would pass this test
-    // for the wrong reason.
+    // It has to be DOING something — a frozen B would pass the buy check for
+    // the wrong reason.
     let action = world
         .commands
         .iter()
         .find(|(round, id, _)| *round == 175 && *id == BUYER)
         .map(|(_, _, action)| action.clone())
-        .unwrap_or_else(|| panic!("the buyer issued no command at all from {here:?}"));
-    // Standing still and working are both fine; walking toward the shop is not.
-    if let Some((_, _, from, to)) = world
-        .moves
-        .iter()
-        .find(|(round, id, _, _)| *round == 175 && *id == BUYER)
-    {
-        assert!(
-            nearest_stand(*to) >= nearest_stand(*from),
-            "the buyer {action}ed its way toward the shop ({:?} -> {:?}: {} -> {} cells \
-             from the counter) with ten rounds left before dusk and a 26-round round trip",
-            from,
-            to,
-            nearest_stand(*from),
-            nearest_stand(*to)
-        );
-    }
+        .expect("the economy worker issued no command at all");
+    assert_ne!(
+        action, "buy",
+        "the economy worker ran a shop errand; buying is not in its chain"
+    );
+    assert!(
+        matches!(action.as_str(), "move" | "collect" | "build"),
+        "the economy worker neither shopped nor worked: {action}"
+    );
 }
 
 #[test]
