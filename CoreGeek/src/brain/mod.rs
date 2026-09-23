@@ -6,6 +6,8 @@ pub mod day;
 pub mod economy;
 pub mod news;
 pub mod night;
+pub mod orchestrate;
+pub mod role;
 pub mod route;
 pub mod task;
 pub mod treasure;
@@ -66,11 +68,10 @@ pub fn decide_with(state: &mut BotState, raw_body: &[u8]) -> Result<String, Stri
     let turn = Turn::from_request(req);
     state.observe(&turn);
 
-    let mut plan = if turn.is_day {
-        day::plan(&turn, state)
-    } else {
-        night::plan(&turn, state)
-    };
+    // One callee: the unified scheduler (issue #221). The legacy day/night
+    // delegation lives inside `orchestrate::plan` until the role mainlines
+    // replace it — `decide_with` itself never forks on the clock again.
+    let mut plan = orchestrate::plan(&turn, state);
 
     // executeCmd is only accepted by the judger while a task is active.
     if !state.task.active {
