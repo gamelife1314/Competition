@@ -60,18 +60,27 @@ fn selected_events(text: &str) -> BTreeSet<String> {
 /// Every event name some `log::event("...")` call site emits.
 fn emitted_events() -> BTreeSet<String> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Recursive walk (issue #221): emitters now also live in subdirectories
+    // like `brain/action/` and `brain/role/`, and a flat scan silently loses
+    // them — the audit then reports a live event as "emitted nowhere". Sorted
+    // so the first-match-by-name payload lookups stay deterministic.
     let mut files = vec![src.join("main.rs"), src.join("log.rs")];
-    for dir in ["brain", "model", ""] {
-        let dir = src.join(dir);
+    let mut stack = vec![src.to_path_buf()];
+    let mut walked = Vec::new();
+    while let Some(dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "rs") {
-                    files.push(path);
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().map_or(false, |ext| ext == "rs") {
+                    walked.push(path);
                 }
             }
         }
     }
+    walked.sort();
+    files.extend(walked);
 
     let mut out = BTreeSet::new();
     for path in files {
@@ -104,18 +113,27 @@ fn emitted_events() -> BTreeSet<String> {
 /// here is which FIELDS are inside them — not how they are formatted.
 fn emitted_payloads() -> Vec<(String, String)> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // Recursive walk (issue #221): emitters now also live in subdirectories
+    // like `brain/action/` and `brain/role/`, and a flat scan silently loses
+    // them — the audit then reports a live event as "emitted nowhere". Sorted
+    // so the first-match-by-name payload lookups stay deterministic.
     let mut files = vec![src.join("main.rs"), src.join("log.rs")];
-    for dir in ["brain", "model", ""] {
-        let dir = src.join(dir);
+    let mut stack = vec![src.to_path_buf()];
+    let mut walked = Vec::new();
+    while let Some(dir) = stack.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "rs") {
-                    files.push(path);
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().map_or(false, |ext| ext == "rs") {
+                    walked.push(path);
                 }
             }
         }
     }
+    walked.sort();
+    files.extend(walked);
 
     let mut out = Vec::new();
     for path in files {

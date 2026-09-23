@@ -6,3 +6,5 @@
 //! legacy planners (until phase 5 deletes them) and the new mainlines call the
 //! same code.
 pub mod fight;
+pub mod mine;
+pub mod sell;
