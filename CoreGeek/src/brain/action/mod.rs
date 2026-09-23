@@ -10,4 +10,5 @@ pub mod fight;
 pub mod geometry;
 pub mod mine;
 pub mod sell;
+pub mod shop;
 pub mod tower_site;
