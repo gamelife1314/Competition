@@ -5,6 +5,9 @@
 //! "what next" of each person. Extracted from `day.rs`/`night.rs` so both the
 //! legacy planners (until phase 5 deletes them) and the new mainlines call the
 //! same code.
+pub mod build;
 pub mod fight;
+pub mod geometry;
 pub mod mine;
 pub mod sell;
+pub mod tower_site;
