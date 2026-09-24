@@ -1,17 +1,18 @@
-//! Shop: the buyer's craft — medicine, provisioning, the shop/vendor walks,
-//! the buyer flow, trip-budget arithmetic, summon orders and vouchers
-//! (issue #221 phase 2d).
+//! Shop: the buyer's craft — medicine, provisioning, the shop walks, summon
+//! orders, vouchers and the FIXED BUY WHITELIST of comment 1 §3 (issue #221
+//! phase 5b).
 //!
-//! Pure move out of `day.rs`, unchanged except visibility. Phase 5 replaces
-//! the intent-list shopping with the comment-1 fixed buy whitelist (base →
-//! weapon → front wall → … → LargeRobotSummonOrder → Bomb → Boss) and the
-//! WallFixer surplus caps; the trip-budget guards become the pioneer's
-//! person-relative round arithmetic.
+//! The pioneer is the buyer ([`crate::brain::role::pioneer`]'s shop step): the
+//! legacy intent-list shopping and its pair-based trip budgets are gone, and
+//! [`fixed_buy_list`] below is the whole purchasing policy — 清单外不买. The
+//! only two entries that do not rank in the list are the special cases the
+//! comment names: the WallFixer surplus conversion (capped per day) and the
+//! Medicine a wounded role buys for itself ([`self_provision`]).
 
 use std::collections::HashSet;
 
-use crate::brain::day::walk_home;
-use crate::brain::{economy, stand_cells, walk_toward};
+use super::base_layout;
+use crate::brain::{combat, economy, stand_cells, walk_toward};
 use crate::model::{chebyshev, Turn, Unit};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
@@ -83,7 +84,7 @@ pub(crate) fn self_provision(
     // a potion is the only way back onto its gun. Above it the shop trip is not
     // worth abandoning the day's errand for, so the purchase waits until the
     // role happens to be there (the buyer, or the pre-night top-up above).
-    let critical = role.health * 10 < max_hp * crate::brain::night::WITHDRAW_HEALTH_TENTHS;
+    let critical = role.health * 10 < max_hp * super::fight::WITHDRAW_HEALTH_TENTHS;
     if !critical || !may_travel {
         return None;
     }
@@ -113,182 +114,168 @@ pub(crate) fn walk_to_shop(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>)
     walk_toward(turn, role, &stands, claimed)
 }
 
-/// Buy the first needed item: walk to the weapon shop, then buy. Buying is
-/// the buyer's sole job — a carried summon order must never preempt a voucher,
-/// upgrade or repair purchase.
-pub(crate) fn buyer_flow(
-    turn: &Turn,
-    role: &Unit,
-    shopping: &[economy::Need],
-    pairs: &[(i64, i64)],
-    claimed: &mut HashSet<Pos>,
-) -> Option<RoleCommand> {
-    let need = shopping.first()?;
-    let mut stands: Vec<Pos> = Vec::new();
-    for shop in turn.weapon_shops() {
-        stands.extend(stand_cells(turn, shop));
+/// THE FIXED BUY WHITELIST of comment 1 §3 (issue #221 phase 5b), in the
+/// comment's own order — 清单外不买, nothing outside this list is ever bought:
+///
+///   1. 基地券, and the base's health shortfall lifts it to the very front
+///      (基地血量不足优先);
+///   2. 武器券1, sized by the L1 weapons standing (按当前L1武器数);
+///   3. 正面墙券1, sized by the L1 walls on the enemy-facing front;
+///   4. 武器券2, sized by the L2 weapons;
+///   5. 正面墙券2, sized by the front's L2 walls;
+///   6. 侧面墙券1, sized by the L1 walls on the top/bottom rows;
+///   7. 基地券1;  8. 基地券2 — the station's level ladder;
+///   9. LargeRobotSummonOrder — 买完立即使用 (the pioneer burns it the next
+///      round, [`burn_summon_order`]);
+///  10. Bomb;  11. BossRobotSummonOrder.
+///
+/// The two special cases deliberately do NOT rank in the list: the WallFixer
+/// surplus conversion ([`wall_fixer_surplus`], capped 5/10 by day) and the
+/// Medicine a wounded role buys for itself ([`self_provision`]). Affordability
+/// is not decided here — the list is the WANT, exactly like the old
+/// `Budget::intent`; [`buy_first_affordable`] at the counter spends it against
+/// the gold B has sold so far, first affordable entry wins.
+pub(crate) fn fixed_buy_list(turn: &Turn) -> Vec<economy::Need> {
+    fn need(name: &str, num: i64, rank: i32, reason: &'static str) -> economy::Need {
+        economy::Need {
+            name: name.to_string(),
+            num,
+            priority: rank,
+            latest_round: 0,
+            value: 0,
+            combat_per_gold: 0.0,
+            reason,
+        }
     }
-    if stands.is_empty() {
-        return None;
-    }
-    if stands.iter().any(|pos| *pos == role.pos) {
-        let price = turn
-            .weapon_shop
-            .get(&need.name)
-            .copied()
-            .unwrap_or(i64::MAX);
-        let free_slots = role.capacity.saturating_sub(role.backpack.len() as i64);
-        let affordable = if price > 0 { turn.gold / price } else { 0 };
-        let num = need.num.min(free_slots).min(affordable);
+    let mut out: Vec<economy::Need> = Vec::new();
+    let mut rank = 0;
+    let mut push = |name: &str, num: i64, reason: &'static str, out: &mut Vec<economy::Need>| {
         if num > 0 {
-            crate::log::event(
-                "buy",
-                crate::log::ledger_record(turn, role, &RoleCommand::buy(&need.name, num)),
-            );
-            return Some(RoleCommand::buy(&need.name, num));
+            rank += 1;
+            out.push(need(name, num, rank, reason));
         }
-        return None; // wait for gold or backpack space
-    }
-    // NOT WITHOUT TIME TO FINISH (issues #156-#160).
-    //
-    // The shop is the farthest errand on the board and this is the one walk on
-    // it that has to end back at a POST: the buyer is the dedicated economy
-    // worker, which is also a tower controller with a dusk deadline
-    // (`preposition_round`). Nothing used to compare the two, so the walk was
-    // started whenever the shopping list turned non-empty and step 4's lock-in
-    // then turned the role around wherever it happened to be when
-    // `in_day_round + dist_to_post` ran out.
-    //
-    // Measured, pk590730 (day 2): the purse jumps to 130 at day-round 23 — 表 2c
-    // prints exactly that — the buyer walks twelve rounds toward the shop,
-    // reaching (28,24), four cells short of the counter, and the lock turns it
-    // around. 表 2a for that match has no voucher in it at all, 表 2b prints 75
-    // rounds with an affordable voucher at the head of the list, and the base
-    // falls on night 2 with score_3 at 10 of a possible 550. Reproduced in
-    // `tests/day1_sim.rs` before this branch existed: the day ends with 144 gold
-    // in the purse and not one `buy`.
-    //
-    // So the errand is time-boxed here instead: it may only be started if the
-    // whole round trip — out to a stand, one round at the counter, back to the
-    // post — still lands before dusk, which is the same budget step 4 measures
-    // the lock-in against. A trip that fits at the start still fits at the
-    // counter (walking out is what shrinks it), and step 4 waives the lock-in
-    // for exactly that window, so a started trip is completed. A trip that does
-    // not fit is not started: the role keeps today's work instead of spending
-    // a dozen rounds being turned around with the purse unspent.
-    if !shop_errand_fits(turn, role, pairs) || role.backpack_full() {
-        crate::log::event(
-            "shop_trip",
-            serde_json::json!({
-                "round": turn.round_no,
-                "role": role.id,
-                "decision": "no_time",
-                "inDayRound": turn.in_day_round,
-                "trip": shop_round_trip(turn, role, pairs),
-                "need": need.name,
-            }),
-        );
-        return None;
-    }
-    walk_toward(turn, role, &stands, claimed)
-}
-
-/// Rounds the buyer needs to complete a shop errand from where it stands: walk
-/// out to a stand, spend one round at the counter, walk back to its post.
-/// `None` when no shop stand exists on the board at all.
-///
-/// The geometry is the Chebyshev one the rest of the day planner budgets in
-/// (`economy::shop_travel`, `walk_home`), so this agrees with the deadline
-/// arithmetic rather than with a second estimate of it. It is deliberately not
-/// a path length: a detour around the ring only makes the estimate optimistic,
-/// and the number it feeds is a bound on when to STOP, not a promise of
-/// arrival — the night recall still owns the post.
-pub(crate) fn shop_round_trip(turn: &Turn, role: &Unit, pairs: &[(i64, i64)]) -> Option<i64> {
-    let post = pairs
-        .iter()
-        .find(|(controller, _)| *controller == role.id)
-        .and_then(|(_, tower)| turn.role_by_id(*tower))
-        .map(|tower| tower.pos);
-    let mut best: Option<i64> = None;
-    for shop in turn.weapon_shops() {
-        for stand in stand_cells(turn, shop) {
-            let back = match post {
-                Some(post) => chebyshev(stand, post) as i64,
-                None => walk_home(turn, stand),
+    };
+    // 1. 基地券 — a station below its level's HP table is the emergency the
+    //    comment puts first: the upgrade is the only heal the base has.
+    if let Some(station) = turn.station() {
+        if station.alive() && station.health < combat::station_max_hp(station.level) {
+            let voucher = match station.level {
+                1 => Some("StationUpgradeVoucher1"),
+                2 => Some("StationUpgradeVoucher2"),
+                _ => None,
             };
-            let trip = chebyshev(role.pos, stand) as i64 + 1 + back;
-            best = Some(best.map_or(trip, |best: i64| best.min(trip)));
+            if let Some(name) = voucher {
+                push(name, 1, "station_hurt", &mut out);
+            }
         }
     }
-    best
+    // 2-6. Weapons and walls, by the standing count of the level each voucher
+    //    upgrades. Front (朝向敌人的一面) before side — the comment's order.
+    let l1_guns = turn
+        .towers()
+        .iter()
+        .filter(|tower| tower.alive() && tower.level == 1)
+        .count() as i64;
+    let l2_guns = turn
+        .towers()
+        .iter()
+        .filter(|tower| tower.alive() && tower.level == 2)
+        .count() as i64;
+    let front = base_layout::front_wall_cells(turn);
+    let side = base_layout::side_wall_cells(turn);
+    let walls_on = |cells: &[Pos], level: i32| {
+        turn.walls()
+            .iter()
+            .filter(|wall| wall.alive() && wall.level == level && cells.contains(&wall.pos))
+            .count() as i64
+    };
+    push("WeaponUpgradeVoucher1", l1_guns, "weapon_l1", &mut out);
+    push(
+        "WallUpgradeVoucher1",
+        walls_on(&front, 1),
+        "front_wall_l1",
+        &mut out,
+    );
+    push("WeaponUpgradeVoucher2", l2_guns, "weapon_l2", &mut out);
+    push(
+        "WallUpgradeVoucher2",
+        walls_on(&front, 2),
+        "front_wall_l2",
+        &mut out,
+    );
+    push("WallUpgradeVoucher1", walls_on(&side, 1), "side_wall_l1", &mut out);
+    // 7/8. The station's level ladder, independent of the health emergency.
+    if let Some(station) = turn.station() {
+        match station.level {
+            1 => push("StationUpgradeVoucher1", 1, "station_ladder", &mut out),
+            2 => push("StationUpgradeVoucher2", 1, "station_ladder", &mut out),
+            _ => {}
+        }
+    }
+    // 9-11. The wave items, in the comment's order.
+    push("LargeRobotSummonOrder", 1, "summon_large", &mut out);
+    push(
+        "Bomb",
+        (2 - economy::stock_of(turn, "Bomb")).max(0),
+        "bomb",
+        &mut out,
+    );
+    push("BossRobotSummonOrder", 1, "summon_boss", &mut out);
+    // Only what the shop actually sells: an entry with no price is a want no
+    // gold can ever satisfy, and it would hold the `buy_deadline` sync hostage.
+    out.retain(|need| turn.weapon_shop.contains_key(&need.name));
+    out
 }
 
-/// Can the buyer still be back behind the wire before dusk?
-///
-/// See [`buyer_flow`] for what the answer decides. The bound is `DUSK_ROUND`
-/// itself and not `HARD_SEAL_ROUND`: a trip that ends inside the dusk window is
-/// the trip that holds the gate open (`wall_gate_open` naming the buyer on
-/// every round of it), which is the hole the wall worker's post guard
-/// (`role::wall_worker`) exists to close.
-pub(crate) fn shop_errand_fits(turn: &Turn, role: &Unit, pairs: &[(i64, i64)]) -> bool {
-    shop_round_trip(turn, role, pairs)
-        .map(|trip| turn.in_day_round + trip <= economy::DUSK_ROUND)
-        .unwrap_or(false)
+/// The WallFixer surplus conversion (comment 1 §3's special case, 不参与排序):
+/// leftover economy turns into repair kits up to a TEAM stock of 5 through day
+/// 5 and 10 from day 6 — the later nights chew the ring harder, and by then
+/// the base fund matters less than the wall holding it. `None` at the cap.
+pub(crate) fn wall_fixer_surplus(turn: &Turn) -> Option<economy::Need> {
+    let cap = if turn.day <= 5 { 5 } else { 10 };
+    let num = cap - economy::stock_of(turn, "WallFixer");
+    (num > 0).then(|| economy::Need {
+        name: "WallFixer".to_string(),
+        num,
+        priority: i32::MAX,
+        latest_round: 0,
+        value: 0,
+        combat_per_gold: 0.0,
+        reason: "surplus_fixer",
+    })
 }
 
-/// Is there a purchase to make this round, and can this role still make it?
-///
-/// One predicate for the three places that have to agree about the shop errand
-/// (issues #156-#160), because the defect was exactly that they did not:
-///
-///   * step 7 uses it to let the errand outrank the sale. The buyer is the
-///     dedicated economy worker, whose pack is full of SELLABLE ore by
-///     construction — that is its job — so `should_sell` was true for most of
-///     the day and the shop branch never ran. The one round it did run was the
-///     round after a sale, which is the round the buyer is standing at the
-///     VENDOR, the far corner of the board from the shop, with the pre-position
-///     lock already firing.
-///   * step 4 uses it to hold the lock-in off the walk it would otherwise cut
-///     short (see the call site).
-///   * [`buyer_flow`] uses it to refuse a walk that cannot be finished.
-///
-/// `budget.shopping` non-empty is the whole of "there is a purchase to make":
-/// that list is computed from the gold in hand, so a sale is not what stands
-/// between the buyer and the counter — the walk is. A full backpack is the one
-/// thing that can still make the errand pointless (the goods need a slot), and
-/// the sale that empties it is the next step of the same day.
-pub(crate) fn shop_trip_worth_taking(
+/// At the counter: buy the FIRST AFFORDABLE entry of the whitelist, and only
+/// when the ranked list has nothing affordable this round, convert the surplus
+/// into WallFixer kits. Affordability is measured against the SPENDABLE gold —
+/// the purse minus [`economy::spendable_reserve`], so the third-tower fund and
+/// the treasure offering stay untouchable exactly as the legacy budget kept
+/// them (P0-4, P2-2).
+pub(crate) fn buy_first_affordable(
     turn: &Turn,
+    state: &BotState,
     role: &Unit,
-    pairs: &[(i64, i64)],
-    shopping: &[economy::Need],
-) -> bool {
-    !shopping.is_empty() && !role.backpack_full() && shop_errand_fits(turn, role, pairs)
-}
-
-/// The same decision, named — the `shopTrip` column of the `shopping` event.
-///
-/// The three "no" answers are the three ways the errand dies, and they call for
-/// different fixes: `no_time` is a scheduling problem (this batch), `pack_full`
-/// is a slot problem, and `sale_first` is the ore in the pack being worth more
-/// than the trip it would displace. Without the split the next batch reads them
-/// as one number again.
-pub(crate) fn shop_trip_decision(
-    turn: &Turn,
-    role: &Unit,
-    pairs: &[(i64, i64)],
-    shopping: &[economy::Need],
-) -> &'static str {
-    if shopping.is_empty() {
-        return "nothing_affordable";
-    }
-    if role.backpack_full() {
-        return "pack_full";
-    }
-    if !shop_errand_fits(turn, role, pairs) {
-        return "no_time";
-    }
-    "walk"
+    list: &[economy::Need],
+) -> Option<RoleCommand> {
+    let spendable = (turn.gold - economy::spendable_reserve(turn, state)).max(0);
+    let free_slots = role.capacity.saturating_sub(role.backpack.len() as i64);
+    let mut buyable = list.iter().filter_map(|need| {
+        let price = turn.weapon_shop.get(&need.name).copied()?;
+        let num = need.num.min(free_slots).min(spendable / price.max(1));
+        (price > 0 && num > 0).then(|| (need.name.clone(), num))
+    });
+    let (name, num) = buyable
+        .next()
+        .or_else(|| {
+            // 盈余转换: the ranked list is out of reach this round; kits are.
+            let fixer = wall_fixer_surplus(turn)?;
+            let price = turn.weapon_shop.get(&fixer.name).copied()?;
+            let num = fixer.num.min(free_slots).min(spendable / price.max(1));
+            (price > 0 && num > 0).then(|| (fixer.name.clone(), num))
+        })?;
+    let cmd = RoleCommand::buy(&name, num);
+    crate::log::event("buy", crate::log::ledger_record(turn, role, &cmd));
+    Some(cmd)
 }
 
 /// Use a carried robot-summon order against the enemy (harassment), one per

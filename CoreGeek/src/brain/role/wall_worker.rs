@@ -33,11 +33,9 @@
 //! 6. **mine** — quota stone first on a single-vein latch (10 collects,
 //!    comment 1 §5); surplus ore only while the trip still gets A back to the
 //!    post before dusk;
-//! 7. **the buyer's errand** — TRANSITIONAL: `round_context` still nominates
-//!    A as the team's buyer; phase 5 moves purchasing to the pioneer's fixed
-//!    whitelist and this step dies;
-//! 8. **summon orders** — burn a carried order when nothing else wants the
-//!    round.
+//! 7. **summon orders** — burn a carried order when nothing else wants the
+//!    round. (The buyer's errand died in phase 5b: the pioneer is the team's
+//!    only buyer, so A never purchases anything.)
 //!
 //! # Night (phase 4b-3, design D14-D16)
 //!
@@ -47,10 +45,10 @@
 //! controller, so three guns cost A no personal command), mends stone on the
 //! reload rounds, walks back to the post while robots live, and mines the
 //! swept board (comment 1 §3.4: 所有己方机器人消灭后出去采矿). The pioneer
-//! stands wall-repair duty inside the ring ([`crate::brain::night::plan_spare`],
-//! Q5's default — not A's backup gunner; phase 5 adds the switch), and B
-//! mines all night outside it on its own mainline. The legacy pairing loop is
-//! deleted.
+//! stands wall-repair duty inside the ring ([`crate::brain::role::pioneer`],
+//! Q5's default — not A's backup gunner; `BotState::pioneer_night_backup` is
+//! the switch), and B mines all night outside it on its own mainline. The
+//! legacy pairing loop is deleted.
 
 use std::collections::HashSet;
 
@@ -59,21 +57,20 @@ use super::economy_worker::{
 };
 use super::super::action::base_layout;
 use super::super::action::build::{build_or_walk, repair_flow};
-use super::super::action::fight::{update_withdraw_holdout, withdrawing};
+use super::super::action::fight::{
+    cooldown_repair, hostile_wave, night_medicine, update_withdraw_holdout, withdrawing,
+};
 use super::super::action::geometry::wall_layer;
 use super::super::action::mine::stone_covered;
 use super::super::action::sell::sell_flow;
-use super::super::action::shop::{
-    burn_summon_order, buyer_flow, self_provision, shop_round_trip, shop_trip_worth_taking,
-    use_medicine, voucher_flow, walk_to_shop,
-};
+use super::super::action::shop::{burn_summon_order, self_provision, use_medicine, voucher_flow};
 use super::super::day::{
     self, roles_can_reach, stone_batch, wall_trip_overdue, wall_would_trap, RoundCtx,
     HARD_SEAL_ROUND,
 };
 use super::super::route::trip_rounds;
 use super::super::{
-    break_out, combat, economy, interior_cells, night, stand_cells, walk_or_remove_wall,
+    break_out, combat, economy, interior_cells, shelter, stand_cells, walk_or_remove_wall,
     walk_toward, Plan,
 };
 use crate::model::{chebyshev, Turn, Unit, STONE};
@@ -155,10 +152,11 @@ fn mainline(
             >= economy::DUSK_ROUND
     });
     if deadline_hit {
-        // The four exceptions, each worth the round it spends and each ending
-        // at or next to the base — the legacy lock's counter/errand/ring-tail
+        // The three exceptions, each worth the round it spends and each ending
+        // at or next to the base — the legacy lock's counter/ring-tail
         // exemptions, plus the cash-out band that replaces the legacy dusk
-        // sell deadline (design D2).
+        // sell deadline (design D2). The shop-errand exemption died with the
+        // buyer nomination (phase 5b): the pioneer owns the counter now.
         let ring_tail = role.count_item(STONE) > 0
             && !ctx.wall_gaps.is_empty()
             && turn.in_day_round < economy::DUSK_ROUND;
@@ -167,31 +165,8 @@ fn mainline(
             .iter()
             .any(|vendor| chebyshev(role.pos, *vendor) == 1)
             && economy::sellable_ores(turn, role, ctx.stone_demand) > 0;
-        let on_shop_errand = Some(role.id) == ctx.buyer_id
-            && shop_trip_worth_taking(turn, role, &ctx.pairs, &ctx.budget.shopping);
-        if on_shop_errand {
-            // Logged only on the rounds the guard actually gives way — the
-            // legacy finding: the three or four rounds a match where the
-            // buyer is past its deadline with the counter still reachable.
-            crate::log::event(
-                "shop_trip",
-                serde_json::json!({
-                    "round": turn.round_no,
-                    "role": role.id,
-                    "decision": "protected",
-                    "inDayRound": turn.in_day_round,
-                    "trip": shop_round_trip(turn, role, &ctx.pairs),
-                    "lockRound": post.map(|post| {
-                        (economy::DUSK_ROUND
-                            - trip_rounds(turn, role.pos, post)
-                            - POST_MARGIN)
-                            .max(0)
-                    }),
-                }),
-            );
-        }
         let cashout = sell_trigger(turn, state, role, ctx) == Some("dusk_cashout");
-        if !ring_tail && !at_counter && !on_shop_errand && !cashout {
+        if !ring_tail && !at_counter && !cashout {
             // Lay what the walk home passes: a gap adjacent this round is a
             // wall placed, not a round lost.
             if let Some(cmd) = place_adjacent_wall(turn, state, role, ctx, ctx_owned, claimed) {
@@ -254,28 +229,9 @@ fn mainline(
             return Some(cmd);
         }
     }
-    // Step 7 — the buyer's errand (TRANSITIONAL: `round_context` nominates A;
-    // phase 5 moves purchasing to the pioneer's fixed whitelist and this step
-    // dies with the nomination).
-    if Some(role.id) == ctx.buyer_id {
-        if !ctx.budget.shopping.is_empty()
-            && shop_trip_worth_taking(turn, role, &ctx.pairs, &ctx.budget.shopping)
-        {
-            if let Some(cmd) =
-                buyer_flow(turn, role, &ctx.budget.shopping, &ctx.pairs, claimed)
-            {
-                return Some(cmd);
-            }
-        } else if ctx.budget.shopping.is_empty()
-            && economy::buyer_must_preposition(turn, role, &ctx.budget.intent)
-        {
-            if let Some(cmd) = walk_to_shop(turn, role, claimed) {
-                return Some(cmd);
-            }
-        }
-    }
-    // Step 8 — a carried summon order burns only when nothing else wants the
-    // round.
+    // Step 7 — a carried summon order burns only when nothing else wants the
+    // round. A buys nothing any more: phase 5b made the pioneer the team's
+    // only buyer and deleted the nomination this step used to ride on.
     burn_summon_order(state, role)
 }
 
@@ -677,12 +633,12 @@ pub(crate) fn plan_night(
                 .collect(),
         );
         if !interior_cells(turn).contains(&role.pos) {
-            night::shelter(turn, role, claimed, plan);
+            shelter(turn, role, claimed, plan);
         }
         return; // already inside the ring: hold, do not pace
     }
     // Step 1 — the night potion: towers wait for the drink.
-    if let Some(cmd) = night::night_medicine(turn, role) {
+    if let Some(cmd) = night_medicine(turn, role) {
         night_debug(
             turn,
             towers
@@ -744,7 +700,7 @@ pub(crate) fn plan_night(
                     // and spend the round on the wall instead.
                     reason = "no_target_reserved_for_robots";
                     if mend.is_none() {
-                        if let Some(cmd) = night::cooldown_repair(turn, role) {
+                        if let Some(cmd) = cooldown_repair(turn, role) {
                             mend = Some(cmd);
                             reason = "mending";
                         }
@@ -755,7 +711,7 @@ pub(crate) fn plan_night(
             // Reload is masonry time (issues #126-#130).
             reason = "cooldown";
             if mend.is_none() {
-                if let Some(cmd) = night::cooldown_repair(turn, role) {
+                if let Some(cmd) = cooldown_repair(turn, role) {
                     mend = Some(cmd);
                     reason = "mending";
                 }
@@ -791,11 +747,7 @@ pub(crate) fn plan_night(
     // live. The legacy three-rung ladder, so a teammate's committed move
     // never freezes the walk and a pocket never holds A until dawn.
     let post = base_layout::operator_cell(turn);
-    let hostile_robots = turn
-        .robots
-        .iter()
-        .any(|robot| robot.health > 0 && robot.target_team == turn.team_type);
-    if hostile_robots {
+    if hostile_wave(turn) {
         let at_post = post.is_some_and(|post| role.pos == post);
         if let (Some(post), false) = (post, at_post) {
             let stands = [post];

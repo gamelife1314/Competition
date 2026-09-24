@@ -6,7 +6,6 @@ pub mod combat;
 pub mod day;
 pub mod economy;
 pub mod news;
-pub mod night;
 pub mod orchestrate;
 pub mod role;
 pub mod route;
@@ -794,4 +793,53 @@ pub fn walk_or_remove_wall(
                 .unwrap_or(i32::MAX)
         })
         .map(|pos| RoleCommand::remove(pos))
+}
+
+/// Move a role inside the wall ring, right next to the station. Returns true
+/// when a movement command was issued (the caller should stop planning this
+/// round). Uses only the cells at footprint distance <= 1 — hugging the
+/// station — so the role never stops on the wall line or out near the mines.
+///
+/// The same set the day planner retreats to (`day::retreat_inside`) and the
+/// night repair duty shelters to; sharing it keeps the walks in step.
+pub(crate) fn shelter(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) -> bool {
+    let mut stands: Vec<Pos> = interior_cells(turn);
+    if stands.is_empty() {
+        return false;
+    }
+    if stands.iter().any(|stand| *stand == role.pos) {
+        return false; // already hugging the station
+    }
+    // Prefer the corner furthest from the nearest robot.
+    stands.sort_by_cached_key(|stand| {
+        let nearest = turn
+            .robots
+            .iter()
+            .filter(|robot| robot.health > 0)
+            .map(|robot| chebyshev(*stand, robot.pos))
+            .min()
+            .unwrap_or(i32::MAX);
+        std::cmp::Reverse(nearest)
+    });
+    if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
+        plan.push(role.id, cmd);
+        return true;
+    }
+    // A ROLE THE RING CLOSED ON HAS NO WAY BACK IN (issues #176-#185). This
+    // walk is the last resort of a role that holds no post: the three-rung
+    // ladder (claims, then no claims, then `break_out`) is what keeps a role
+    // sealed out from holding still forever — being behind the ring is the
+    // whole of the night duty (任务书: the three valid night duties are
+    // operate, heal, retreat), so a role that cannot walk in must cut its way
+    // in, the same as the operator next to it.
+    let mut ignored = HashSet::new();
+    if let Some(cmd) = walk_or_remove_wall(turn, role, &stands, &mut ignored) {
+        plan.push(role.id, cmd);
+        return true;
+    }
+    if let Some(cmd) = break_out(turn, role, &stands, &mut ignored) {
+        plan.push(role.id, cmd);
+        return true;
+    }
+    false
 }

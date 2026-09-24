@@ -143,6 +143,33 @@ pub fn entrance_cells(turn: &Turn) -> Vec<Pos> {
     lay(turn, &[(-2, -1), (-2, 0), (-2, 1), (-2, 2)])
 }
 
+/// The enemy-facing FRONT column of the ring — the first six cells of
+/// [`wall_build_order`] (comment 1 §4: 先建朝向敌人的一面). The buy whitelist
+/// of comment 1 §3 sizes 正面墙券 against exactly this face.
+pub fn front_wall_cells(turn: &Turn) -> Vec<Pos> {
+    lay(turn, &[(3, -2), (3, -1), (3, 0), (3, 1), (3, 2), (3, 3)])
+}
+
+/// The top and bottom rows — the ten cells [`wall_build_order`] lays after the
+/// front column (the 侧面 of the whitelist's 侧面墙券1 entry).
+pub fn side_wall_cells(turn: &Turn) -> Vec<Pos> {
+    lay(
+        turn,
+        &[
+            (2, 3),
+            (1, 3),
+            (0, 3),
+            (-1, 3),
+            (-2, 3),
+            (-2, -2),
+            (-1, -2),
+            (0, -2),
+            (1, -2),
+            (2, -2),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

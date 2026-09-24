@@ -523,6 +523,15 @@ pub struct BotState {
     /// 再出去). Day-1-only guard; never reset.
     pub d1_weapon_helped: bool,
 
+    /// Q5's backup-gunner switch (issue #221). Default FALSE — the pioneer's
+    /// night is the repair duty of comment 1 §3.3. When enabled, the pioneer
+    /// waits inside the ring as A's backup while a hostile wave lives, BEFORE
+    /// any task or shop errand, so a dead A does not leave all three weapons
+    /// silent; the wait ends when the board is swept. Read by
+    /// `brain::role::pioneer`'s night chain; never reset by the day rollover —
+    /// it is a configuration, not a memory.
+    pub pioneer_night_backup: bool,
+
     /// Compact telemetry baselines used to report deltas rather than dumping
     /// full protocol payloads every round.
     pub prev_total_score: Option<i64>,

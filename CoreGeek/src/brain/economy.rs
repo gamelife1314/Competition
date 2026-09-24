@@ -803,6 +803,36 @@ pub fn budget(turn: &Turn, state: &BotState, reserve: i64) -> Budget {
     }
 }
 
+/// Gold the shop list may NOT touch (issue #221 phase 5b — the single source
+/// both the `tower_plan` telemetry and the pioneer's whitelist counter read,
+/// so the reserve can never disagree between them inside one round):
+///
+/// * the tower build-out fund (`tower_build_reserve`) — defenses come before
+///   consumables, but only for the 1-2 towers actually being built;
+/// * P0-4 第三塔资金守护: with the fallback window near and the upgrade out of
+///   reach, 25 gold stays fenced for the third tower (issues #22/#23: five
+///   straight matches without it, the purse pinned at 5-24 by small purchases);
+/// * the dusk release: past `DUSK_ROUND` hoarding buys nothing — the night is
+///   spent fighting, not shopping — so the fund's window closing drops the
+///   reserve to zero;
+/// * P2-2 宝藏线的献祭金: the next offering's price, held back from the shop so
+///   the pioneer does not reach the altar with an empty purse
+///   (`treasure::gold_reserve`).
+pub fn spendable_reserve(turn: &Turn, state: &BotState) -> i64 {
+    let tower_gaps = crate::brain::action::tower_site::tower_gaps(turn, state);
+    let mut reserve = crate::brain::action::geometry::tower_build_reserve(
+        turn.towers().len(),
+        tower_gaps.len(),
+    );
+    if !tower_gaps.is_empty() && third_tower_guard(turn, state) {
+        reserve = reserve.max(WEAPON_BUILD_COST);
+    }
+    if turn.in_day_round >= DUSK_ROUND {
+        reserve = 0;
+    }
+    reserve.max(crate::brain::treasure::gold_reserve(turn, state))
+}
+
 /// Gold the team could raise today: coins in hand plus every ore in a backpack
 /// the vendor would ACTUALLY TAKE, valued at the current price. The economy's
 /// real spending power — used to tell a goal that is merely not-yet-affordable

@@ -95,6 +95,84 @@ pub fn withdrawing(turn: &Turn, role: &Unit) -> bool {
         .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= THREAT_RADIUS)
 }
 
+/// Is a hostile wave on the board? Robots are only hostile to us when their
+/// `targetTeam` names our team (the rest fight each other or the enemy). The
+/// wall worker's night recall and the pioneer's Q5 backup wait read the SAME
+/// predicate, so "the wave is gone" can never mean two different things in two
+/// mainlines inside one round.
+pub(crate) fn hostile_wave(turn: &Turn) -> bool {
+    turn.robots
+        .iter()
+        .any(|robot| robot.health > 0 && robot.target_team == turn.team_type)
+}
+
+/// Heal at night, while the role is still worth saving.
+///
+/// `shop::use_medicine` waits for 30% health, which is tuned for the day: a
+/// role that takes a hit at noon has hours to walk it off, and a potion spent
+/// early is 10 gold never coming back. At night there is no walking it off — a
+/// focused controller goes from 30% to dead inside the round it is shot in,
+/// and the tower it was manning goes silent with it. Issue #18 lost 20011 in
+/// six rounds (HP 200→0) and 20010 in TWO (HP 220→0); issue #19 lost all
+/// three on D2 night and the base fell from 1500 to 105 HP behind them.
+/// Medicine restores FULL health, so a potion spent at 60% buys a gun that
+/// fires all night and a survival score that keeps paying — the potion saved
+/// buys nothing.
+///
+/// Below the threat radius (no robot close enough to finish the job this
+/// round) the day threshold still applies: a scratch at 3 a.m. can wait.
+pub(crate) fn night_medicine(turn: &Turn, role: &Unit) -> Option<crate::protocol::RoleCommand> {
+    if role.count_item("Medicine") < 1 {
+        return None;
+    }
+    let max_hp = match role.kind {
+        UnitKind::Worker => 220,
+        UnitKind::Pioneer => 200,
+        _ => return None,
+    };
+    let threatened = turn
+        .robots
+        .iter()
+        .any(|robot| robot.health > 0 && chebyshev(robot.pos, role.pos) <= THREAT_RADIUS);
+    let threshold = if threatened { 7 } else { 3 };
+    if role.health * 10 < max_hp * threshold {
+        return Some(crate::protocol::RoleCommand::use_item("Medicine"));
+    }
+    None
+}
+
+/// Mend the weakest wall this operator is standing beside, if the gun it mans
+/// cannot fire this round anyway.
+///
+/// See the call sites for why a round the gun cannot fire is a round the wall
+/// gets. There are two such windows and both call this: the reload
+/// (`tower.cooldown != 0`), and a ready gun whose trigger came up empty
+/// because every robot hunting us is outside every tower's reach
+/// (`no_target_reserved_for_robots` — 表 6a's second-largest silence bucket in
+/// issues #131-#135, 18-42 rounds a match). Neither trades a shot for a mend.
+///
+/// The predicates live in [`combat::night_mend_target`]: the role carries a
+/// `WallFixer`, no live robot is ADJACENT (chebyshev <= 1) to it, and an own
+/// wall is ADJACENT and below its level's maximum — weakest first, the same
+/// ranking the day's `repair_target` uses. Bounded to one mend per round,
+/// which is what one action per role allows.
+pub(crate) fn cooldown_repair(
+    turn: &Turn,
+    role: &Unit,
+) -> Option<crate::protocol::RoleCommand> {
+    let target = combat::night_mend_target(turn, role)?;
+    crate::log::event(
+        "wall_mend",
+        serde_json::json!({
+            "round": turn.round_no,
+            "role": role.id,
+            "target": [target.x, target.y],
+            "duty": "cooldown",
+        }),
+    );
+    Some(crate::protocol::RoleCommand::use_item_at("WallFixer", target))
+}
+
 /// Greedy pairing: every living tower gets the closest free controller that
 /// can actually REACH it. A pioneer busy with a self-evolution task must stay
 /// at the task point and is therefore excluded. Towers under the heaviest

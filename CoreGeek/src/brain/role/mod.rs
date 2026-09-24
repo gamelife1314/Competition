@@ -17,10 +17,13 @@
 
 use crate::model::Turn;
 
-// Role mainline modules land here as the phases replace the legacy planners:
-// `wall_worker` (phase 4 — 4a delegates to the legacy dispatch), `pioneer`
-// (phase 5).
+// The three role mainlines (issue #221): `wall_worker` (phase 4), `pioneer`
+// (phase 5a — tasks, the fixed buy whitelist, night wall repair) and
+// `economy_worker` (phase 3). Phase 5c deletes the legacy `day`/`night`
+// planners entirely; until then `day` keeps the round context and the
+// closing backstop.
 pub(crate) mod economy_worker;
+pub(crate) mod pioneer;
 pub(crate) mod wall_worker;
 
 /// Which mainline a controllable unit belongs to.
