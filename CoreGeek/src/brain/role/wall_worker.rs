@@ -39,19 +39,27 @@
 //! 8. **summon orders** — burn a carried order when nothing else wants the
 //!    round.
 //!
-//! # Transitional state (phase 4b-2)
+//! # Night (phase 4b-3, design D14-D16)
 //!
-//! The NIGHT still belongs to the legacy `night::plan_owned`: the
-//! single-operator L-shape model (design D14-D16) lands in 4b-3. The operator
-//! cell this mainline pre-positions on is already the post that model uses —
-//! it is a valid stand for all three weapon sites, so the legacy pairing
-//! finds A where the night wants it.
+//! [`plan_night`] is the single-operator L-shape: ONE post — the operator
+//! cell, adjacent by construction to all three weapon sites — from which A
+//! fires the whole salvo (attacks are tower-addressed commands that name the
+//! controller, so three guns cost A no personal command), mends stone on the
+//! reload rounds, walks back to the post while robots live, and mines the
+//! swept board (comment 1 §3.4: 所有己方机器人消灭后出去采矿). The pioneer
+//! stands wall-repair duty inside the ring ([`crate::brain::night::plan_spare`],
+//! Q5's default — not A's backup gunner; phase 5 adds the switch), and B
+//! mines all night outside it on its own mainline. The legacy pairing loop is
+//! deleted.
 
 use std::collections::HashSet;
 
-use super::economy_worker::{pick_vein, NEAR_VENDOR_ROUNDS, VEIN_COLLECT_LIMIT};
+use super::economy_worker::{
+    night_safe, pick_vein, NEAR_VENDOR_ROUNDS, NIGHT_ROBOT_CLEARANCE, VEIN_COLLECT_LIMIT,
+};
 use super::super::action::base_layout;
 use super::super::action::build::{build_or_walk, repair_flow};
+use super::super::action::fight::{update_withdraw_holdout, withdrawing};
 use super::super::action::geometry::wall_layer;
 use super::super::action::mine::stone_covered;
 use super::super::action::sell::sell_flow;
@@ -64,7 +72,10 @@ use super::super::day::{
     HARD_SEAL_ROUND,
 };
 use super::super::route::trip_rounds;
-use super::super::{economy, stand_cells, walk_toward, Plan};
+use super::super::{
+    break_out, combat, economy, interior_cells, night, stand_cells, walk_or_remove_wall,
+    walk_toward, Plan,
+};
 use crate::model::{chebyshev, Turn, Unit, STONE};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
@@ -517,6 +528,22 @@ fn mine_step(
                 (pos, ore)
             })
         })?;
+    run_vein(turn, state, role, vein, &ore, stone_short, claimed)
+}
+
+/// The shared mine executor — both the day step and the swept-night step
+/// end here: collect when adjacent, else walk, announcing the pick with the
+/// legacy `mine_pick` record (the fields issues #12-#17 read, so the wall
+/// line's failure mode stays audible in the log).
+fn run_vein(
+    turn: &Turn,
+    state: &mut BotState,
+    role: &Unit,
+    vein: Pos,
+    ore: &str,
+    stone_short: bool,
+    claimed: &mut HashSet<Pos>,
+) -> Option<RoleCommand> {
     if chebyshev(role.pos, vein) == 1 {
         *state.vein_hits.entry(vein).or_insert(0) += 1;
         return Some(RoleCommand::collect(vein));
@@ -524,9 +551,6 @@ fn mine_step(
     let stands = stand_cells(turn, vein);
     let cmd = walk_toward(turn, role, &stands, claimed)?;
     claimed.insert(vein);
-    // Which vein the quota is being spent on, and why — the legacy
-    // `mine_pick` fields, so the wall line's failure mode stays audible in
-    // the log (issues #12-#17 all opened with "0 墙").
     crate::log::event(
         "mine_pick",
         serde_json::json!({
@@ -588,6 +612,374 @@ fn surplus_trip_fits(turn: &Turn, role: &Unit, vein: Pos) -> bool {
             + POST_MARGIN
             <= economy::DUSK_ROUND
     })
+}
+
+/// Plan Worker A's night round — the single-operator L-shape (issue #221
+/// phase 4b-3, design D14-D16, comment 1 §3.4: 晚上操作武器…所有己方机器人
+/// 消灭后出去采矿).
+///
+/// ONE post — the operator cell, adjacent by construction to all three
+/// weapon sites — operates the whole L. The chain:
+///
+/// 0. **survival** — a controller about to die is bait, not a gunner:
+///    withdraw inside the ring, hold there, guns dark (issue #20);
+/// 1. **the night potion** — the legacy firing filter kept towers silent in
+///    a round the controller drank, so healing outranks the whole salvo;
+/// 2. **the whole salvo** — every gun A can fire this round, most-pressured
+///    first on one shared damage simulation (the legacy loop's cross-tower
+///    overkill prevention, now one controller for all of them). Attacks are
+///    TOWER-addressed commands naming the controller, so a full salvo costs
+///    A no personal command. A reload round the gun cannot fire anyway is a
+///    masonry round (`cooldown_repair`), never traded against a shot;
+/// 3. **recall** — no gun fired and A is off-post while robots live: walk
+///    back on the legacy three-rung ladder (claims, no-claims, `break_out`);
+/// 4. **the swept-night mine** — no hostile robot left alive: A goes out
+///    and mines (D15/D16's reversal of the no-night-mining rule);
+/// 5. **hold** — no threat, no ore, no walk: the post IS the plan.
+///
+/// Every path emits the legacy `night_debug` record so 表 6a/6b keep reading
+/// the same schema.
+pub(crate) fn plan_night(
+    turn: &Turn,
+    state: &mut BotState,
+    role: &Unit,
+    claimed: &mut HashSet<Pos>,
+    plan: &mut Plan,
+) {
+    if !role.alive() {
+        return;
+    }
+    // The P1-4 hysteresis set survives the pairing loop that used to read
+    // it: maintained here, it keeps a once-downed operator off the guns
+    // until it has healed or the board has been quiet for a spell.
+    update_withdraw_holdout(turn, state);
+    let mut towers = turn.towers();
+    towers.sort_by_cached_key(|tower| std::cmp::Reverse(combat::threat_load(turn, tower)));
+
+    // Step 0 — survival before position. `withdrawing` is false for a
+    // Medicine carrier and the holdout branch re-checks the potion, so a
+    // healer always reaches step 1 instead of fleeing.
+    let wounded = withdrawing(turn, role)
+        || (role.count_item("Medicine") == 0 && state.withdraw_holdout.contains(&role.id));
+    if wounded {
+        night_debug(
+            turn,
+            towers
+                .iter()
+                .map(|tower| {
+                    serde_json::json!({
+                        "tower": tower.id,
+                        "controller": role.id,
+                        "reason": "controller_withdrawn",
+                        "hp": role.health,
+                    })
+                })
+                .collect(),
+        );
+        if !interior_cells(turn).contains(&role.pos) {
+            night::shelter(turn, role, claimed, plan);
+        }
+        return; // already inside the ring: hold, do not pace
+    }
+    // Step 1 — the night potion: towers wait for the drink.
+    if let Some(cmd) = night::night_medicine(turn, role) {
+        night_debug(
+            turn,
+            towers
+                .iter()
+                .map(|tower| {
+                    serde_json::json!({
+                        "tower": tower.id,
+                        "controller": role.id,
+                        "reason": "controller_healing",
+                    })
+                })
+                .collect(),
+        );
+        plan.push(role.id, cmd);
+        return;
+    }
+
+    // Step 2 — the whole salvo.
+    let policy = state.coach.policy();
+    let mut sim = combat::init_sim(turn);
+    let firing: Vec<(i64, i64)> = towers
+        .iter()
+        .filter(|tower| tower.cooldown == 0 && chebyshev(role.pos, tower.pos) <= 1)
+        .map(|tower| (tower.id, role.id))
+        .collect();
+    let aims = combat::plan_round(&policy, turn, &firing);
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut fired_any = false;
+    let mut mend: Option<RoleCommand> = None;
+    for tower in &towers {
+        let adjacent = chebyshev(role.pos, tower.pos) <= 1;
+        let mut reason = "controller_walking"; // refined by steps 3/4 below
+        let mut fired = 0usize;
+        let mut enemy_fire = false;
+        if adjacent && tower.cooldown == 0 {
+            match combat::choose_attack_kind_aimed(
+                &policy,
+                turn,
+                tower,
+                &mut sim,
+                aims.get(&tower.id).copied(),
+            ) {
+                Some((targets, kind)) => {
+                    fired = targets.len();
+                    enemy_fire = kind == combat::TargetKind::EnemyAssets;
+                    if enemy_fire {
+                        // Coach credit: damage on the enemy base is not
+                        // evidence about our summons.
+                        state.coach.note_enemy_fire();
+                    }
+                    plan.push(tower.id, RoleCommand::attack(role.id, targets));
+                    fired_any = true;
+                    reason = "fired";
+                }
+                None if combat::spare_firepower(turn) => reason = "no_target_in_range",
+                None => {
+                    // Every robot hunting us is out of every live tower's
+                    // reach: hold the opportunistic fire (issue #7's 有余力时)
+                    // and spend the round on the wall instead.
+                    reason = "no_target_reserved_for_robots";
+                    if mend.is_none() {
+                        if let Some(cmd) = night::cooldown_repair(turn, role) {
+                            mend = Some(cmd);
+                            reason = "mending";
+                        }
+                    }
+                }
+            }
+        } else if adjacent {
+            // Reload is masonry time (issues #126-#130).
+            reason = "cooldown";
+            if mend.is_none() {
+                if let Some(cmd) = night::cooldown_repair(turn, role) {
+                    mend = Some(cmd);
+                    reason = "mending";
+                }
+            }
+        }
+        let mut row = serde_json::json!({
+            "tower": tower.id,
+            "controller": role.id,
+            "reason": reason,
+        });
+        if fired > 0 {
+            row["fired"] = serde_json::json!(fired);
+            if enemy_fire {
+                row["enemyAssets"] = serde_json::json!(true);
+            }
+        }
+        rows.push(row);
+    }
+    if fired_any {
+        // The salvo IS the round: the operator holds (legacy discipline — no
+        // walking and no masonry in a round a gun fired, and holding costs
+        // nothing because attacks are tower-addressed).
+        night_debug(turn, rows);
+        return;
+    }
+    if let Some(cmd) = mend {
+        night_debug(turn, rows);
+        plan.push(role.id, cmd);
+        return;
+    }
+
+    // Step 3 — recall (issues #121-#130): no gun fired and hostile robots
+    // live. The legacy three-rung ladder, so a teammate's committed move
+    // never freezes the walk and a pocket never holds A until dawn.
+    let post = base_layout::operator_cell(turn);
+    let hostile_robots = turn
+        .robots
+        .iter()
+        .any(|robot| robot.health > 0 && robot.target_team == turn.team_type);
+    if hostile_robots {
+        let at_post = post.is_some_and(|post| role.pos == post);
+        if let (Some(post), false) = (post, at_post) {
+            let stands = [post];
+            let mut moved = false;
+            let mut digging = false;
+            let mut recall_site = None;
+            if let Some(cmd) = walk_or_remove_wall(turn, role, &stands, claimed) {
+                plan.push(role.id, cmd);
+                moved = true;
+            } else {
+                let mut ignored = HashSet::new();
+                if let Some(cmd) = walk_or_remove_wall(turn, role, &stands, &mut ignored) {
+                    plan.push(role.id, cmd);
+                    moved = true;
+                } else if let Some(cmd) = break_out(turn, role, &stands, &mut ignored) {
+                    digging = cmd.action == "remove";
+                    plan.push(role.id, cmd);
+                    moved = true;
+                }
+            }
+            if !moved {
+                recall_site = Some((
+                    role.pos,
+                    stands.len(),
+                    turn.walls()
+                        .into_iter()
+                        .filter(|wall| chebyshev(role.pos, wall.pos) == 1)
+                        .count(),
+                ));
+            }
+            let reason = if digging {
+                "controller_digging"
+            } else if moved {
+                "controller_walking"
+            } else {
+                "controller_stuck"
+            };
+            for row in rows.iter_mut() {
+                if row["reason"] == "controller_walking" {
+                    row["reason"] = serde_json::json!(reason);
+                    if let Some((pos, stands, walls)) = recall_site {
+                        row["stuck"] = serde_json::json!([pos.x, pos.y, stands, walls]);
+                    }
+                }
+            }
+            night_debug(turn, rows);
+            return;
+        }
+        // At the post with silent guns (or no station left on the board):
+        // holding IS the plan — the day backstop would refuse inside the
+        // ring anyway.
+        night_debug(turn, rows);
+        return;
+    }
+
+    // Step 4 — the swept-night mine (comment 1 §3.4: 所有己方机器人消灭后
+    // 出去采矿). The moment a hostile robot lives again step 3 owns A, and
+    // that walk back silences no gun the trip itself would not have.
+    if let Some(cmd) = night_mine_step(turn, state, role, claimed) {
+        for row in rows.iter_mut() {
+            if row["reason"] == "controller_walking" {
+                row["reason"] = serde_json::json!("swept_mining");
+            }
+        }
+        night_debug(turn, rows);
+        plan.push(role.id, cmd);
+        return;
+    }
+    // Step 5 — hold.
+    night_debug(turn, rows);
+}
+
+/// The legacy per-round night record, same shape: 表 6a/6b read the reasons
+/// from this schema, so the L-shape model reports in it too.
+fn night_debug(turn: &Turn, rows: Vec<serde_json::Value>) {
+    crate::log::event(
+        "night_debug",
+        serde_json::json!({"round": turn.round_no, "robots": turn.robots.len(), "pairs": rows}),
+    );
+}
+
+/// The mine half of the swept night (comment 1 §3.4). The day step's quota
+/// discipline unchanged — stone first while the ring is short, the
+/// single-vein latch (D19), the ten-collect cap — with two night
+/// differences: the surplus ore has no dusk deadline to fit (the guns, not
+/// the clock, bound the trip; a surviving robot pulls A straight back to
+/// the post next round), and every pick runs through the D15 robot
+/// clearance so A never mines inside a robot's zone even mid-sweep.
+fn night_mine_step(
+    turn: &Turn,
+    state: &mut BotState,
+    role: &Unit,
+    claimed: &mut HashSet<Pos>,
+) -> Option<RoleCommand> {
+    let demand = day::stone_demand_of(turn, state);
+    if role.backpack_full() {
+        return economy::discard_command(turn, state, role, demand);
+    }
+    let stone_short = !stone_covered(turn, demand);
+    let (vein, ore) = night_latched_vein(turn, state, claimed, stone_short)
+        .or_else(|| {
+            // The quota stone first — but NOT through `pick_vein`'s stone
+            // pass: its deliverability gate measures dusk, and at night it
+            // correctly refuses stone for B (stone does not sell, and B
+            // never builds). A's night stone feeds tomorrow morning's wall
+            // line, so it gets its own picker; when no stone survives the
+            // filters the round falls back to the sellable ore, mirroring
+            // B's `choose_vein` second pass.
+            let pick = if stone_short {
+                night_stone_pick(turn, state, role, claimed).or_else(|| {
+                    pick_vein(turn, state, role, false, NIGHT_ROBOT_CLEARANCE, claimed, false)
+                })
+            } else {
+                pick_vein(turn, state, role, false, NIGHT_ROBOT_CLEARANCE, claimed, false)
+            };
+            pick.map(|(pos, ore)| {
+                state.wall_vein_latch = Some(pos);
+                (pos, ore)
+            })
+        })?;
+    run_vein(turn, state, role, vein, &ore, stone_short, claimed)
+}
+
+/// The stone half of the swept-night mine: `pick_vein`'s outage, claim,
+/// ten-collect and D15 robot-clearance filters, ranked by plain walk
+/// distance (nearest wins, coordinates break ties) instead of a dusk
+/// deadline that does not exist after dark.
+fn night_stone_pick(
+    turn: &Turn,
+    state: &BotState,
+    role: &Unit,
+    claimed: &HashSet<Pos>,
+) -> Option<(Pos, String)> {
+    let mut best: Option<(i64, i32, i32, Pos)> = None;
+    for (pos, ore) in turn.all_mines() {
+        if ore != STONE
+            || state.ore_on_outage(&ore, turn.day)
+            || claimed.contains(&pos)
+            || state.vein_hits.get(&pos).copied().unwrap_or(0) >= VEIN_COLLECT_LIMIT
+            || !night_safe(turn, pos, NIGHT_ROBOT_CLEARANCE)
+        {
+            continue;
+        }
+        let trip = trip_rounds(turn, role.pos, pos).max(1);
+        let is_better = best
+            .as_ref()
+            .map_or(true, |current| (trip, pos.x, pos.y) < (current.0, current.1, current.2));
+        if is_better {
+            best = Some((trip, pos.x, pos.y, pos));
+        }
+    }
+    best.map(|(_, _, _, pos)| (pos, STONE.to_owned()))
+}
+
+/// The night contract of [`BotState::wall_vein_latch`]: the same
+/// revalidation the day's [`latched_vein`] runs — on the map, not mined out,
+/// not claimed, not blacked out, a stone latch released when the pool
+/// covers the demand, an ore latch released when stone goes short — minus
+/// the dusk-deadline release, which does not exist after dark.
+fn night_latched_vein(
+    turn: &Turn,
+    state: &BotState,
+    claimed: &HashSet<Pos>,
+    stone_short: bool,
+) -> Option<(Pos, String)> {
+    let pos = state.wall_vein_latch?;
+    if state.vein_hits.get(&pos).copied().unwrap_or(0) >= VEIN_COLLECT_LIMIT {
+        return None;
+    }
+    if claimed.contains(&pos) {
+        return None;
+    }
+    let (_, ore) = turn.all_mines().into_iter().find(|(p, _)| *p == pos)?;
+    if state.ore_on_outage(&ore, turn.day) {
+        return None;
+    }
+    if ore == STONE {
+        if !stone_short {
+            return None;
+        }
+    } else if stone_short {
+        return None;
+    }
+    Some((pos, ore))
 }
 
 #[cfg(test)]
@@ -891,5 +1283,199 @@ mod tests {
         assert_eq!(cmd.action, "collect");
         assert_eq!(target(&cmd), pos(14, 23), "the stone vein is skipped");
         assert_eq!(state.wall_vein_latch, Some(pos(14, 23)));
+    }
+
+    // ---- Night fixtures (phase 4b-3) ----
+
+    fn tower(id: i64, kind: &str, at: Pos, cooldown: i64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "pos": {"x": at.x, "y": at.y}, "roleType": kind,
+            "health": 1000, "level": 1, "attackPower": 10, "attackRange": 10,
+            "cooldown": cooldown, "backPackCapability": 0, "backpack": []
+        })
+    }
+
+    fn robot(id: i64, at: Pos, kind: &str, health: i64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "pos": {"x": at.x, "y": at.y}, "roleType": kind,
+            "health": health, "abnormalState": "", "targetTeam": "challenger"
+        })
+    }
+
+    /// A night board: `roundNo` 71+ is day 1's night (`in_day_round >= 70`).
+    /// The L's three sites are (9,22) rocket, (10,22) railgun, (9,24)
+    /// gatling, and the operator cell (9,23) is adjacent to all three.
+    fn night_board(
+        round_no: i64,
+        roles: Vec<serde_json::Value>,
+        zones: Vec<serde_json::Value>,
+        robots: Vec<serde_json::Value>,
+    ) -> Turn {
+        let mut all = vec![unit(10001, "station", pos(10, 24), vec![])];
+        all.extend(roles);
+        let payload = serde_json::json!({
+            "roundNo": round_no,
+            "mapInfo": {"width": 41, "height": 32, "zones": zones},
+            "teamOur": {
+                "type": "challenger", "goldNum": 0, "totalScore": 0,
+                "playerTasks": [], "roles": all
+            },
+            "teamEnemy": {"roles": []},
+            "robot": {"roles": robots},
+        });
+        let req: crate::protocol::Request =
+            serde_json::from_value(payload).expect("payload parses");
+        Turn::from_request(req)
+    }
+
+    /// Drive A (10002) through the night mainline and return the WHOLE plan:
+    /// the attacks are keyed by tower id, A's personal command by 10002.
+    fn night_plan_for(turn: &Turn, state: &mut BotState) -> Plan {
+        let mut claimed = HashSet::new();
+        let mut plan = Plan::default();
+        let role = turn.role_by_id(10002).expect("worker A exists");
+        plan_night(turn, state, role, &mut claimed, &mut plan);
+        plan
+    }
+
+    /// Design D16's L-shape: ONE operator fires the whole three-gun salvo in
+    /// a single round. Attacks are tower-addressed commands naming the
+    /// controller, so the salvo costs A no personal command at all — the
+    /// operator stands at the post with an empty slot while all three guns
+    /// fire.
+    #[test]
+    fn one_operator_fires_the_whole_l() {
+        let turn = night_board(
+            75,
+            vec![
+                unit(10002, "worker", pos(9, 23), vec![]), // the operator cell
+                tower(30001, "rocket", pos(9, 22), 0),
+                tower(30002, "railgun", pos(10, 22), 0),
+                tower(30003, "gatling", pos(9, 24), 0),
+            ],
+            vec![],
+            vec![
+                robot(90001, pos(12, 23), "largeRobot", 500),
+                robot(90002, pos(11, 22), "largeRobot", 500),
+                robot(90003, pos(11, 24), "largeRobot", 500),
+            ],
+        );
+        assert!(!turn.is_day);
+        let mut state = BotState::default();
+        let plan = night_plan_for(&turn, &mut state);
+        for id in [30001i64, 30002, 30003] {
+            let cmd = plan.commands.get(&id).expect("every gun of the L fires");
+            assert_eq!(cmd.action, "attack");
+            assert_eq!(cmd.controllerId.as_deref(), Some("10002"));
+        }
+        assert!(
+            plan.commands.get(&10002).is_none(),
+            "the salvo costs the operator no personal command"
+        );
+    }
+
+    /// D14/§3.4: while robots live, the night belongs to the guns — an
+    /// off-post A walks back instead of running errands. The copper vein
+    /// beside A must not steal the round: the swept-night mine is step 4,
+    /// and step 4 needs a swept board.
+    #[test]
+    fn a_live_wave_recalls_the_operator() {
+        let turn = night_board(
+            75,
+            vec![
+                unit(10002, "worker", pos(20, 10), vec![]),
+                tower(30001, "rocket", pos(9, 22), 0),
+            ],
+            vec![zone(21, 10, "copper")],
+            vec![robot(90001, pos(12, 23), "largeRobot", 500)],
+        );
+        let mut state = BotState::default();
+        let plan = night_plan_for(&turn, &mut state);
+        let cmd = plan.commands.get(&10002).expect("A walks home");
+        assert_eq!(cmd.action, "move");
+        let post = base_layout::operator_cell(&turn).expect("the operator cell");
+        assert!(
+            (chebyshev(target(cmd), post) as i64) < trip_rounds(&turn, pos(20, 10), post),
+            "the step closes on the post"
+        );
+        assert!(
+            plan.commands.get(&30001).is_none(),
+            "the gun is out of reach and stays silent"
+        );
+    }
+
+    /// Comment 1 §3.4: 所有己方机器人消灭后出去采矿 — the swept night sends A
+    /// out to the quota stone (the ring still owes 16 cells and the pool
+    /// holds none), on the single-vein latch and clear of any robot zone
+    /// (vacuous here, but the picker runs the same D15 filter).
+    #[test]
+    fn the_swept_night_sends_a_to_the_quota_stone() {
+        let turn = night_board(
+            75,
+            vec![
+                unit(10002, "worker", pos(9, 23), vec![]),
+                tower(30001, "rocket", pos(9, 22), 0),
+            ],
+            vec![zone(14, 24, "stone"), zone(16, 24, "copper")],
+            vec![],
+        );
+        let mut state = BotState::default();
+        let plan = night_plan_for(&turn, &mut state);
+        let cmd = plan.commands.get(&10002).expect("A mines the swept night");
+        assert_eq!(cmd.action, "move");
+        assert_eq!(
+            state.wall_vein_latch,
+            Some(pos(14, 24)),
+            "quota stone first, on the latch — the copper does not tempt it"
+        );
+        assert!(plan.commands.get(&30001).is_none(), "nothing to shoot at");
+    }
+
+    /// Issue #20 / P1-4: a dying operator is bait, not a gunner — the guns
+    /// stay dark and an A already inside the ring holds instead of pacing.
+    #[test]
+    fn a_dying_operator_holds_inside_instead_of_manning() {
+        let mut a = unit(10002, "worker", pos(9, 23), vec![]);
+        a["health"] = serde_json::json!(40); // under 30% of the 220 worker max
+        let turn = night_board(
+            75,
+            vec![a, tower(30001, "rocket", pos(9, 22), 0)],
+            vec![],
+            vec![robot(90001, pos(11, 24), "smallRobot", 100)],
+        );
+        let mut state = BotState::default();
+        let plan = night_plan_for(&turn, &mut state);
+        assert!(plan.commands.get(&30001).is_none(), "the gun stays dark");
+        assert!(
+            plan.commands.get(&10002).is_none(),
+            "already inside: hold, do not pace"
+        );
+        assert!(
+            state.withdraw_holdout.contains(&10002),
+            "the hysteresis set keeps A off the guns while the wound is fresh"
+        );
+    }
+
+    /// Issues #126-#130: a reload round with no WallFixer and no masonry is
+    /// a hold round — the operator at the post does not pace and does not
+    /// errand while the wave lives.
+    #[test]
+    fn a_reloading_gun_holds_the_operator_at_the_post() {
+        let turn = night_board(
+            75,
+            vec![
+                unit(10002, "worker", pos(9, 23), vec![]),
+                tower(30001, "rocket", pos(9, 22), 5),
+            ],
+            vec![zone(14, 24, "stone")],
+            vec![robot(90001, pos(12, 23), "largeRobot", 500)],
+        );
+        let mut state = BotState::default();
+        let plan = night_plan_for(&turn, &mut state);
+        assert!(plan.commands.get(&30001).is_none(), "the gun is reloading");
+        assert!(
+            plan.commands.get(&10002).is_none(),
+            "at the post with a live wave: holding IS the plan"
+        );
     }
 }

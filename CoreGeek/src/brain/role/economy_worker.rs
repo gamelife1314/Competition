@@ -539,7 +539,8 @@ pub(crate) fn pick_vein(
 
 /// True when no living robot is within `clearance` cells of `pos`. With
 /// `clearance == 0` (day) everything is safe — the filter is a night parameter.
-fn night_safe(turn: &Turn, pos: Pos, clearance: i32) -> bool {
+/// Shared with A's swept-night stone picker (phase 4b-3, design D15).
+pub(crate) fn night_safe(turn: &Turn, pos: Pos, clearance: i32) -> bool {
     clearance <= 0
         || !turn
             .robots

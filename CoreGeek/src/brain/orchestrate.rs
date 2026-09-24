@@ -8,13 +8,14 @@
 //!
 //! # Transitional state (phase 4b of the refactor)
 //!
-//! BOTH workers are dispatched by their own mainlines: the economy worker (B)
-//! by [`role::economy_worker`] (comment 1 §5/§6), the wall worker (A) by
-//! [`role::wall_worker`] (comment 1 §4/§5) — the legacy `worker_day` dispatch
-//! is deleted. `day::plan_roles` now owns only the team prompt slot, the
-//! pioneer and the closing backstop. At night, A and the pioneer are still
-//! planned by the legacy `night::plan_owned`; 4b-3 moves A onto the
-//! single-operator L-shape model. Claim order is the legacy one — A, pioneer,
+//! BOTH workers are dispatched by their own mainlines, day AND night: the
+//! economy worker (B) by [`role::economy_worker`] (comment 1 §5/§6), the wall
+//! worker (A) by [`role::wall_worker`] (§4/§5 by day; §3.4's single-operator
+//! L-shape at night — `plan_night`, design D14-D16). Both legacy dispatchers
+//! are gone: `day::plan_roles` now owns only the team prompt slot, the pioneer
+//! and the closing backstop, and `night::plan_spare` is the pioneer's night
+//! chain (wall-repair duty per comment 1 §3.3 and Q5's default — it is not
+//! A's backup gunner yet). Claim order is the legacy one — A, pioneer,
 //! backstop, B — and no unit is ever commanded twice (`Plan::push` is
 //! first-wins on top of that). The remaining day/night fork below is the LAST
 //! one, and it dies in phase 5 when `role::pioneer` takes over and both
@@ -57,9 +58,28 @@ pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
             .collect();
         day::plan_roles(turn, state, &ctx, &skip, &mut claimed, &mut plan);
     } else {
-        // Night in 4b-2: A still takes its tower from the legacy pairing; the
-        // L-shape single-operator model replaces it in 4b-3 (design D14-D16).
-        plan = night::plan_owned(turn, state, &owned);
+        // Night, dispatched by PERSON like the day (design D14-D16). A runs
+        // the whole L-shape from the operator cell: guns, reload masonry, the
+        // swept-board mine (comment 1 §3.4). Everybody the roster does not
+        // name — the pioneer first — takes the spare chain: WallFixer in hand
+        // it stands inside the ring and mends, and with the kit spent it
+        // shelters (Q5's default; the backup-gunner switch lands in phase 5).
+        // B never comes home: its mainline below mines all night outside the
+        // ring (comment 1 §6). The legacy pairing loop is deleted.
+        if let Some(role) = roles.wall_worker.and_then(|id| turn.role_by_id(id)) {
+            role::wall_worker::plan_night(turn, state, role, &mut claimed, &mut plan);
+        }
+        let spares: Vec<i64> = turn
+            .controllable()
+            .into_iter()
+            .map(|role| role.id)
+            .filter(|id| Some(*id) != roles.wall_worker && Some(*id) != roles.economy_worker)
+            .collect();
+        for id in spares {
+            if let Some(role) = turn.role_by_id(id) {
+                night::plan_spare(turn, state, role, &mut claimed, &mut plan);
+            }
+        }
     }
     if let Some(id) = roles.economy_worker {
         role::economy_worker::plan(turn, state, id, &mut claimed, &mut plan);
