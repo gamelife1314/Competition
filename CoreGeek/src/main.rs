@@ -25,7 +25,7 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime");
 
-    println!("listening on 0.0.0.0:{port}");
+    println!("CoreGeek v{} listening on 0.0.0.0:{port}", env!("CARGO_PKG_VERSION"));
     // Startup log record (JSONL to stdout) for post-match diagnostics.
     coregeek::log::event(
         "startup",
