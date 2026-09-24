@@ -509,6 +509,12 @@ pub struct BotState {
     /// instead of re-picking a vein every round. Cleared when exhausted,
     /// gone, or (at night) when a robot comes inside the safety distance.
     pub vein_latch: Option<Pos>,
+    /// Worker A's single-vein latch (design D19; comment 1 §5: 每个矿只能采集10次,
+    /// 尽可能一次性将单个矿采集完). Same contract as [`Self::vein_latch`] (B's)
+    /// but a separate field: A's quota stone vein and B's ROI ore vein are
+    /// different errands, and one shared latch would have the two workers
+    /// re-pick each other's vein every round.
+    pub wall_vein_latch: Option<Pos>,
     /// Collects issued per vein. The game limits every vein to 10 collects;
     /// the latch and the ROI pick both refuse a vein that is spent.
     pub vein_hits: std::collections::BTreeMap<Pos, i64>,

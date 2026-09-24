@@ -113,21 +113,6 @@ pub(crate) fn walk_to_shop(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>)
     walk_toward(turn, role, &stands, claimed)
 }
 
-/// Walk to the nearest vendor stand: the SALE leg of a merged outing, walked
-/// before the shop leg because the counter is paid in gold and the pack is
-/// where the gold is. Same shape as `walk_to_shop` — the day has one way of
-/// walking a role to a stand and this is not a second one.
-pub(crate) fn walk_to_vendor(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>) -> Option<RoleCommand> {
-    let mut stands: Vec<Pos> = Vec::new();
-    for vendor in turn.vendors() {
-        stands.extend(stand_cells(turn, vendor));
-    }
-    if stands.is_empty() {
-        return None;
-    }
-    walk_toward(turn, role, &stands, claimed)
-}
-
 /// Buy the first needed item: walk to the weapon shop, then buy. Buying is
 /// the buyer's sole job — a carried summon order must never preempt a voucher,
 /// upgrade or repair purchase.
@@ -243,7 +228,8 @@ pub(crate) fn shop_round_trip(turn: &Turn, role: &Unit, pairs: &[(i64, i64)]) ->
 /// See [`buyer_flow`] for what the answer decides. The bound is `DUSK_ROUND`
 /// itself and not `HARD_SEAL_ROUND`: a trip that ends inside the dusk window is
 /// the trip that holds the gate open (`wall_gate_open` naming the buyer on
-/// every round of it), which is the hole `dusk_recall_round` exists to close.
+/// every round of it), which is the hole the wall worker's post guard
+/// (`role::wall_worker`) exists to close.
 pub(crate) fn shop_errand_fits(turn: &Turn, role: &Unit, pairs: &[(i64, i64)]) -> bool {
     shop_round_trip(turn, role, pairs)
         .map(|trip| turn.in_day_round + trip <= economy::DUSK_ROUND)

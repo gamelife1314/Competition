@@ -1,6 +1,9 @@
-//! Daytime planning (70 rounds): workers run the economy loop
-//! (mine → sell → build towers/walls → upgrades), the pioneer runs tasks,
-//! the treasure hunt and shopping.
+//! Daytime planning (70 rounds) — what is left of the legacy dispatch
+//! (issue #221 phase 4b): the round context both worker mainlines read, the
+//! team prompt slot, the pioneer's day and the closing backstop. The worker
+//! loop is gone — A lives in [`crate::brain::role::wall_worker`], B in
+//! [`crate::brain::role::economy_worker`] — and phase 5 moves the pioneer out
+//! too and deletes this file.
 
 use std::collections::HashSet;
 
@@ -18,15 +21,12 @@ use crate::state::{BotState, TaskSession};
 // the build/tower/wall-geometry cluster moved to `action::{build,tower_site,
 // geometry}` (phase 2c). Everything the test crates used to import from here is
 // re-exported under its old name until phase 5 flips the paths once.
-use super::action::build::{build_or_walk, repair_flow};
 use super::action::geometry::{ring_open_cells, wall_layer};
-use super::action::mine::{mine_flow, stone_covered};
+use super::action::mine::stone_covered;
 use super::action::shop::{
-    burn_summon_order, buyer_flow, self_provision, shop_round_trip, shop_trip_decision,
-    shop_trip_worth_taking, voucher_flow, walk_to_shop, walk_to_vendor,
+    self_provision, shop_round_trip, shop_trip_decision, voucher_flow,
 };
 pub(crate) use super::action::shop::use_medicine;
-use super::action::sell::sell_flow;
 pub use super::action::build::repair_target;
 pub use super::action::geometry::{
     primary_wall_gaps, tower_build_reserve, wall_daily_cap, wall_gaps, D1_WALL_CAP, LATER_WALL_CAP,
@@ -51,33 +51,17 @@ const STONE_BATCH: i64 = 6;
 /// wall and a frozen purse in issues #12/#13/#14.
 const RING_BATCH: i64 = 20;
 
-/// Stones a wall trip must be able to carry home before it is worth starting.
-/// A trip that lands one stone is not a wall line, it is a lost day: issue #17
-/// spent the whole of D1 walking to a vein on the far side of the map and put
-/// up zero walls.
-pub(crate) const MIN_WALL_LOAD: i64 = 4;
 /// Rounds kept in hand on top of the walk home before a stone carrier gives up
 /// on the vein — a blocked cell, a detour, a claim.
 const WALL_TRIP_SLACK: i64 = 3;
-
-/// The day-round by which this role must be standing beside its gun. A role
-/// with no gun pair is due at dusk like everyone else.
-pub(crate) fn gun_deadline(turn: &Turn, role: &Unit, pairs: &[(i64, i64)]) -> i64 {
-    pairs
-        .iter()
-        .find(|(controller, _)| *controller == role.id)
-        .and_then(|(_, tower)| turn.role_by_id(*tower))
-        .map(|tower| preposition_round(chebyshev(role.pos, tower.pos)))
-        .unwrap_or(economy::DUSK_ROUND)
-}
 
 /// Has the vein stopped paying for the walk home? The load already in hand is
 /// what the ring gets; a carrier that keeps digging is a carrier the night
 /// finds outside the wall. Measured against the wall window (dusk plus the
 /// seal grace), not the gun deadline: the seal is allowed to spend the last
 /// rounds of the day on the ring, and a trip that is still placing walls then
-/// is a trip that worked.
-fn wall_trip_overdue(turn: &Turn, role: &Unit, gaps: &[Pos]) -> bool {
+/// is a trip that worked. Read by the wall worker's batch release (phase 4b).
+pub(crate) fn wall_trip_overdue(turn: &Turn, role: &Unit, gaps: &[Pos]) -> bool {
     let home = gaps
         .iter()
         .map(|gap| chebyshev(role.pos, *gap) as i64)
@@ -86,8 +70,9 @@ fn wall_trip_overdue(turn: &Turn, role: &Unit, gaps: &[Pos]) -> bool {
     turn.in_day_round + home + 1 + WALL_TRIP_SLACK >= economy::DUSK_ROUND + SEAL_GRACE
 }
 
-/// Stones this role should carry before it walks out to the wall line.
-fn stone_batch(turn: &Turn, gaps: usize) -> i64 {
+/// Stones this role should carry before it walks out to the wall line. Read
+/// by the wall worker's batch release (phase 4b).
+pub(crate) fn stone_batch(turn: &Turn, gaps: usize) -> i64 {
     let want = if turn.day == 1 {
         RING_BATCH
     } else {
@@ -121,11 +106,6 @@ pub(crate) const HARD_SEAL_ROUND: i64 = economy::DUSK_ROUND + 11;
 /// Slack on top of the walk home before the pioneer's dusk recall fires, for a
 /// blocked cell or a detour. Mirrors the three rounds `preposition_round` keeps.
 const PIONEER_RETREAT_SLACK: i64 = 2;
-/// Day-rounds before dusk from which a role with no gun to man stops taking
-/// errands outside the ring. One ordinary walk home (a worker is four to eight
-/// cells out at the vein or the wall line) plus slack — the mirror of
-/// `SEAL_GRACE`, which is the same budget on the far side of dusk.
-const DUSK_RETREAT_LEAD: i64 = 8;
 /// Day-rounds that must still be available before a task point is worth
 /// accepting.
 ///
@@ -151,45 +131,16 @@ const TASK_MIN_ATTEMPT_ROUNDS: i64 = 12;
 /// working, and `MAX_WRONG_ANSWERS` already governs that case.
 const MAX_STERILE_ROUNDS: i64 = 15;
 
-/// How many ring stones the dedicated economy worker carries and lays on day 1
-/// before its shift changes to earning.
-///
-/// The ring is 20 cells plus the gate, and the day has to buy it AND earn with
-/// it: 「挖矿必须进行，必须赚钱」. The wall worker carries the rest — its pack
-/// holds 100 (`backPackCapability`, 任务书 3.2) against the 21 stones the day
-/// owes, so nothing about the ring's stone needs a second carrier. What the
-/// second carrier buys is TIME, and only on the cells it lays itself: measured
-/// on the day-1 board, the two workers' 21 placements take the whole afternoon
-/// (R17 to R56) because both walk the same ring route and only the one standing
-/// beside the gap may build. A worker that carries six and lays six is out of
-/// that queue by mid-morning with the rest of the day ahead of it; a worker that
-/// carries eleven is in it until dusk, which is exactly the day the owner
-/// filed. Six is the share the day's remaining rounds can pay for: leaving the
-/// ring work at ~R30 puts the nearest sellable vein (eight to ten rounds out) in
-/// reach before the dusk recall, and hands the wall worker the 15 stones it can
-/// still lay before the gate seals.
-const ECONOMY_D1_STONE_SHARE: i64 = 6;
-
-/// Rounds one carrier needs per ring cell on the day-1 sweep.
-///
-/// The build order walks the ring, so a cell costs a step to the site and then
-/// the placement: measured on the day-1 board, the sweep lays one cell every
-/// other round from R17 to R56. Used by `worker_day`'s `ring_fits_without_me`,
-/// which is what stops the economy worker standing down while the cells it
-/// would leave behind no longer fit in the afternoon.
-pub(crate) const ROUNDS_PER_RING_CELL: i64 = 2;
-
 pub fn plan(turn: &Turn, state: &mut BotState) -> Plan {
     plan_owned(turn, state, &[], &mut HashSet::new())
 }
 
 /// The day plan with the issue-#221 roster seam: every unit id in `owned` is
-/// dispatched by a role mainline ([`crate::brain::role`]) instead of the legacy
-/// worker loop — this planner skips it entirely (no wall duty, no shopping
-/// errand, no backstop walk) and the caller merges the plans. `owned == &[]`
-/// is exactly the old `plan`, which is what the test crates still drive.
-/// `claimed` is shared with the mainlines so two people never reserve the same
-/// vein or build site.
+/// dispatched by a role mainline ([`crate::brain::role`]) instead of this
+/// planner — the backstop skips it (no shopping errand, no fallback walk) and
+/// the caller merges the plans. `owned == &[]` is exactly the old `plan`,
+/// which is what the test crates still drive. `claimed` is shared with the
+/// mainlines so two people never reserve the same vein or build site.
 pub(crate) fn plan_owned(
     turn: &Turn,
     state: &mut BotState,
@@ -198,7 +149,7 @@ pub(crate) fn plan_owned(
 ) -> Plan {
     let ctx = round_context(turn, state, owned);
     let mut plan = Plan::default();
-    plan_roles(turn, state, &ctx, owned, owned, &mut claimed, &mut plan);
+    plan_roles(turn, state, &ctx, owned, &mut claimed, &mut plan);
     plan
 }
 
@@ -214,9 +165,6 @@ pub(crate) struct RoundCtx {
     pub(crate) wall_cap: i64,
     pub(crate) budget: economy::Budget,
     pub(crate) buyer_id: Option<i64>,
-    pub(crate) economy_id: Option<i64>,
-    pub(crate) shared_wall_duty: bool,
-    pub(crate) ring_at_risk: bool,
     pub(crate) pairs: Vec<(i64, i64)>,
 }
 
@@ -311,9 +259,9 @@ pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) ->
     // has to buy its ring and then go earn.
     //
     // WHAT PAYS FOR THE WALL NOW: the stone already in the crew's packs. The
-    // release is `stone_covered` — the very bound `mine_flow` uses to decide
-    // who digs (see it there) — so "the ring has its stone" cannot mean two
-    // different things in two places. The old trigger was `wall_gaps.len() > 4`,
+    // release is `stone_covered` — the very bound both worker mainlines use to
+    // decide who digs stone (see `action::mine`) — so "the ring has its stone"
+    // cannot mean two different things in two places. The old trigger was `wall_gaps.len() > 4`,
     // i.e. release once the ring is all but closed, and on the day-1 board that
     // lands at R41 with dusk at 55 and the nearest sellable vein eight to ten
     // rounds out: the released worker reached the ore exactly as the recall
@@ -326,24 +274,10 @@ pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) ->
     let shared_wall_duty = turn.day == 1
         && workers.len() >= 2
         && !stone_covered(turn, stone_demand);
-    // THE RING HAS THE LAST WORD (issue #207 §5(iii)). The release above is a
-    // loan against a ring that is on schedule, and the schedule is arithmetic:
-    // one carrier lays a ring cell every other round (a step to the site, then
-    // the placement — measured over the day-1 sweep), so `worker_day`'s
-    // `ring_fits_without_me` takes the earner back the moment the cells it
-    // would leave behind no longer fit in the afternoon. This flag is the other
-    // half of the bound, and the cruder one: the day is out of wall work it can
-    // be sent to while the ring is still open.
-    //
-    // The debt is counted on the ring itself, not on `wall_gaps`: the sweep's
-    // list drops a cell a teammate is standing on and a cell whose build the
-    // judger has blacklisted, and those dropped cells are exactly the ones that
-    // end a day at 16/20 (the day-1 board closed its last four from the dusk
-    // seal alone, R56 → R65, with the whole crew idle inside the ring and 3
-    // iron in a backpack). What the night finds open is the debt that matters,
-    // so the debt is what this reads.
-    let ring_debt = ring_open_cells(turn, state) as i64;
-    let ring_at_risk = turn.day == 1 && ring_debt > 0 && wall_gaps.is_empty();
+    // The flag's only surviving reader is the buyer pick below (phase 4b
+    // deleted the worker loop that dispatched on it): while the D1 ring is
+    // still short of stone, wall work is NOT done, so the shop errand stays
+    // with the fallback nominee instead of moving to the first worker.
     let wall_work_done = wall_gaps.is_empty() && !shared_wall_duty;
     let buyer_id: Option<i64> = if budget.intent.is_empty() {
         None
@@ -398,22 +332,6 @@ pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) ->
             "upgradeReachable": economy::upgrade_reachable(turn, state),
         }),
     );
-    // With two workers, the LAST one is the dedicated economy worker: it skips
-    // wall duty and focuses on mine → sell → shop, so the wall line never
-    // monopolizes both workers. Day 1's open ring is the exception — a builder
-    // can only spend stone it is carrying itself, so a "held back" stone in
-    // the economy worker's pack is not a reserve, it is a hole in the ring,
-    // and the only role that can close it is the one carrying it. That is
-    // exactly the shape of issues #12/#13/#14: one worker swept 8 walls and
-    // ran dry while the other stood on 17 stone it was neither allowed to
-    // build with nor able to sell. While the D1 ring is still open both
-    // workers fortify; the exemption returns as soon as only the gate is left,
-    // and the mine→sell→shop loop owns the rest of the day.
-    let economy_id = if workers.len() >= 2 {
-        workers.last().map(|unit| unit.id)
-    } else {
-        None
-    };
     if !budget.intent.is_empty() {
         // Economy intent vs outcome: the head of the list is what we WANT, the
         // gold check and the buyer's distance say whether it is reachable this
@@ -454,8 +372,9 @@ pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) ->
                 // it — the round trip and the round the buyer has to be home by
                 // — were nowhere in the log, so "75 rounds affordable, no
                 // purchase" (表 2b/2a of pk590730) could only be read as a
-                // mystery. `shopTrip` is the decision `worker_day` will take
-                // this round: `walk` (the errand is worth taking), `no_time`
+                // mystery. `shopTrip` is the decision the buyer's mainline
+                // step will take this round: `walk` (the errand is worth
+                // taking), `no_time`
                 // (it cannot be finished before dusk), `pack_full` (no slot for
                 // the goods) or `sale_first` (there is ore to sell and the trip
                 // is not worth taking yet). `trip` is the round-trip estimate in
@@ -493,41 +412,27 @@ pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) ->
         wall_cap,
         budget,
         buyer_id,
-        economy_id,
-        shared_wall_duty,
-        ring_at_risk,
         pairs,
     }
 }
 
-/// Dispatch the roles the legacy day planner still owns: the worker loop, the
-/// team prompt slot, the pioneer and the closing backstop. Split out of
-/// `plan_owned` with zero behaviour change (issue #221 phase 4a).
+/// Dispatch the roles the legacy day planner still owns: the team prompt
+/// slot, the pioneer and the closing backstop. Split out of `plan_owned`
+/// (issue #221 phase 4a); phase 4b deleted the worker loop — both workers
+/// run their own mainlines ([`crate::brain::role`]) around this call, the
+/// wall worker's BEFORE (its legacy claim priority over the pioneer and B is
+/// preserved) and the economy worker's AFTER.
 ///
-/// Two rosters, because they answer two questions. `skip` is the DISPATCH
-/// exclusion: ids a role mainline commands around this call — the scheduler
-/// runs the wall worker's BEFORE (its legacy claim priority over the pioneer
-/// and B is preserved) and the economy worker's AFTER, exactly as the merged
-/// plan was ordered before the split. `ctx_owned` is the CONTEXT roster that
-/// `worker_day`'s trap vetoes must see identically to [`round_context`]'s
-/// pairing and gate record — for direct `plan_owned` callers the two lists are
-/// the same one, which is what keeps this a pure move.
+/// `skip` is the DISPATCH exclusion: ids a role mainline commands, which the
+/// backstop must not second-guess with a walk of its own.
 pub(crate) fn plan_roles(
     turn: &Turn,
     state: &mut BotState,
     ctx: &RoundCtx,
-    ctx_owned: &[i64],
     skip: &[i64],
     mut claimed: &mut HashSet<Pos>,
     mut plan: &mut Plan,
 ) {
-    for worker in &turn.workers() {
-        if skip.contains(&worker.id) {
-            continue; // dispatched by its role mainline, not by this planner
-        }
-        plan_worker_legacy(turn, state, worker, ctx, ctx_owned, &mut *claimed, &mut *plan);
-    }
-
     // The day's news/treasure prompt is a team-level channel, not a role
     // command — it costs the pioneer no movement. Moving it out of
     // `pioneer_day` so a dead pioneer does not silence the LLM ask: the news
@@ -590,41 +495,6 @@ pub(crate) fn plan_roles(
     }
 }
 
-/// The legacy per-worker day dispatch behind the phase-4a delegation in
-/// [`crate::brain::role::wall_worker`]: unfolds one [`RoundCtx`] into
-/// `worker_day`'s argument list. `owned` is the CONTEXT roster (see
-/// [`plan_roles`]) — the list the trap vetoes inside `worker_day` measure
-/// "would somebody be locked out" against, which must stay the same list
-/// [`round_context`] paired and sealed with.
-pub(crate) fn plan_worker_legacy(
-    turn: &Turn,
-    state: &mut BotState,
-    role: &Unit,
-    ctx: &RoundCtx,
-    owned: &[i64],
-    claimed: &mut HashSet<Pos>,
-    plan: &mut Plan,
-) {
-    worker_day(
-        turn,
-        state,
-        role,
-        &ctx.tower_gaps,
-        &ctx.wall_gaps,
-        ctx.stone_demand,
-        ctx.wall_cap,
-        &ctx.budget,
-        ctx.buyer_id,
-        ctx.economy_id,
-        ctx.shared_wall_duty,
-        ctx.ring_at_risk,
-        &ctx.pairs,
-        owned,
-        claimed,
-        plan,
-    );
-}
-
 /// Is this role pinned to a task point this round?
 ///
 /// Only the pioneer can hold a self-evolution task (`validate` admits
@@ -667,670 +537,6 @@ pub(crate) fn fallback_toward_station(turn: &Turn, role: &Unit) -> Option<RoleCo
     // the demolition hatch still refuses when no SINGLE cut reopens the route
     // (issues #176-#185: 20011 on (24,16) for twelve straight dusk rounds).
     walk_home_or_reroute(turn, role, &stands, &mut HashSet::new())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn worker_day(
-    turn: &Turn,
-    state: &mut BotState,
-    role: &Unit,
-    tower_gaps: &[(Pos, String)],
-    wall_gaps: &[Pos],
-    stone_demand: i64,
-    // Today's fortification budget, computed once in `plan` — the same number
-    // the day's `wall_demand` is measured against, so the day's stone and the
-    // day's wall work can never disagree about how much ring today is worth.
-    wall_cap: i64,
-    budget: &economy::Budget,
-    buyer_id: Option<i64>,
-    economy_id: Option<i64>,
-    shared_wall_duty: bool,
-    ring_at_risk: bool,
-    pairs: &[(i64, i64)],
-    owned: &[i64],
-    claimed: &mut HashSet<Pos>,
-    plan: &mut Plan,
-) {
-    // 1. Self-heal — a dead worker builds nothing, so this outranks all else.
-    if let Some(cmd) = use_medicine(role) {
-        plan.push(role.id, cmd);
-        return;
-    }
-    // 2. Apply upgrade vouchers we already carry — using them the moment we
-    //    hold them beats buying more or anything else (the night's firepower
-    //    depends on it).
-    if let Some(cmd) = voucher_flow(turn, role, claimed) {
-        plan.push(role.id, cmd);
-        return;
-    }
-    // Steps 3/3b of the legacy dispatch — the dusk seal of the day's gate and
-    // the re-seal of the morning's doors — are deleted with the gate itself
-    // (design D17): the permanent entrance is never walled, so there is no
-    // cell whose seal must be timed, forced or waited for. Any ring cell still
-    // open at dusk is an ordinary gap the wall sweep below keeps offering.
-    // 4. Pre-position near the assigned tower. This outranks walls, weapons
-    //    and the economy once the deadline hits: a tower with no operator by
-    //    dusk is a weapon that never fires (battle pk575060 lost 17/20 night
-    //    rounds to walking back). Once past the deadline the role locks to the
-    //    tower — late-day economy is deliberately sacrificed for a manned gun.
-    if let Some(tower_id) = pairs
-        .iter()
-        .find(|(controller, _)| *controller == role.id)
-        .map(|(_, tower)| *tower)
-    {
-        if let Some(tower) = turn.role_by_id(tower_id) {
-            let dist = chebyshev(role.pos, tower.pos);
-            // The dedicated economy worker keeps the collect→sell→buy loop
-            // running until the last day rounds (so gold never freezes during
-            // tasks); everyone else retreats by dusk. The unconditional night
-            // recall still guarantees arrival even if this lands late.
-            // Dusk is a hard defense checkpoint for every operator, including
-            // the economy worker. No collect/sell/buy action may delay a tower
-            // assignment past its travel deadline — with ONE measured
-            // exception: a role already AT the vendor's counter sells before
-            // it comes home. The deadline subtracts the walk and three rounds
-            // of detours but not the sale itself, and a seller yanked one hop
-            // from the counter walks home with a full pack UNSOLD — the whole
-            // errand wasted and the day frozen (the day-2 board: iron rode
-            // home twice). One round at the counter moves the arrival from
-            // day-round ≤51 to ≤52, still before dusk; the lock fires the
-            // round after the pack is sold, and the night recall bounds the
-            // rest. The checkpoint stands — it is the lock's own arithmetic
-            // that now includes the counter round.
-            let deadline = preposition_round(dist);
-            let at_counter = turn
-                .vendors()
-                .iter()
-                .any(|vendor| chebyshev(role.pos, *vendor) == 1)
-                && economy::should_sell(turn, state, role, stone_demand);
-            // THE SECOND COUNTER EXCEPTION, and it is the same one (issues
-            // #156-#160): a buyer already on a shop errand that still finishes
-            // before dusk is worth more at the counter than at the post, and
-            // the lock-in is what has been turning it around four cells short
-            // of it. `shop_errand_fits` is the same predicate `buyer_flow`
-            // starts the walk with, so the two cannot disagree: a trip that was
-            // allowed to start is a trip this lock waits for, and one that was
-            // not allowed to start never gets this far.
-            //
-            // The arrival it allows is bounded by dusk, not by
-            // `preposition_round`'s three rounds of detour slack — so the post
-            // is still manned before nightfall, and the unconditional night
-            // recall (night.rs) owns the rest. What it buys is the purchase
-            // itself: pk590730's 130 gold never reached the counter, and a
-            // 1500-HP base at level 2 is what the night was missing.
-            let on_shop_errand =
-                Some(role.id) == buyer_id && shop_trip_worth_taking(turn, role, pairs, &budget.shopping);
-            // Logged only on the rounds the lock actually gives way, which is
-            // the whole finding: the three or four rounds a match where the
-            // buyer is past its deadline with the counter still reachable. A
-            // record on every shopping round would be forty lines a day of the
-            // same facts.
-            if on_shop_errand && turn.in_day_round >= deadline {
-                crate::log::event(
-                    "shop_trip",
-                    serde_json::json!({
-                        "round": turn.round_no,
-                        "role": role.id,
-                        "decision": "protected",
-                        "inDayRound": turn.in_day_round,
-                        "trip": shop_round_trip(turn, role, pairs),
-                        "lockRound": deadline,
-                    }),
-                );
-            }
-            // THE RING'S TAIL OUTRANKS THE POST, AND IT IS BOUNDED BY THE HARD
-            // DEADLINE (issue #207 §5). The lock above is measured against the
-            // PRE-POSITION round, which is dusk minus the walk minus the detour
-            // slack — on the day-1 board that is round 46, nine rounds before
-            // dusk. A stone carrier locked there stops being a carrier: the two
-            // cells the sweep could still reach sat bare until dusk released
-            // them, and the ring closed at R65 — 「第一天只挖石头」's own ring,
-            // with the dusk at 55. So a role carrying stone for gaps that are
-            // still open keeps the wall sweep available to it until dusk, and
-            // the moment the gaps are filled this falls through and the lock
-            // has the last word. The gun is not abandoned — `night::plan`'s
-            // unconditional recall is the backstop, and the sweep's errand is
-            // inside the ring.
-            let ring_tail = role.count_item(STONE) > 0
-                && !wall_gaps.is_empty()
-                && turn.in_day_round < economy::DUSK_ROUND;
-            if turn.in_day_round >= deadline && !at_counter && !on_shop_errand && !ring_tail {
-                // "Arrived" is a cell the gun can be OPERATED from, not merely
-                // one within a chebyshev cell of it. A gun's diagonal
-                // neighbours sit on the radius-2 wall ring: a controller that
-                // parks on one of them is standing in the wall line, outside
-                // the base — issue #15's "操控者在墙的外侧": the gun is manned
-                // from in front of the wall it is supposed to be behind.
-                // Walking on until a real operating cell is reached (or, when
-                // none can be reached, sheltering inside) is what keeps the
-                // crew behind the ring it spends the day building.
-                let stands = tower_stand_cells(turn, tower.pos);
-                if !stands.iter().any(|stand| *stand == role.pos) {
-                    // Walk there — but never by demolishing the wall line. The
-                    // ring is the day's whole product (issues #12/#13/#14: "420
-                    // log lines and zero wall builds"), and a controller that
-                    // cuts its way to a gun on the way in leaves a base that is
-                    // open all night. The night recall in `night::plan` keeps
-                    // its demolition escape hatch, where being locked out is
-                    // fatal; here the fallback is to shelter inside, which is
-                    // one of the three valid night duties (operate / heal /
-                    // retreat).
-                    if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
-                        plan.push(role.id, cmd);
-                        return;
-                    }
-                    if let Some(cmd) = retreat_inside(turn, state, role, claimed) {
-                        plan.push(role.id, cmd);
-                        return;
-                    }
-                }
-                // Already at the post (or sheltering inside): the day's walking
-                // is done, but the building need not be. On a slow board the
-                // ring's tail lands exactly here — the carrier arrives beside
-                // the last open cells with stone in its pack, and the bare
-                // lock used to make it hold that stone for six idle rounds
-                // while the shell waited for the seal step (the distant-vein
-                // board: the bottom row sat open R48–R55 and the tail landed
-                // two rounds late). An adjacent placement costs no walk and
-                // drags nobody off a gun; the reserve floor still applies, so
-                // this can never spend the gate's own stone.
-                if role.count_item(STONE) > 0
-                    && economy::team_ores(turn, STONE) >= stone_demand
-                {
-                    if let Some(site) = wall_gaps
-                        .iter()
-                        .find(|site| {
-                            !claimed.contains(site)
-                                && chebyshev(role.pos, **site) == 1
-                                && !wall_would_trap(turn, pairs, state, **site, owned)
-                        })
-                        .copied()
-                    {
-                        claimed.insert(site);
-                        state.walls_built_today = state.walls_built_today.saturating_add(1);
-                        state.walled_cells_today.insert(site);
-                        crate::log::event(
-                            "wall_build",
-                            serde_json::json!({
-                                "role": role.id,
-                                "target": site,
-                                "layer": wall_layer(turn, site),
-                                "stone": role.count_item(STONE),
-                                "atPost": true,
-                            }),
-                        );
-                        plan.push(role.id, RoleCommand::build(site, "wall"));
-                        return;
-                    }
-                }
-                // Already at the post (or no walkable step to one): hold
-                // position so a late mine/wall errand can't drag the role away
-                // from the gun.
-                return;
-            }
-        }
-    }
-    // 5. Build weapons (gold) FIRST — firepower is the priority. A tower costs
-    //    25 gold and takes one round to place. Offense-first: every tower is a
-    //    gun that kills NPCs for score, which is how the base survives.
-    //    Day 1 must build at least 2 towers so both workers have a weapon to
-    //    operate at night — a worker with no tower is dead weight during the
-    //    assault. The wall line (step 6 below) is secondary: 2 towers with no
-    //    walls beats 1 tower with a complete ring.
-    if economy::may_build_weapon(turn, state) {
-        // Dusk guard: after dusk, skip weapon building entirely. A weapon
-        // that isn't placed by dusk can wait until tomorrow — a worker
-        // stranded outside the ring at nightfall loses the gate seal and
-        // the night walks in (dusk_gate tests: role 10002 stuck at
-        // (13,23) building railgun every round R66-70 instead of going
-        // home).
-        let past_dusk = turn.in_day_round >= economy::DUSK_ROUND;
-        if !past_dusk {
-            for (site, kind) in tower_gaps {
-                if claimed.contains(site) {
-                    continue;
-                }
-                // Day 1: build all 3 towers immediately — firepower is the
-                // day's first priority. Every worker needs a weapon to
-                // operate at night; a worker with no tower is dead weight.
-                if let Some(cmd) = build_or_walk(turn, role, *site, kind, claimed) {
-                    claimed.insert(*site);
-                    plan.push(role.id, cmd);
-                    return;
-                }
-            }
-        }
-    }
-    // 6. Build walls (stone) AFTER weapons: the wall ring is a nice-to-have
-    //    that protects the base, but firepower kills enemies for score.
-    //    Capped to a minimal daily ring and skipped by the dedicated economy
-    //    worker, so the wall line never monopolizes the whole day. Building
-    //    also stops the moment any role could no longer reach its night
-    //    weapon — the gate stays open until everyone has retreated inside,
-    //    so we never wall ourselves out.
-    // DAY 1 IS THE SAME SPLIT, ONE SHIFT EARLIER. Day 1 used to keep the
-    // economy worker on the stone queue until the ring was all but closed
-    // (`wall_gaps.len() > 4`), and on the day-1 board the two workers spent
-    // every daylight round of the day digging and laying 21 stone between
-    // them: 21 stone dug, 20 walls up at R56 with dusk at 55, and not one iron
-    // or copper in either pack — the purse never moved off 25 and the whole day
-    // bought nothing (「第一天只挖石头」). The wall does not need the second
-    // carrier for its stone, only for its cells: the first worker carries what
-    // the day owes once this one has laid its share, and what this one carries
-    // it still lays itself — [`ECONOMY_D1_STONE_SHARE`] stones, placed by the
-    // `economy_unload_stone` branch below before the shift changes. From then
-    // on it is the earner: `keep_gold_loop` takes it off the stone queue
-    // altogether, so it fetches no more stone and digs only ore the vendor buys
-    // (`choose_sellable_mine`).
-    let economy_share_laid = Some(role.id) == economy_id
-        && turn.day == 1
-        && role.count_item(STONE) as i64 >= ECONOMY_D1_STONE_SHARE;
-    // THE SHIFT CHANGE IS BOUNDED BY THE RING'S OWN REMAINING WORK. The last
-    // carrier to leave the wall line is the one that decides whether the day
-    // ends with a closed ring, and the rule above releases it on "my share is
-    // carried" alone — which says nothing about whether the cells still bare
-    // fit in the afternoon that is left. Measured on the distant-vein board
-    // (the ring's stone eight cells further out): the earner stood down at R45
-    // with six cells and ten rounds left, the solo carrier laid one cell every
-    // other round as the build order walks the ring, and the ring closed at 65
-    // against a bound of 63 — the gate had sealed at 61, so the last two cells
-    // had to wait for the seal step. One carrier lays `ROUNDS_PER_RING_CELL`
-    // rounds a cell (a step to the site, then the placement), so the day can
-    // spare this role exactly when the gaps it would leave behind still fit.
-    let ring_fits_without_me = (wall_gaps.len() as i64) * ROUNDS_PER_RING_CELL
-        <= (economy::DUSK_ROUND - turn.in_day_round).max(0);
-    // The shift change in one predicate, asked in three places below (the wall
-    // step, the carried stone, the gold loop): the economy worker EARNS while
-    // the ring is on schedule, and is a carrier whenever it is not.
-    let economy_earns = Some(role.id) == economy_id
-        && (!shared_wall_duty || economy_share_laid)
-        && !ring_at_risk
-        && ring_fits_without_me;
-    let on_wall_duty = (Some(role.id) != economy_id || shared_wall_duty || ring_at_risk)
-        && (state.walled_cells_today.len() as i64) < wall_cap;
-    // Economy worker carrying stone when released from wall duty on Day 1:
-    // let it place the stone it's carrying before switching to mining. A
-    // worker with a pack full of stone can't mine ore, and standing idle
-    // with stone is the exact freeze issue #12 describes. Day 2+ the economy
-    // worker sells/ shops instead — wall repair is the first worker's job.
-    let economy_unload_stone = Some(role.id) == economy_id
-        && (!shared_wall_duty || economy_share_laid || ring_at_risk)
-        && turn.day == 1
-        && role.count_item(STONE) > 0
-        && !wall_gaps.is_empty();
-    // (shared_wall_duty is passed in from `plan`: day 1 keeps both workers on
-    // the ring until it closes — see the comment there.)
-    if role.count_item(STONE) > 0
-        && !wall_gaps.is_empty()
-        && (on_wall_duty || economy_unload_stone)
-        && roles_can_reach(turn, pairs)
-    {
-        let batch = stone_batch(turn, wall_gaps.len());
-        let carrying = role.count_item(STONE) as i64;
-        // One trip per batch. Dropping a wall every time we happen to walk past
-        // a gap with a single stone in hand is what turned the day into a
-        // mine↔ring shuttle: the build is only worth taking once the load is
-        // complete, there is no more stone left to fetch, or nightfall is close
-        // enough that another trip would not pay for itself.
-        //
-        // "Complete" is measured against the TEAM's stone, not this one pack:
-        // two workers splitting a 20-cell ring hold 10 each and neither pack
-        // ever reaches the batch, so a per-pack test waits for a load that no
-        // single worker is supposed to carry and the ring is never started.
-        // Once the team between them holds enough to fill every gap, the next
-        // mine trip only pushes the build past dusk.
-        //
-        // And the walk home has the last word: once dusk plus the seal grace
-        // is only a walk away, the load in hand is the load the ring gets.
-        // Issue #17's crew was still digging at the far vein when the day ran
-        // out — the stone arrived nowhere, and the ring kept zero walls.
-        let team_stone = economy::team_ores(turn, STONE);
-        let load_complete = carrying >= batch
-            || team_stone >= wall_gaps.len() as i64
-            || stone_demand <= 0
-            || turn.in_day_round >= economy::DUSK_ROUND - 12
-            || wall_trip_overdue(turn, role, wall_gaps);
-        // THE SEAL RESERVE IS A FLOOR ON THE SWEEP. `stone_demand` counts every
-        // cell the dusk still owes — the gaps, the doors the economy cut, and
-        // the gate itself — so a build may only spend stone while the team
-        // still covers all of it. Without the floor the last placement of the
-        // sweep zeroes the pool, and the gate — the one cell guaranteed to need
-        // a stone at dusk — finds every pack empty (issues #121-#125: the gate
-        // open for the whole dusk window in every match of the batch).
-        //
-        // It is a floor on the WAIT, not on the last stone in hand: a carrier
-        // with nowhere left to dig is not waiting for anything, and the
-        // disjunction below says so (see the `adjacent_site` guard).
-        let reserve_met = team_stone >= stone_demand;
-        // Build immediately when already standing next to a safe gap — but only
-        // once this trip's load is settled. The batch exists to avoid the
-        // mine↔ring commute, so it decides whether it is worth WALKING OUT to
-        // the wall line, never whether a stone already in hand gets used: when
-        // there is no more stone to fetch (batch complete, no reachable ore
-        // left, or dusk too close for another trip) waiting for a load means
-        // never placing the stone at all, and the role walks off to a tower
-        // with a full pack instead
-        // (tests/combat.rs::worker_builds_wall_before_weapon).
-        let more_stone_available =
-            economy::choose_mine(turn, state, role, stone_demand, &mut HashSet::new())
-                .is_some();
-        // A carrier with nowhere left to dig is not waiting for anything: the
-        // stone it holds is the only stone there is, and holding it back means
-        // never placing it at all (`combat.rs::worker_builds_wall_before_weapon`
-        // — one worker, six stone, no vein on the board). The reserve governs
-        // the WAIT for a batch, never the last stone in hand.
-        let adjacent_site = if !more_stone_available || (load_complete && reserve_met) {
-            wall_gaps
-                .iter()
-                .find(|site| {
-                    !claimed.contains(site)
-                        && chebyshev(role.pos, **site) == 1
-                        && !wall_would_trap(turn, pairs, state, **site, owned)
-                })
-                .copied()
-        } else {
-            None
-        };
-        if let Some(site) = adjacent_site {
-            claimed.insert(site);
-            state.walls_built_today = state.walls_built_today.saturating_add(1);
-            state.walled_cells_today.insert(site);
-            crate::log::event(
-                "wall_build",
-                serde_json::json!({
-                    "role": role.id,
-                    "target": site,
-                    "layer": wall_layer(turn, site),
-                    "stone": role.count_item(STONE),
-                }),
-            );
-            plan.push(role.id, RoleCommand::build(site, "wall"));
-            return;
-        }
-        // Otherwise commit to the wall line once we carry a batch of stone.
-        if load_complete && reserve_met {
-            for site in wall_gaps {
-                if claimed.contains(site) || wall_would_trap(turn, pairs, state, *site, owned) {
-                    continue;
-                }
-                if let Some(cmd) = build_or_walk(turn, role, *site, "wall", claimed) {
-                    claimed.insert(*site);
-                    if cmd.action == "build" {
-                        state.walls_built_today = state.walls_built_today.saturating_add(1);
-                        state.walled_cells_today.insert(*site);
-                        crate::log::event(
-                            "wall_build",
-                            serde_json::json!({
-                                "role": role.id,
-                                "target": *site,
-                                "layer": wall_layer(turn, *site),
-                                "stone": role.count_item(STONE),
-                            }),
-                        );
-                    }
-                    plan.push(role.id, cmd);
-                    return;
-                }
-            }
-        }
-    }
-    // 6b. Has this role's day outside the ring ended? (P1.) The steps above have
-    //     had their turn — a role carrying stone to a legal gap built it, and a
-    //     role that could pay for a gun built that — and everything from here
-    //     down is an errand OUTSIDE the ring: the shop trip, the vendor, the
-    //     mine. A role outside the ring at dusk is the hole the gate cannot
-    //     close; see `dusk_recall_round` for the measured shape (15/15 open
-    //     rounds in #111 day 1, #112 both days, #115 day 1).
-    //
-    //     Two steps are deliberately left above the lock-in, because each is
-    //     worth a round and each ends beside the base: the wall repair (step 8,
-    //     the ring is at the base) and the sale (step 9, the ore in the pack
-    //     becomes the gold the next day's towers are bought with). Only the
-    //     WALKS are cut — a carried Medicine is still drunk at step 1.
-    //
-    //     Gunners are excluded: step 4 (`preposition_round`) already locks them
-    //     and repeating it here would only shadow a deadline that works.
-    let committed = !pairs.iter().any(|(controller, _)| *controller == role.id)
-        && dusk_committed(state, turn, role, dusk_recall_round(turn, role));
-    // 6d. THE MERGED OUTING (issue #206 §2, 「一趟买齐」). One trip out of the
-    //     ring carries the whole errand list — the vein, the vendor, the shop —
-    //     because the pack is what makes it possible and the walk is what makes
-    //     it worth doing: a worker's pack is 100 slots and the pioneer's 40
-    //     (任务书 3.2, read off `backPackCapability`, never assumed here), and
-    //     every separate departure pays the walk again.
-    //
-    //     `economy::outing` lays the trip out and prices it in rounds against
-    //     the daylight left; what the day takes from it is its ORDER. When the
-    //     trip both sells and buys, the sale is walked first — step 7 outranks
-    //     step 9, so a buyer holding ore and a shopping list set off for the
-    //     shop with the load still in its pack, bought nothing (the counter is
-    //     paid in gold, not ore), and walked the pack back out to the mine.
-    //     That is the parking `buyer_must_preposition` was taught to avoid, one
-    //     level up: the goal is payable, so the earner goes — but it goes to the
-    //     VENDOR first and the shop is the next stop on the same trip.
-    //
-    //     When the day cannot fit the whole trip before the dusk recall, the
-    //     route gives up its last stop instead — the shopping — and this step
-    //     then routes nothing at all, leaving step 7 exactly as it was. A short
-    //     afternoon costs a voucher, never the sale.
-    //
-    //     Only the trip's FIRST claim is enforced here. The digging, the
-    //     counter and the shop are the day's own flows (7, 9, 10), each
-    //     re-picking its venue from where the role actually stands.
-    let mut sell_first = false;
-    if !committed
-        && !turn.vendors().is_empty()
-        && (buyer_id == Some(role.id) || economy_id == Some(role.id))
-    {
-        if let Some(outing) = economy::outing(turn, state, role, &budget.shopping, stone_demand) {
-            if outing.sells() && outing.buys() {
-                crate::log::event(
-                    "merged_outing",
-                    serde_json::json!({
-                        "round": turn.round_no,
-                        "role": role.id,
-                        "stops": outing.stops.len(),
-                        "rounds": outing.rounds,
-                        "daylight": outing.daylight,
-                    }),
-                );
-                sell_first = true;
-                if economy::vendor_travel(turn, role.pos) > 0 {
-                    match walk_to_vendor(turn, role, claimed) {
-                        Some(cmd) => {
-                            plan.push(role.id, cmd);
-                            return;
-                        }
-                        // No legal step toward the vendor after all — the route
-                        // gives way rather than parking the role on the spot.
-                        None => sell_first = false,
-                    }
-                }
-            }
-        }
-    }
-    // 7. Shopping (dedicated buyer) — upgrades come after survival. When
-    //    nothing is affordable YET the buyer still sets off once the ore in its
-    //    pack covers the price, so the purchase lands the round the sale does.
-    //
-    //    The sale comes first. This branch outranks step 9, so a buyer sent to
-    //    the shop with an unsold pack never got to sell it: the shop refused
-    //    the purchase (it is paid in gold, not ore), the pack rode back to the
-    //    mine, and the round trip was spent twice over. A role with something
-    //    to sell sells it and shops next round — the gold in hand is what
-    //    `budget.shopping` is computed from, so this is also the only order in
-    //    which the purchase can happen at all.
-    //
-    //    A role whose dusk commitment has fired does not shop. The shop is the
-    //    farthest errand on the board (its stands are the ones `buyerShopDist`
-    //    measures in the teens), and the round trip is what parked the loose
-    //    role outside the ring for the whole dusk window in the measurement
-    //    behind `dusk_recall_round`. It sells what it carries and goes in.
-    if committed {
-        // Dusk cash-out (issues #201-#205): the buyer gets one last weapon
-        // purchase through the dusk seal window. Gold left unspent at dusk is
-        // gold that buys nothing all night — the reserve is already 0, so any
-        // affordable weapon upgrade voucher in the shopping list is spent now
-        // rather than hoarded. The trip must still fit inside the seal grace
-        // (DUSK_ROUND + SEAL_GRACE) so the buyer is back before nightfall.
-        //
-        // Multi-worker dusk buy: during the cash-out window any worker — not
-        // just the dedicated buyer — that is already standing at a shop stand
-        // may purchase. The dedicated buyer still gets priority for the walk;
-        // this only fires for a worker that happens to be at the counter
-        // (e.g. the buyer itself returned, or another worker passed by).
-        // Gold sitting in the purse at nightfall is the failure mode this
-        // prevents.
-        let is_buyer = buyer_id == Some(role.id);
-        let at_shop = turn.weapon_shops().iter().any(|shop| {
-            chebyshev(role.pos, *shop) <= 1
-        });
-        if !sell_first && !budget.shopping.is_empty() && (is_buyer || at_shop) {
-            // The buyer may still walk to the shop; other workers only buy
-            // if already standing at the counter (no new walks for non-buyers
-            // — those workers need to get behind the ring for the seal).
-            let can_walk = is_buyer
-                && shop_round_trip(turn, role, pairs)
-                    .map(|trip| {
-                        turn.in_day_round + trip <= economy::DUSK_ROUND + SEAL_GRACE
-                    })
-                    .unwrap_or(false);
-            if can_walk || at_shop {
-                if let Some(cmd) = buyer_flow(turn, role, &budget.shopping, pairs, claimed) {
-                    plan.push(role.id, cmd);
-                    return;
-                }
-            }
-        }
-        // fall through: steps 8 and 9 still run, everything below them is
-        // replaced by the lock-in.
-    } else if !sell_first
-        && buyer_id == Some(role.id)
-        && (shop_trip_worth_taking(turn, role, pairs, &budget.shopping)
-            || !economy::should_sell(turn, state, role, stone_demand))
-    {
-        if !budget.shopping.is_empty() {
-            if let Some(cmd) = buyer_flow(turn, role, &budget.shopping, pairs, claimed) {
-                plan.push(role.id, cmd);
-                return;
-            }
-        } else if economy::buyer_must_preposition(turn, role, &budget.intent) {
-            if let Some(cmd) = walk_to_shop(turn, role, claimed) {
-                plan.push(role.id, cmd);
-                return;
-            }
-        }
-    }
-    // 7b. Personal Medicine: only its carrier can drink it, so this is a
-    //     per-role errand, after the team list has had its turn. For a
-    //     critically wounded role it is the recovery path, and the walk is
-    //     part of it. Same rule for the committed role: drinking a carried
-    //     Medicine needs no walk (step 1) and is untouched, buying one does.
-    if !committed {
-        if let Some(cmd) = self_provision(turn, role, claimed, true) {
-            plan.push(role.id, cmd);
-            return;
-        }
-    }
-    // Step 7c — cutting a door in our own wall line — is deleted (design D17):
-    // the permanent entrance (comment 1 §4) is never built, so a closed ring
-    // always has its four-cell way out and issue #14's frozen economy cannot
-    // arise structurally.
-    // 8. Patch the wall line. Before selling and before mining: a 10-gold kit
-    //    buys back 1000 HP of wall, and a wall left at 200 HP is the cell the
-    //    next wave comes through. Issue #16 lost the ring that way — D2 rebuilt
-    //    walls (16→19) but never restored one HP, the first night's damaged
-    //    cells were the ones that failed on the second, and the base finished
-    //    the match at 35 HP with two roles dead. The repair existed but only
-    //    fired for a role already standing beside a damaged wall, and the
-    //    mining step returns long before that: with stone still to dig, the
-    //    worker never walks to the wall it should be mending.
-    //
-    //    One role is excused: the dedicated economy worker with a load to sell.
-    //    It is the one keeping the collect→sell→buy loop running — the loop
-    //    that pays for these kits in the first place — and it is also the role
-    //    that walks to the shop and ends up holding them, so exempting it is
-    //    not an option. Instead the sale goes first and the repair happens a
-    //    round later, from the same errand: the wall is still mended today, and
-    //    no round of the loop is spent on it.
-    let repair_duty =
-        Some(role.id) != economy_id || !economy::should_sell(turn, state, role, stone_demand);
-    if repair_duty {
-        if let Some(cmd) = repair_flow(turn, state, role, wall_gaps, claimed) {
-            plan.push(role.id, cmd);
-            return;
-        }
-    }
-    // 9. Sell accumulated ore in one batch before collecting more. This keeps
-    //    the collect→sell→buy loop moving instead of filling a 100-slot pack
-    //    one item at a time while usable gold remains trapped in the backpack.
-    if economy::should_sell(turn, state, role, stone_demand) {
-        if let Some(cmd) = sell_flow(turn, state, role, stone_demand, claimed) {
-            plan.push(role.id, cmd);
-            return;
-        }
-    }
-    // 9b. The lock-in. Steps 8 and 9 have had their turn — a wall mended and a
-    //     pack sold are both worth a round and both end beside the base — and
-    //     everything from here down (the mine, the last-resort repair, the
-    //     summon order) is an errand that leaves the ring and holds the gate
-    //     open. See `dusk_recall_round` for what that costs.
-    if committed {
-        lock_in_for_dusk(turn, state, role, claimed, plan);
-        return;
-    }
-    // 10. Mine the nearest ore (stone first while walls are wanted). Mining
-    //    pauses during dusk so the ore we hold is converted to gold instead.
-    //
-    //    9c. Which is also why the pack-full branch is here and not beside the
-    //    sale: a full pack is a role that cannot dig, and step 9 has just
-    //    declined to sell it. `economy::discard_command` owns what may leave —
-    //    only the cheapest ore carried, only when a vein worth more is still
-    //    within reach of the afternoon, and never stone the ring is holding
-    //    back — and it runs inside the same dusk guard, because the cash-out
-    //    window converts ore to gold rather than throwing it away. With nothing
-    //    worth dropping it returns None and the role is exactly as it was.
-    if turn.in_day_round < economy::DUSK_ROUND {
-        // The dedicated economy worker keeps the collect→sell→buy loop funded
-        // once the ring's own build-out is over: outside day 1 it digs ore the
-        // vendor buys, never the stone the wall line is holding back. See
-        // `economy::choose_sellable_mine`.
-        //
-        // (`economy_earns` is the same predicate the wall step reads: the day-1
-        // shift change is one rule, asked in two places, and the stone-first
-        // bound lives inside it — see `plan`'s `ring_at_risk`.)
-        let keep_gold_loop = economy_earns;
-        if role.backpack_full() {
-            if let Some(cmd) = economy::discard_command(turn, state, role, stone_demand) {
-                plan.push(role.id, cmd);
-                return;
-            }
-        } else if let Some(cmd) = mine_flow(
-            turn,
-            state,
-            role,
-            stone_demand,
-            keep_gold_loop,
-            pairs,
-            wall_gaps,
-            claimed,
-        ) {
-            plan.push(role.id, cmd);
-            return;
-        }
-    }
-    // 11. Last-resort repair: the adjacency-only selector, reached only when
-    //    step 8 declined — no kit in the pack, or no legal cell to stand on
-    //    while walking to the wall it picked. Step 8 owns the repair policy
-    //    now; this stays as the cheap no-move fallback beside a wall.
-    if let Some(wall_pos) = crate::brain::combat::repair_target(turn, role, 0) {
-        plan.push(role.id, RoleCommand::use_item_at("WallFixer", wall_pos));
-        return;
-    }
-    // 12. Burn a carried robot-summon order only when everything else is done.
-    if let Some(cmd) = burn_summon_order(state, role) {
-        plan.push(role.id, cmd);
-    }
 }
 
 /// Merged prompt: when BOTH the news read and the treasure ask want the
@@ -1807,51 +1013,6 @@ pub(crate) fn walk_home(turn: &Turn, from: Pos) -> i64 {
         .unwrap_or(0) as i64
 }
 
-/// Day-round from which a role with NO gun to man must stop working outside the
-/// ring and be inside it.
-///
-/// `preposition_round` covers a controller that has a tower, and the pioneer has
-/// its own recall. A role with neither — the odd one out on a three-role board
-/// with two guns, which is what day 1 always is (see `ring_still_forming`) —
-/// had no deadline at all: `worker_day` falls straight through the pre-position
-/// step, and every step below it (walls, buyer, shop, vendor, mine) is an errand
-/// outside the ring.
-///
-/// Measured on a three-role board with one gun and the ring open: the role with
-/// no gun walked to the weapon shop and issued `buy Medicine` on every single
-/// round from r52 to r70 while `wall_gate_open` named it — the record that
-/// issues #111/#112/#115 carry for the whole dusk window (15/15 open rounds,
-/// base destroyed on night 2). The gate is the last ring cell and it does not
-/// close while any role is outside, so one role's shopping trip is the hole the
-/// night walks through.
-///
-/// The lead is FLAT, not measured from where the role currently is — the one
-/// place this differs from `pioneer_recall_round`. A walk-based deadline reads
-/// tighter but costs the whole afternoon: a worker eighteen cells out at the
-/// far vein is told to stop at in-day 34 and hold for twenty rounds, and the day
-/// then produces neither a coin nor a tower (measured on the
-/// `stone_out_of_reach` board: the purse never moved off its opening 75 and the
-/// gun count stayed at zero). `DUSK_RETREAT_LEAD` is one ordinary walk home plus
-/// slack; a role caught further out than that still arrives inside the dusk
-/// window (rounds 55-69), and arriving at 62 is the seal happening — which is
-/// the thing that was never happening at all.
-fn dusk_recall_round(turn: &Turn, role: &Unit) -> i64 {
-    let flat = economy::DUSK_ROUND - DUSK_RETREAT_LEAD;
-    // ...except that a FLAT lead is only ever right for a role that is one
-    // ordinary walk from home, and issues #121-#125 show the other case is the
-    // common one. In #122 and #124 a worker was still fourteen-plus cells out
-    // when the dusk window opened and walked one cell per round for the whole
-    // of it — `wall_gate_open` named it from day-round 56 to 70, the last day
-    // round, and the gate never sealed. The lead is still flat for everyone it
-    // fits; the floor below only moves the roles it demonstrably does not fit,
-    // and it moves them just far enough to arrive INSIDE the window rather than
-    // after it. Anchoring on `DUSK_ROUND + SEAL_GRACE` and not on `DUSK_ROUND`
-    // is what keeps the afternoon: an eighteen-cell role turns around at
-    // day-round 45, not at 34.
-    let walked = economy::DUSK_ROUND + SEAL_GRACE - walk_home(turn, role.pos);
-    flat.min(walked)
-}
-
 /// Has this role's dusk commitment fired? Latching is the whole point: the
 /// deadline above is measured from where the role IS, so re-testing it every
 /// round lets a role that has walked one cell closer fall back out of the
@@ -1867,28 +1028,6 @@ fn dusk_committed(state: &mut BotState, turn: &Turn, role: &Unit, deadline: i64)
     }
     state.dusk_home.insert(role.id);
     true
-}
-
-/// Walk `role` inside the ring and hold there — the role's post for the rest of
-/// the day. A no-command round inside is the intended answer, not idleness:
-/// standing on the band `update_wall_gate` measures "everyone is inside" against
-/// is exactly what lets the gate cell be built.
-///
-/// Once committed the role does not leave again. Falling through to the economy
-/// steps when it is already inside is the oscillation: the buyer walks to the
-/// shop, the next round it is outside past its deadline, it walks back in, and
-/// the gate opens and closes on alternate rounds (measured: `wall_gate_open`
-/// naming the same role on every odd round of the window).
-///
-/// The shelter walk keeps `walk_or_remove_wall`'s demolition escape hatch, so a
-/// role the crew walled out still gets in rather than pacing the outside.
-fn lock_in_for_dusk(turn: &Turn, state: &BotState, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) {
-    if let Some(cmd) = retreat_inside(turn, state, role, claimed) {
-        plan.push(role.id, cmd);
-    }
-    // Inside already, or nowhere walkable to walk: both mean "no more errands
-    // out there". `retreat_inside` has tried to cut a way through our own wall
-    // before giving up, and the night recall keeps the same hatch.
 }
 
 fn loiter_at_task_point(

@@ -19,8 +19,10 @@
 //!
 //! The legacy `should_sell` trigger pile (stone surplus ≥ 8, dusk deadline,
 //! sell_batch, price spike, force_sell ≥ 15 …) is deliberately NOT used here —
-//! comment 1 replaces it with the five triggers above, and the legacy set stays
-//! in `economy.rs` only for Worker A until phase 4.
+//! comment 1 replaces it with the five triggers above. Since phase 4b neither
+//! worker mainline calls it; the set survives in `economy.rs` only for the
+//! integration tests that still drive the legacy `day::plan`, until phase 5
+//! deletes it with them.
 
 use std::collections::HashSet;
 
@@ -57,8 +59,8 @@ pub(crate) const NEAR_VENDOR_ROUNDS: i64 = 3;
 pub(crate) const TREASURE_GOLD_FLOOR: i64 = 45;
 
 /// Rounds one carrier alone needs per ring wall (fetch + walk + lay), for the
-/// `ring_fits_without_me` release. The legacy pair-rate constant
-/// (`ROUNDS_PER_RING_CELL` = 2) assumed two carriers working the line.
+/// `ring_fits_without_me` release. The legacy pair-rate constant (= 2,
+/// deleted with `worker_day`) assumed two carriers working the line.
 pub(crate) const SOLO_RING_CELL_ROUNDS: i64 = 4;
 
 /// What one stone is worth to the ROI metric while the ring is still short:
@@ -207,7 +209,7 @@ fn mainline(
 
 /// Is the day-1 ring still B's problem? True while gaps remain and either the
 /// team pool is short of stone or Worker A cannot close the remaining gaps by
-/// dusk alone (`gaps × ROUNDS_PER_RING_CELL` against the rounds left).
+/// dusk alone (`gaps × SOLO_RING_CELL_ROUNDS` against the rounds left).
 fn day1_wall_hunger(turn: &Turn, state: &BotState, stone_demand: i64, role: &Unit) -> bool {
     if turn.day != 1 || !turn.is_day {
         return false;
@@ -482,8 +484,10 @@ fn choose_vein(
 /// One ROI pass over the board's veins. `stone_only` is the ring-first filter:
 /// ore is invisible to it. Total-order tie-break: ROI desc, trip asc, then
 /// coordinates — a consistent comparison is what keeps the pick independent
-/// of the zone HashMap's iteration order.
-fn pick_vein(
+/// of the zone HashMap's iteration order. Shared with Worker A's quota mine
+/// (phase 4b): A passes `stone_only = true` for the day's wall stone and
+/// `stone_short = false` for its surplus ore, with its own latch field.
+pub(crate) fn pick_vein(
     turn: &Turn,
     state: &BotState,
     role: &Unit,
