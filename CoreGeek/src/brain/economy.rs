@@ -1382,7 +1382,7 @@ pub fn sell_command(
 /// dedicated economy worker). The ring still gets its diggers: every other
 /// worker is on `choose_mine` and stone duty, and day 1 keeps the whole crew on
 /// the ring until it closes, because the ring is what makes the rest of the
-/// match affordable ([`crate::brain::day`]'s `shared_wall_duty`). Stone is the
+/// match affordable (the wall worker's quota step (`role::wall_worker`)). Stone is the
 /// fallback here: with no other vein left to dig, income is impossible anyway
 /// and idling is worse.
 pub fn choose_sellable_mine(

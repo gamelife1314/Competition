@@ -460,26 +460,17 @@ pub struct BotState {
     /// bombs/dizzy bought tracker can be derived from backpacks; kept simple
     pub harass_done_today: bool,
 
-    /// Stable controller↔tower pairings, computed once per night and reused
-    /// until a tower is built/destroyed or a new night starts. Without this,
-    /// greedy re-pairing every round causes controllers to oscillate and
-    /// weapons go unoperated.
-    pub night_pairs: Vec<(i64, i64)>,
-    pub night_pair_day: i64,
-    pub night_pair_tower_ids: Vec<i64>,
-    pub night_pair_controller_ids: Vec<i64>,
-    pub night_pair_task_busy: bool,
-    /// Controllers too wounded to hold a gun this round (see
-    /// `brain::night::withdrawing`). Sorted. The pairing prefers a fit
-    /// controller, so a change here invalidates it.
-    pub night_pair_withdrawing: Vec<i64>,
+    // The `night_pair*` block — the stable controller↔tower pairings and their
+    // invalidation memory — died with the pairing machinery in issue #221's
+    // phase 5c: the night is a SINGLE OPERATOR on the L's inner corner
+    // (design D14-D16), so there is no pairing left to stabilize.
 
     /// P1-4 withdrawal hysteresis (additive; owned by the night-side change).
     /// Controllers currently in a holdout: they have been withdrawn from their
-    /// gun for long enough that the pairing should stop handing it back to
+    /// gun for long enough that the night chain should stop handing it back to
     /// them until they actually recover. Membership is maintained by
-    /// `brain::night` once that change lands; an empty set reproduces the
-    /// pre-hysteresis behaviour exactly.
+    /// `brain::action::fight::update_withdraw_holdout`; an empty set reproduces
+    /// the pre-hysteresis behaviour exactly.
     pub withdraw_holdout: HashSet<i64>,
     /// Controller id -> last round a robot was seen inside its threat radius.
     /// The hysteresis uses this to tell "chronically threatened" (stay in

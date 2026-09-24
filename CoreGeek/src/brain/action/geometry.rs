@@ -15,7 +15,9 @@
 use std::collections::HashSet;
 
 use super::base_layout;
-use crate::model::{chebyshev, footprint_distance, station_footprint, Turn, WEAPON_BUILD_COST};
+use crate::model::{
+    chebyshev, footprint_distance, station_footprint, Turn, Unit, WEAPON_BUILD_COST,
+};
 use crate::protocol::Pos;
 use crate::state::BotState;
 
@@ -266,6 +268,234 @@ pub(crate) fn ring_cells(footprint: &[Pos], radius: i32) -> Vec<Pos> {
     cells
 }
 
+// ---------------------------------------------------------------------------
+// Wall safety: the quota batch, the seal deadlines and the trap veto. Moved
+// out of `day.rs` by issue #221 phase 5c — the wall line's geometry and the
+// checks that keep it from sealing the crew out live together now. The veto is
+// ROLE-based: A's night post is the operator cell of the fixed L (design
+// D14-D16) and everybody else's home is the inside of the ring. The legacy
+// controller↔tower pairing it used to be measured against is deleted.
+// ---------------------------------------------------------------------------
+
+/// Stones to carry before walking out to the wall line on a maintenance day.
+const STONE_BATCH: i64 = 6;
+/// Day 1's wall line is one complete ring, and the mine↔ring commute costs more
+/// rounds than the mining does. Carrying the whole remaining demand in a single
+/// trip is what closes the ring before the dusk lock-in; the one-stone dribble
+/// (mine one, walk back, build one) is how the base ended up with two towers, no
+/// wall and a frozen purse in issues #12/#13/#14.
+const RING_BATCH: i64 = 20;
+
+/// Rounds kept in hand on top of the walk home before a stone carrier gives up
+/// on the vein — a blocked cell, a detour, a claim.
+const WALL_TRIP_SLACK: i64 = 3;
+
+/// Has the vein stopped paying for the walk home? The load already in hand is
+/// what the ring gets; a carrier that keeps digging is a carrier the night
+/// finds outside the wall. Measured against the wall window (dusk plus the
+/// seal grace), not the gun deadline: the seal is allowed to spend the last
+/// rounds of the day on the ring, and a trip that is still placing walls then
+/// is a trip that worked. Read by the wall worker's batch release (phase 4b).
+pub(crate) fn wall_trip_overdue(turn: &Turn, role: &Unit, gaps: &[Pos]) -> bool {
+    let home = gaps
+        .iter()
+        .map(|gap| chebyshev(role.pos, *gap) as i64)
+        .min()
+        .unwrap_or(0);
+    turn.in_day_round + home + 1 + WALL_TRIP_SLACK >= crate::brain::economy::DUSK_ROUND + SEAL_GRACE
+}
+
+/// Stones this role should carry before it walks out to the wall line. Read
+/// by the wall worker's batch release (phase 4b).
+pub(crate) fn stone_batch(turn: &Turn, gaps: usize) -> i64 {
+    let want = if turn.day == 1 {
+        RING_BATCH
+    } else {
+        STONE_BATCH
+    };
+    want.min(gaps as i64).max(1)
+}
+
+/// Day-rounds after dusk during which a stone carrier may still walk out to
+/// close the last hole in the ring. Long enough for a round trip from any
+/// tower post, short enough that the gun is manned again well before night.
+pub(crate) const SEAL_GRACE: i64 = 8;
+/// The day-round past which the ring is sealed whether or not the crew is home.
+///
+/// `SEAL_GRACE` is the window the seal is *allowed* to spend; this is the point
+/// at which it stops being allowed to spend more. Across issues #121-#125 the
+/// gate never sealed on any day after the first in ANY of the five matches —
+/// `wall_gate_open` for 5, 7, 10, 11 and 15 of the fifteen dusk rounds, the
+/// last of those being the whole window, i.e. the ring kept a robot-sized hole
+/// every night of the match. The cause is that the seal waits for every role,
+/// and a role fourteen to twenty cells out at dusk cannot arrive in time; the
+/// wait then outlives the day, and the night planner never revisits the flag,
+/// so the hole is permanent.
+///
+/// A straggler left outside is recoverable — the night recall's
+/// `walk_or_remove_wall` hatch cuts back through our own ring — while an open
+/// ring is not: the wall is the only thing between the waves and the station,
+/// and `score_3` is 10×day for every day the station stands (550 over ten).
+/// Sealing with three day-rounds to spare is also what leaves the stone carrier
+/// time to actually place the gate cell.
+pub(crate) const HARD_SEAL_ROUND: i64 = crate::brain::economy::DUSK_ROUND + 11;
+
+/// Is there a walkable route from `start` to any of `stands`? A role already
+/// standing on a stand cell counts as reachable (no move needed).
+pub(crate) fn can_reach(turn: &Turn, start: Pos, stands: &[Pos]) -> bool {
+    if stands.iter().any(|stand| *stand == start) {
+        return true;
+    }
+    let blocked = turn.blocked_for(-1);
+    crate::path::step_toward_stands(turn, start, stands, &blocked).is_some()
+}
+
+/// Where a role has to be able to get before the ring closes around it: the
+/// OPERATOR CELL for the wall worker — the one post of the single-operator
+/// night (design D14-D16), adjacent by construction to all three weapon sites
+/// — and the inside of the ring for everybody else.
+///
+/// The second case is the whole of issue #15's "idle role walled out". With
+/// guns and roles no longer paired, "no gun to man" is simply "no post": both
+/// safety checks measure every role that has one against it, so a role mining
+/// outside can never be sealed away from its own base by the crew closing the
+/// last ring cell behind it (the gate that used to wait on "everyone inside"
+/// died with design D17, but the veto that keeps everyone ABLE to get inside
+/// is the same load-bearing check).
+fn night_home(turn: &Turn, roles: &crate::brain::role::Roles, role_id: i64) -> Vec<Pos> {
+    if roles.wall_worker == Some(role_id) {
+        base_layout::operator_cell(turn).into_iter().collect()
+    } else {
+        crate::brain::interior_cells(turn)
+    }
+}
+
+/// Every controllable role must still be able to reach its night post — the
+/// operator cell for A, the inside of the ring for everybody else. If any
+/// can't, wall building must stop: we never seal a role outside the ring.
+pub(crate) fn roles_can_reach(turn: &Turn) -> bool {
+    let roles = crate::brain::role::Roles::of(turn);
+    for role in turn.controllable() {
+        let home = night_home(turn, &roles, role.id);
+        if home.is_empty() {
+            continue; // nowhere to be: not a verdict this check can make
+        }
+        if !can_reach(turn, role.pos, &home) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Would placing a wall at `site` cut any role off from its post, or seal a
+/// gap the ring still has to fill away from the workers who can fill it?
+/// Simulate the wall and re-run both reachability checks. Together with the
+/// far-side-first build order, this guarantees the ring is only ever closed
+/// after everyone can still get in — and that the last stone can still reach
+/// the last gap.
+pub(crate) fn wall_would_trap(turn: &Turn, state: &BotState, site: Pos, owned: &[i64]) -> bool {
+    let roles = crate::brain::role::Roles::of(turn);
+    let mut blocked = turn.blocked_for(-1);
+    blocked.insert(site);
+    for role in turn.controllable() {
+        // A unit dispatched by its own mainline is OUTSIDE ON PURPOSE (comment
+        // 1 §6: the economy worker does not come home at dusk). Standing beyond
+        // this wall is that unit's plan, not an accident the wall caused, so
+        // it never gets a veto — otherwise the ring's last cell waits forever
+        // for a worker who is never coming back (the seal board finished at
+        // 19/20 with the door open and the worker's own stones two maps away).
+        if owned.contains(&role.id) {
+            continue;
+        }
+        // A role with no gun to man is measured against the inside of the ring
+        // (see `night_home`): "no tower" is not "no home", and the hole this
+        // wall would cut is in ITS way home, not only in a controller's.
+        let home = night_home(turn, &roles, role.id);
+        if home.is_empty() {
+            continue;
+        }
+        if home.iter().any(|stand| *stand == role.pos) {
+            continue; // already at the post / already home: nothing to trap
+        }
+        // A role that cannot reach its post even WITHOUT this wall is not
+        // what the wall would trap. Counting it anyway vetoes every remaining
+        // ring cell at once — which is how day 1 ended at 19/20 with the last
+        // stone sitting in a backpack (issues #12/#13/#14).
+        if !crate::brain::can_reach_any(turn, role, &home) {
+            continue;
+        }
+        if crate::path::step_toward_stands(turn, role.pos, &home, &blocked).is_none() {
+            return true;
+        }
+    }
+    // The same question for the wall line itself. A ring cell is only
+    // buildable from a cell next to it, and a cell a teammate was standing on
+    // when the sweep went past is exactly the one that stays open. Closing the
+    // ring over the top of it leaves that hole reachable from the outside
+    // only, with the stone on the wrong side of the wall — day 1 finished
+    // 19/20 with two stones stuck in a backpack exactly that way.
+    let can_build = |role: &Unit, gap: Pos, blocked: &HashSet<Pos>| -> bool {
+        if chebyshev(role.pos, gap) == 1 {
+            return true;
+        }
+        let stands = crate::brain::stand_cells(turn, gap);
+        crate::path::step_toward_stands(turn, role.pos, &stands, blocked).is_some()
+    };
+    let before = turn.blocked_for(-1);
+    for gap in pending_ring(turn, state, site) {
+        let reachable = |blocked: &HashSet<Pos>| {
+            turn.controllable()
+                .iter()
+                .filter(|role| !owned.contains(&role.id))
+                .any(|role| can_build(role, gap, blocked))
+        };
+        // A gap nobody could reach even before this wall is not the wall's
+        // doing, and vetoing on its account would leave the ring open forever.
+        if reachable(&before) && !reachable(&blocked) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Ring cells that are still to be filled, IGNORING whether a teammate happens
+/// to be standing on one. `wall_gaps` drops an occupied cell so we never build
+/// under a unit, but that same filter hides the cell from the build-order
+/// safety check — and a ring cell a role was standing on when the sweep went
+/// past is precisely the one that ends up walled off from the inside, with the
+/// stone on the wrong side. Day 1 finished 19/20 exactly that way.
+///
+/// The list is the fixed build order (comment 1 §4), so the four permanent
+/// entrance cells are not in it and never were "pending": the gate clause this
+/// function used to carry died with the gate (design D17).
+pub(crate) fn pending_ring(turn: &Turn, state: &BotState, ignore: Pos) -> Vec<Pos> {
+    let walls: HashSet<Pos> = turn.walls().iter().map(|wall| wall.pos).collect();
+    base_layout::wall_build_order(turn)
+        .into_iter()
+        .filter(|pos| {
+            *pos != ignore
+                && turn.is_land(*pos)
+                && !walls.contains(pos)
+                && !state
+                    .blacklisted_builds
+                    .contains(&(*pos, "wall".to_string()))
+        })
+        .collect()
+}
+
+/// The stone the day still owes: wall gaps inside today's budget, and nothing
+/// else — the door and gate terms died with the gate (design D17), and the
+/// permanent entrance is never walled. Recomputed from pure queries so a role
+/// mainline (issue #221) can ask it without threading the round context's
+/// locals. Reads the STORED `ring_ever_complete`, which the context may set a
+/// round later — a one-round lag on the cap latch, never on the gap count.
+pub(crate) fn stone_demand_of(turn: &Turn, state: &BotState) -> i64 {
+    let gaps = wall_gaps(turn, state);
+    let primary_open = ring_open_cells(turn, state);
+    let cap = wall_daily_cap(turn.day, state.ring_ever_complete, primary_open);
+    (gaps.len() as i64).min(cap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +583,119 @@ mod tests {
             10,
             "the debt still counts the occupied cell: the night finds it open"
         );
+    }
+
+    // -- the trap veto (moved out of `day.rs`, phase 5c) --------------------
+
+    /// One role in a pocket of our own walls whose only opening is `(21,20)`.
+    /// A pioneer, so the roster gives it no post: this is the "idle role" of
+    /// P0-3, measured against the inside of the ring. `seal` closes the
+    /// opening.
+    fn pocketed_idle_role(seal: bool) -> Turn {
+        let mut cells = vec![
+            pos(19, 19),
+            pos(19, 20),
+            pos(19, 21),
+            pos(20, 19),
+            pos(20, 21),
+            pos(21, 19),
+            pos(21, 21),
+        ];
+        if seal {
+            cells.push(pos(21, 20));
+        }
+        let mut roles: Vec<serde_json::Value> = cells
+            .iter()
+            .enumerate()
+            .map(|(index, at)| unit(20000 + index as i64, "wall", *at))
+            .collect();
+        roles.push(unit(10002, "pioneer", pos(20, 20)));
+        board(roles)
+    }
+
+    /// P0-3: a role with no post still has a home — the inside of the ring —
+    /// and a wall that would cut it off from that home is a wall the crew may
+    /// not build. Both safety checks used to `continue` past such a role,
+    /// which is how an idle worker ended a day sealed outside the ring with
+    /// the gate open behind it (docs/FAILURE-ANALYSIS-2026-09-14.md §3.3).
+    #[test]
+    fn a_wall_that_seals_an_idle_role_out_is_refused() {
+        let turn = pocketed_idle_role(false);
+        let state = BotState::default();
+        let idle = turn.role_by_id(10002).expect("the idle role exists");
+        let roles = crate::brain::role::Roles::of(&turn);
+        assert_eq!(
+            night_home(&turn, &roles, idle.id),
+            crate::brain::interior_cells(&turn),
+            "test setup: this role mans no gun — its home is the ring's inside"
+        );
+        // The pocket has exactly one opening and the role is not standing on
+        // its home band, so today it can still get home — which is what makes
+        // the wall on that opening the crew's doing and not the role's problem.
+        assert!(
+            crate::brain::can_reach_any(&turn, idle, &crate::brain::interior_cells(&turn)),
+            "test setup: the role must be able to reach home BEFORE the wall"
+        );
+        assert!(
+            roles_can_reach(&turn),
+            "test setup: nobody is cut off yet, so the wall step is running"
+        );
+        assert!(
+            wall_would_trap(&turn, &state, pos(21, 20), &[]),
+            "the one cell that lets the idle role home was about to be walled over"
+        );
+    }
+
+    /// …and once that cell IS wall — by the crew, by a robot, or by the crew's
+    /// own earlier mistake — the whole wall step stands down instead of
+    /// building somewhere else with a role sealed out of its own base.
+    #[test]
+    fn an_idle_role_already_sealed_out_stops_the_wall_line() {
+        let sealed = pocketed_idle_role(true);
+        assert!(
+            !roles_can_reach(&sealed),
+            "wall building went ahead with a role sealed out of its own base"
+        );
+    }
+
+    /// The same predicate on a board where nobody is cut off: a role standing
+    /// inside is not a veto, and neither is a wall far from it.
+    #[test]
+    fn a_wall_nobody_is_cut_off_by_is_allowed() {
+        let turn = board(vec![unit(10002, "worker", pos(12, 24))]);
+        let state = BotState::default();
+        assert!(
+            roles_can_reach(&turn),
+            "a role standing inside the base is not a veto"
+        );
+        assert!(
+            !wall_would_trap(&turn, &state, pos(20, 20), &[]),
+            "a wall in the open, far from every role's way home, traps nobody"
+        );
+    }
+
+    // -- ring geometry (moved out of `day.rs`, phase 5c) ---------------------
+
+    #[test]
+    fn ring_distance_one_of_footprint() {
+        let footprint = station_footprint(pos(10, 24));
+        let ring = ring_cells(&footprint, 1);
+        assert_eq!(ring.len(), 12); // 4x4 outer minus 2x2 footprint
+        assert!(ring
+            .iter()
+            .all(|cell| footprint_distance(*cell, &footprint) == 1));
+    }
+
+    #[test]
+    fn radius_two_ring_is_one_complete_layer() {
+        let footprint = station_footprint(pos(10, 24));
+        let ring = ring_cells(&footprint, 2);
+        assert_eq!(ring.len(), 20);
+        assert!(ring
+            .iter()
+            .all(|cell| footprint_distance(*cell, &footprint) == 2));
+        assert!(ring
+            .iter()
+            .all(|cell| footprint_distance(*cell, &footprint) != 3));
     }
 }

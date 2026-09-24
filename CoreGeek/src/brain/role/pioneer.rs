@@ -54,8 +54,8 @@ const PIONEER_RETREAT_SLACK: i64 = 2;
 /// retreated through).
 const MAX_STERILE_ROUNDS: i64 = 15;
 
-/// Plan the pioneer (or, at night, any controllable the roster does not name —
-/// the repair chain is role-generic) for this round.
+/// Plan the pioneer for this round: the day chain or the night chain, picked
+/// inside — the scheduler never forks on the clock (issue #221 phase 5c).
 pub(crate) fn plan(
     turn: &Turn,
     state: &mut BotState,
@@ -71,6 +71,27 @@ pub(crate) fn plan(
     } else {
         plan_night(turn, state, role, claimed, plan);
     }
+}
+
+/// Plan a SPARE controller — any controllable the roster does not name (issue
+/// #221 phase 5c). Night-only by construction: after dark the repair chain is
+/// role-generic and every spare runs it (the legacy `spare_night`), while the
+/// legacy DAY planners gave spares nothing but the scheduler's closing
+/// backstop — so this declines immediately by day and the backstop below it in
+/// [`crate::brain::orchestrate`] owns the round, exactly as before. One
+/// statement list in the scheduler, the day/night split kept where the legacy
+/// behavior had it.
+pub(crate) fn plan_spare(
+    turn: &Turn,
+    state: &mut BotState,
+    role: &Unit,
+    claimed: &mut HashSet<Pos>,
+    plan: &mut Plan,
+) {
+    if turn.is_day {
+        return;
+    }
+    self::plan(turn, state, role, claimed, plan);
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +368,7 @@ fn retreat_inside(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>) -> Optio
     if stands.is_empty() {
         return None;
     }
-    crate::brain::day::walk_home_or_reroute(turn, role, &stands, claimed)
+    crate::brain::walk_home_or_reroute(turn, role, &stands, claimed)
 }
 
 // ---------------------------------------------------------------------------
@@ -495,7 +516,14 @@ fn plan_night(
 /// The day's news/treasure prompt slot. A team-level channel, not a role
 /// command — it costs the pioneer no movement, and it runs even when the
 /// pioneer is dead (issue #218: the ask is a property of the ROUND).
+///
+/// DAY-only, and the guard lives here rather than in the scheduler (phase 5c:
+/// the dispatch is one statement list around the clock): every legacy planner
+/// asked only by day, and the night spends its LLM budget on nothing.
 pub(crate) fn plan_prompts(turn: &Turn, state: &mut BotState, plan: &mut Plan) {
+    if !turn.is_day {
+        return;
+    }
     // Merged prompt: when both news and treasure need asking, send one prompt
     // with both questions (issue #207 §3: 「用一个 prompt 向大模型发起两个
     // 提问」). Falls back to individual prompts when only one consumer needs

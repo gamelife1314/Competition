@@ -60,18 +60,18 @@ use super::super::action::build::{build_or_walk, repair_flow};
 use super::super::action::fight::{
     cooldown_repair, hostile_wave, night_medicine, update_withdraw_holdout, withdrawing,
 };
-use super::super::action::geometry::wall_layer;
+use super::super::action::geometry::{
+    ring_open_cells, roles_can_reach, stone_batch, stone_demand_of, wall_daily_cap, wall_gaps,
+    wall_layer, wall_trip_overdue, wall_would_trap, HARD_SEAL_ROUND,
+};
 use super::super::action::mine::stone_covered;
 use super::super::action::sell::sell_flow;
 use super::super::action::shop::{burn_summon_order, self_provision, use_medicine, voucher_flow};
-use super::super::day::{
-    self, roles_can_reach, stone_batch, wall_trip_overdue, wall_would_trap, RoundCtx,
-    HARD_SEAL_ROUND,
-};
+use super::super::action::tower_site::tower_gaps;
 use super::super::route::trip_rounds;
 use super::super::{
-    break_out, combat, economy, interior_cells, shelter, stand_cells, walk_or_remove_wall,
-    walk_toward, Plan,
+    break_out, combat, economy, fallback_toward_station, interior_cells, shelter, stand_cells,
+    treasure, walk_or_remove_wall, walk_toward, Plan,
 };
 use crate::model::{chebyshev, Turn, Unit, STONE};
 use crate::protocol::{Pos, RoleCommand};
@@ -88,22 +88,138 @@ pub(crate) const POST_MARGIN: i64 = 3;
 /// would ride into the night unsold.
 const CASHOUT_LEAD: i64 = 3;
 
-/// Plan Worker A's day round.
-///
-/// `ctx_owned` is the context roster [`day::round_context`] was computed
-/// with — the pairing and the trap vetoes all read the same list, and in
-/// this phase it is still `[B]` alone.
-pub(crate) fn plan_day(
+/// The round's shared reads for the day mainline (issue #221 phase 4a, moved
+/// out of the deleted `day.rs` by phase 5c): every number the wall and tower
+/// work needs before it dispatches. Only this mainline consumes it, so it
+/// lives — and is computed — inside the mainline's own module.
+pub(crate) struct RoundCtx {
+    pub(crate) tower_gaps: Vec<(Pos, String)>,
+    pub(crate) wall_gaps: Vec<Pos>,
+    pub(crate) stone_demand: i64,
+    pub(crate) wall_cap: i64,
+}
+
+/// Compute the [`RoundCtx`]. Split out of `plan_owned` (issue #221 phase 4a):
+/// the side effects — the ring-completion memory and the per-round telemetry —
+/// run here exactly once per DAY round, in the order they always ran. (Phase
+/// 5c note: with the context inside the wall worker's day branch, the latch and
+/// the `tower_plan` event now skip when A is dead — a base with no wall worker
+/// has no wall plan to explain, and the night side never read either.)
+pub(crate) fn round_context(turn: &Turn, state: &mut BotState) -> RoundCtx {
+    let tower_gaps = tower_gaps(turn, state);
+    let wall_gaps = wall_gaps(turn, state);
+    // Ring integrity, remembered across days. An EMPTY gap list with walls
+    // standing means the shell is closed — the permanent entrance is not part
+    // of the count (comment 1 §4: the back four cells are open by design), so
+    // this never reads the entrance as a hole. From then on `wall_daily_cap`
+    // treats holes as breach repair (see `BotState::ring_ever_complete`).
+    //
+    // Measured on the PRIMARY ring alone. The second layer (P2-1) is a later,
+    // partial addition which sits in `wall_gaps` too; letting it answer this
+    // question would mean the ring's own breach-repair budget never latched,
+    // and a ring the night tore open would be repaired on the six-cell
+    // maintenance budget that cannot re-close it (issue #21).
+    let primary_open = ring_open_cells(turn, state);
+    if primary_open == 0 && !turn.walls().is_empty() {
+        state.ring_ever_complete = true;
+    }
+    let wall_cap = wall_daily_cap(turn.day, state.ring_ever_complete, primary_open);
+    // On D1 carry enough stone to finish the complete radius-2 shell. Later
+    // days use a bounded maintenance budget. `stone_demand` counts the GAPS
+    // still open, not the shortfall against what is already carried: stone in a
+    // backpack is committed to those gaps, and treating it as "demand already
+    // met" made the carrier sell the ring's own stone out from under itself.
+    // There is no gate term and no door term any more (design D17): the
+    // permanent entrance is never built, so every cell of `wall_gaps` is a cell
+    // the day intends to wall, and the demand is exactly that list, capped.
+    let wall_demand = (wall_gaps.len() as i64).min(wall_cap);
+    let stone_demand = wall_demand;
+    // Gold reserved for finishing the tower build-out is untouchable by the
+    // shop whitelist — defenses come before consumables, but only for the 1-2
+    // towers we actually build (never all three slots at once). Phase 5b moved
+    // the whole computation — the P0-4 第三塔资金守护, the dusk cash-out and the
+    // P2-2 宝藏线的献祭金 — into `economy::spendable_reserve`, the one number the
+    // pioneer's counter check spends against. `guard` and `treasure_reserve`
+    // survive as locals purely for the telemetry fields below.
+    let build_reserve = economy::spendable_reserve(turn, state);
+    let guard = !tower_gaps.is_empty() && economy::third_tower_guard(turn, state);
+    let treasure_reserve = treasure::gold_reserve(turn, state);
+    // Tower plan telemetry: whether a third weapon is being held back for the
+    // 100-gold upgrade, and whether that upgrade is still reachable, is the
+    // decision the deadline budgeter exists to make explainable.
+    crate::log::event(
+        // Written every day round, deliberately: this is the evidence for
+        // WORKFLOW_REQUEST §7.1's first question — whether `mayBuild` was ever
+        // true while `towers < 3` — and that question is a *ratio* over rounds,
+        // which a record emitted only on change could not answer. What it no
+        // longer carries is `dayRound` (derivable from `round`) and
+        // `fallbackRound` (`DUSK_ROUND - FALLBACK_LEAD`, the same constant on
+        // all 1400 of them).
+        "tower_plan",
+        serde_json::json!({
+            "round": turn.round_no,
+            "towers": turn.towers().len(),
+            "gaps": tower_gaps.len(),
+            "reserve": build_reserve,
+            "guard": guard,
+            // P2-1: how many of `wallGaps` are the second layer. Without the
+            // split, a day that spends its wall budget on ring 3 reads exactly
+            // like a day that failed to close ring 2.
+            "secondLayer": wall_gaps
+                .iter()
+                .filter(|site| wall_layer(turn, **site) == 3)
+                .count(),
+            "treasureReserve": treasure_reserve,
+            "wallGaps": wall_gaps.len(),
+            "stoneDemand": stone_demand,
+            "teamStone": economy::team_ores(turn, STONE),
+            "mayBuild": economy::may_build_weapon(turn, state),
+            "upgradeReachable": economy::upgrade_reachable(turn, state),
+        }),
+    );
+    RoundCtx {
+        tower_gaps,
+        wall_gaps,
+        stone_demand,
+        wall_cap,
+    }
+}
+
+/// Plan Worker A's round, day or night (issue #221 phase 5c): the scheduler
+/// hands the PERSON over and the mainline owns the rest — the day branch
+/// computes its own [`RoundCtx`] and walks the priority chain, the night
+/// branch is the single-operator L-shape. The is_day dispatch lives here, in
+/// the role's own file, so [`super::super::orchestrate`] never forks on it.
+pub(crate) fn plan(
     turn: &Turn,
     state: &mut BotState,
     role: &Unit,
-    ctx: &RoundCtx,
+    owned: &[i64],
+    claimed: &mut HashSet<Pos>,
+    plan: &mut Plan,
+) {
+    if turn.is_day {
+        plan_day(turn, state, role, owned, claimed, plan);
+    } else {
+        plan_night(turn, state, role, claimed, plan);
+    }
+}
+
+/// Plan Worker A's day round.
+///
+/// `owned` is the context roster the trap vetoes read — the units whose
+/// dispatch this mainline must not fight over.
+fn plan_day(
+    turn: &Turn,
+    state: &mut BotState,
+    role: &Unit,
     ctx_owned: &[i64],
     claimed: &mut HashSet<Pos>,
     plan: &mut Plan,
 ) {
     if role.alive() {
-        if let Some(cmd) = mainline(turn, state, role, ctx, ctx_owned, claimed) {
+        let ctx = round_context(turn, state);
+        if let Some(cmd) = mainline(turn, state, role, &ctx, ctx_owned, claimed) {
             plan.push(role.id, cmd);
         }
     }
@@ -114,7 +230,7 @@ pub(crate) fn plan_day(
     // fallback ignores `claimed` by design, and it declines inside the ring,
     // so holding at the operator cell stays a hold.
     if !plan.commands.contains_key(&role.id) {
-        if let Some(cmd) = day::fallback_toward_station(turn, role) {
+        if let Some(cmd) = fallback_toward_station(turn, role) {
             plan.push(role.id, cmd);
         }
     }
@@ -268,15 +384,10 @@ fn build_tower(
 /// May this gap be closed right now? The trap veto holds until
 /// `HARD_SEAL_ROUND`; past it the night outranks a straggler's way home —
 /// the same override the legacy dusk seal and B's stone delivery run.
-fn safe_gap(
-    turn: &Turn,
-    ctx: &RoundCtx,
-    state: &BotState,
-    ctx_owned: &[i64],
-    site: Pos,
-) -> bool {
-    !wall_would_trap(turn, &ctx.pairs, state, site, ctx_owned)
-        || turn.in_day_round >= HARD_SEAL_ROUND
+/// Role-based since phase 5c: the veto itself computes the roster
+/// ([`wall_would_trap`]), so the context's pairs list is gone.
+fn safe_gap(turn: &Turn, state: &BotState, ctx_owned: &[i64], site: Pos) -> bool {
+    !wall_would_trap(turn, state, site, ctx_owned) || turn.in_day_round >= HARD_SEAL_ROUND
 }
 
 /// The placement itself, with the day's tally and the log line the wall
@@ -324,7 +435,7 @@ fn place_adjacent_wall(
         .find(|site| {
             !claimed.contains(site)
                 && chebyshev(role.pos, *site) == 1
-                && safe_gap(turn, ctx, state, ctx_owned, *site)
+                && safe_gap(turn, state, ctx_owned, *site)
         })
         .map(|site| place_wall(turn, state, role, site, claimed))
 }
@@ -350,7 +461,7 @@ fn build_wall_step(
     }
     // Nobody may be sealed out of their own base by the line going up
     // (P0-3); the hard-seal override lives in `safe_gap`, per cell.
-    if !roles_can_reach(turn, &ctx.pairs) {
+    if !roles_can_reach(turn) {
         return None;
     }
     let gaps = ctx.wall_gaps.len() as i64;
@@ -381,7 +492,7 @@ fn build_wall_step(
     // failed walk would hide the gap from every later step this round).
     if load_complete && reserve_met {
         for site in &ctx.wall_gaps {
-            if claimed.contains(site) || !safe_gap(turn, ctx, state, ctx_owned, *site) {
+            if claimed.contains(site) || !safe_gap(turn, state, ctx_owned, *site) {
                 continue;
             }
             if let Some(cmd) = build_or_walk(turn, role, *site, "wall", claimed) {
@@ -842,7 +953,7 @@ fn night_mine_step(
     role: &Unit,
     claimed: &mut HashSet<Pos>,
 ) -> Option<RoleCommand> {
-    let demand = day::stone_demand_of(turn, state);
+    let demand = stone_demand_of(turn, state);
     if role.backpack_full() {
         return economy::discard_command(turn, state, role, demand);
     }
@@ -978,14 +1089,14 @@ mod tests {
         Turn::from_request(req)
     }
 
-    /// Drive A (10002) through the real scheduler seam: context first, then
-    /// the mainline, then read back the one command the plan holds for A.
+    /// Drive A (10002) through the real scheduler seam: the day branch
+    /// computes its own context, then the mainline, then read back the one
+    /// command the plan holds for A.
     fn plan_for(turn: &Turn, state: &mut BotState, owned: &[i64]) -> Option<RoleCommand> {
-        let ctx = day::round_context(turn, state, owned);
         let mut claimed = HashSet::new();
         let mut plan = Plan::default();
         let role = turn.role_by_id(10002).expect("worker A exists");
-        plan_day(turn, state, role, &ctx, owned, &mut claimed, &mut plan);
+        plan_day(turn, state, role, owned, &mut claimed, &mut plan);
         plan.commands.get(&10002).cloned()
     }
 
@@ -1111,17 +1222,15 @@ mod tests {
             board(round_no, roles, vec![], 0)
         };
         let before = pocket(61); // in_day 60 < HARD_SEAL_ROUND
-        let mut state = BotState::default();
-        let ctx = day::round_context(&before, &mut state, &[]);
+        let state = BotState::default();
         assert!(
-            !safe_gap(&before, &ctx, &state, &[], pos(21, 20)),
+            !safe_gap(&before, &state, &[], pos(21, 20)),
             "the one cell that lets the idle role home is refused before the hard seal"
         );
         let after = pocket(67); // in_day 66 >= HARD_SEAL_ROUND
-        let mut state = BotState::default();
-        let ctx = day::round_context(&after, &mut state, &[]);
+        let state = BotState::default();
         assert!(
-            safe_gap(&after, &ctx, &state, &[], pos(21, 20)),
+            safe_gap(&after, &state, &[], pos(21, 20)),
             "past the hard seal the ring closes anyway"
         );
     }
@@ -1195,13 +1304,13 @@ mod tests {
         };
         let mut state = BotState::default();
         let early = make(21); // in_day 20, rounds_left 35
-        let ctx = day::round_context(&early, &mut state, &[]);
+        let ctx = round_context(&early, &mut state);
         let role = early.role_by_id(10002).expect("A exists");
         assert_eq!(sell_trigger(&early, &state, role, &ctx), None);
 
         let mut state = BotState::default();
         let band = make(44); // in_day 43, rounds_left 12 == via + margin
-        let ctx = day::round_context(&band, &mut state, &[]);
+        let ctx = round_context(&band, &mut state);
         let role = band.role_by_id(10002).expect("A exists");
         assert_eq!(
             sell_trigger(&band, &state, role, &ctx),
@@ -1210,7 +1319,7 @@ mod tests {
 
         let mut state = BotState::default();
         let late = make(51); // in_day 50, rounds_left 5 < via + margin
-        let ctx = day::round_context(&late, &mut state, &[]);
+        let ctx = round_context(&late, &mut state);
         let role = late.role_by_id(10002).expect("A exists");
         assert_eq!(sell_trigger(&late, &state, role, &ctx), None);
     }

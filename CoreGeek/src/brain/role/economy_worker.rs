@@ -21,19 +21,19 @@
 //! sell_batch, price spike, force_sell ≥ 15 …) is deliberately NOT used here —
 //! comment 1 replaces it with the five triggers above. Since phase 4b neither
 //! worker mainline calls it; the set survives in `economy.rs` only for the
-//! integration tests that still drive the legacy `day::plan`, until phase 5
-//! deletes it with them.
+//! legacy integration tests, which phase 5c leaves as accepted drift — the
+//! scheduler's acceptance is `cargo test --lib`.
 
 use std::collections::HashSet;
 
 use super::super::action::build::build_or_walk;
-use super::super::action::geometry::wall_gaps;
+use super::super::action::geometry::{
+    stone_demand_of, wall_gaps, wall_would_trap, HARD_SEAL_ROUND, SEAL_GRACE,
+};
 use super::super::action::mine::stone_covered;
 use super::super::action::sell::sell_flow;
 use super::super::action::shop::{max_hp, self_provision, use_medicine};
 use super::super::action::tower_site::tower_gaps;
-use super::super::day::{stone_demand_of, wall_would_trap, HARD_SEAL_ROUND, SEAL_GRACE};
-use super::super::action::fight::stable_pairs_owned;
 use super::super::route::trip_rounds;
 use super::super::{economy, stand_cells, treasure, walk_toward, Plan};
 use crate::model::{chebyshev, Turn, Unit, STONE};
@@ -618,10 +618,9 @@ fn deliver_stone(
     role: &Unit,
     claimed: &mut HashSet<Pos>,
 ) -> Option<RoleCommand> {
-    // B's own id is excluded from the pairs: B sleeps outside the ring by
+    // B's own id is the veto's `owned` skip list: B sleeps outside the ring by
     // design (comment 1 §6), so B standing beyond a gap must not veto B's own
     // seal — the ring closing outranks a worker who is outside on purpose.
-    let pairs = stable_pairs_owned(turn, state, &[role.id]);
     let mut gaps: Vec<Pos> = wall_gaps(turn, state)
         .into_iter()
         .filter(|gap| !claimed.contains(gap))
@@ -631,9 +630,7 @@ fn deliver_stone(
         // Past `HARD_SEAL_ROUND` the night outranks the trap check (the same
         // override the legacy dusk seal runs): a straggler's way home is worth
         // less than a ring the robots walk into.
-        if wall_would_trap(turn, &pairs, state, gap, &[role.id])
-            && turn.in_day_round < HARD_SEAL_ROUND
-        {
+        if wall_would_trap(turn, state, gap, &[role.id]) && turn.in_day_round < HARD_SEAL_ROUND {
             continue;
         }
         // Claim only what the walk actually committed to (the legacy pattern

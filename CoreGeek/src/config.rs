@@ -16,7 +16,7 @@
 /// three-entry line builds all three entries in order as the three slots fill.
 ///
 /// A line shorter than the empty-slot count simply builds fewer towers — that is
-/// intended, not an error. See `brain::day::tower_gaps` for the site selection
+/// intended, not an error. See `brain::action::tower_site::tower_gaps` for the site selection
 /// that consumes this.
 ///
 /// Battle analysis (pk616181/pk616182, 2026-09-17): opponents that build 0

@@ -130,7 +130,6 @@ pub struct LogSigs {
     pub enemy_towers: Option<String>,
     pub towers: Option<String>,
     pub roles: Option<String>,
-    pub pairs: Option<String>,
     pub task: Option<String>,
     pub treasure: Option<String>,
 }

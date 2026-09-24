@@ -4,13 +4,30 @@
 //! While a task is active the pioneer MUST stay within 1 cell of the task
 //! point, so this module never emits movement.
 
-use crate::brain::Plan;
-use crate::model::{Turn, Unit};
-use crate::protocol::RoleCommand;
-use crate::state::{BotState, PromptPurpose, TaskStage};
+use std::collections::HashSet;
+
+use crate::brain::{stand_cells, walk_toward, Plan};
+use crate::model::{chebyshev, Turn, Unit};
+use crate::protocol::{Pos, RoleCommand};
+use crate::state::{BotState, PromptPurpose, TaskSession, TaskStage};
 
 /// Consecutive "`executeCmd` is not available" verdicts that end a session.
 const MAX_WINDOW_ERRORS: i32 = 2;
+
+/// Day-rounds that must still be available before a task point is worth
+/// accepting.
+///
+/// 任务书 5.3: "在任务执行结束后，再次接取任务需等待 30 个回合刷新时间" — and the
+/// dusk recall ends every session the pioneer is still holding when it fires.
+/// So a session accepted with fewer rounds left than a session needs is not a
+/// cheap attempt, it is that task point sold for 30 rounds: the recall walks
+/// the pioneer off the point, the judger ends the task, and the point is gone
+/// through the whole of the next morning. A working session costs four to six
+/// rounds (prompt → `llmResp` → the held-back command → verdict → submit), so
+/// twelve leaves room for one failed cycle and a second try.
+///
+/// Moved out of `day.rs` with its consumer by issue #221 phase 5c.
+const TASK_MIN_ATTEMPT_ROUNDS: i64 = 12;
 
 /// Which of the task book's three lanes a session belongs to.
 ///
@@ -1080,4 +1097,100 @@ pub fn answer_wire_payload(payload: &str) -> String {
     }
     serde_json::to_string(&serde_json::Value::String(payload.trim().to_string()))
         .unwrap_or_else(|_| payload.to_string())
+}
+
+/// Accept or walk toward the first valid task point.
+///
+/// Moved out of `day.rs` by issue #221 phase 5c: the whole task lane already
+/// lives here — the session, the lanes, the prompt loop, the refusals — and
+/// the accept decision is the lane's front door, not the scheduler's.
+impl BotState {
+    pub fn next_task_point(
+        &mut self,
+        turn: &Turn,
+        pioneer: &Unit,
+        claimed: &mut HashSet<Pos>,
+    ) -> Option<RoleCommand> {
+        let candidate = turn
+            .player_tasks
+            .iter()
+            .filter(|task| task.is_valid && task.cooldown_rounds == 0)
+            // A point whose execution window the judger already shut stays
+            // shut for this pioneer: re-accepting it only re-enters the same
+            // refusal. See `BotState::task_refusals`.
+            .filter(|task| {
+                !self
+                    .task_refusals
+                    .get(&task.pos)
+                    .map_or(false, |until| turn.round_no <= *until)
+            })
+            // P1-4: the kind outranks the distance. 推理 + 传闻 first, 自进化
+            // next, everything else last; distance only decides inside a lane.
+            // Until this existed the pioneer took whatever point was nearest,
+            // which on a board carrying two kinds is a coin toss between the
+            // day's reasoning and its sandbox. The kind is also stamped on the
+            // session, so the log says which lane the rounds went to.
+            .min_by_key(|task| {
+                (
+                    classify(&task.task_type).rank(),
+                    chebyshev(pioneer.pos, task.pos),
+                    task.pos.x,
+                    task.pos.y,
+                )
+            })?;
+        if chebyshev(pioneer.pos, candidate.pos) <= 1 {
+            // The clock gates the ACCEPT, never the approach: a point accepted
+            // with fewer rounds left than a session needs is a point sold for
+            // its 30-round cooldown (see `TASK_MIN_ATTEMPT_ROUNDS`), but
+            // walking toward a point is free and the morning is the only time
+            // the pioneer has. Measured from where the pioneer IS, so standing
+            // out at the point already costs the walk home — which is the same
+            // deadline the recall will enforce.
+            let recall = crate::brain::role::pioneer::recall_round(turn, pioneer);
+            if turn.in_day_round + TASK_MIN_ATTEMPT_ROUNDS > recall {
+                crate::log::event(
+                    "task_accept_deferred",
+                    serde_json::json!({
+                        "round": turn.round_no,
+                        "dayRound": turn.in_day_round,
+                        "point": candidate.pos,
+                        "recall": recall,
+                    }),
+                );
+                return None;
+            }
+            let timeout = if candidate.timeout_rounds > 0 {
+                candidate.timeout_rounds
+            } else {
+                250
+            };
+            self.task_session_seq = self.task_session_seq.saturating_add(1);
+            let session_id = self.task_session_seq;
+            let kind = classify(&candidate.task_type);
+            crate::log::event(
+                "task_accept",
+                serde_json::json!({
+                    "round": turn.round_no,
+                    "session": session_id,
+                    "point": candidate.pos,
+                    "taskType": candidate.task_type,
+                    "task_kind": kind.as_str(),
+                    "kindRank": kind.rank(),
+                }),
+            );
+            self.task = TaskSession {
+                active: true,
+                session_id,
+                accepted_round: turn.round_no,
+                timeout_round: turn.round_no + timeout,
+                point: Some(candidate.pos),
+                task_type: candidate.task_type.clone(),
+                kind,
+                ..Default::default()
+            };
+            return Some(RoleCommand::accept_task());
+        }
+        let stands = stand_cells(turn, candidate.pos);
+        walk_toward(turn, pioneer, &stands, claimed)
+    }
 }

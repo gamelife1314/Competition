@@ -3,7 +3,6 @@
 pub mod action;
 pub mod coach;
 pub mod combat;
-pub mod day;
 pub mod economy;
 pub mod news;
 pub mod orchestrate;
@@ -319,11 +318,6 @@ fn log_round(
     }
     let survival_score = survival_score(turn.day, state.station_fell_day);
     let residual = turn.total_score - state.cum_kill_score - survival_score;
-    let pairs: serde_json::Value = state
-        .night_pairs
-        .iter()
-        .map(|(controller, tower)| json!({"controller": controller, "tower": tower}))
-        .collect();
     // `policy` and `scoreAttr` are written every round on purpose: the first is
     // the documented way to tell which coach stance was in force at a given
     // moment (WORKFLOW_REQUEST §5), the second is how `abreport` splits the
@@ -418,7 +412,7 @@ fn log_round(
         "ms": started.elapsed().as_micros() as f64 / 1000.0,
     });
     // Blocks that move a handful of times a match: the base and wall lines,
-    // the tower roster, the controller roster, the night pairing, the task
+    // the tower roster, the controller roster, the task
     // session and the treasure plan. Writing them every round cost ~500 of the
     // record's ~1400 bytes and answered nothing — the question a reader has is
     // always "when did this change", and a change is exactly what gets written.
@@ -428,7 +422,7 @@ fn log_round(
     let object = data.as_object_mut().expect("round data is an object");
     let base = json!([station_hp, station_lvl]);
     let enemy_base = json!([enemy_station_hp, enemy_station_lvl]);
-    let gated: [(&str, &serde_json::Value, &mut Option<String>); 10] = [
+    let gated: [(&str, &serde_json::Value, &mut Option<String>); 9] = [
         ("base", &base, &mut state.log_sigs.station),
         ("enemyBase", &enemy_base, &mut state.log_sigs.enemy_station),
         ("wall", &wall, &mut state.log_sigs.wall),
@@ -436,7 +430,6 @@ fn log_round(
         ("enemyTowers", &enemy_towers, &mut state.log_sigs.enemy_towers),
         ("towers", &towers, &mut state.log_sigs.towers),
         ("roles", &roles, &mut state.log_sigs.roles),
-        ("pairs", &pairs, &mut state.log_sigs.pairs),
         ("task", &task, &mut state.log_sigs.task),
         ("treasure", &treasure, &mut state.log_sigs.treasure),
     ];
@@ -800,7 +793,7 @@ pub fn walk_or_remove_wall(
 /// round). Uses only the cells at footprint distance <= 1 — hugging the
 /// station — so the role never stops on the wall line or out near the mines.
 ///
-/// The same set the day planner retreats to (`day::retreat_inside`) and the
+/// The same set the day planner retreats to (`role::pioneer::retreat_inside`) and the
 /// night repair duty shelters to; sharing it keeps the walks in step.
 pub(crate) fn shelter(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan: &mut Plan) -> bool {
     let mut stands: Vec<Pos> = interior_cells(turn);
@@ -842,4 +835,94 @@ pub(crate) fn shelter(turn: &Turn, role: &Unit, claimed: &mut HashSet<Pos>, plan
         return true;
     }
     false
+}
+
+/// Walk a role home under a deadline: the second rung of the recall's ladder,
+/// which the day side used to lack (issues #176-#185). Moved out of `day.rs`
+/// by issue #221 phase 5c — the pioneers' retreat, the wall worker's fallback
+/// and the scheduler's backstop all climb the same ladder.
+///
+/// [`walk_or_remove_wall`] has a deliberate HOLD branch: when `walk_toward`
+/// finds nothing but a route exists once this round's claims are ignored, it
+/// issues NO command, on the reasoning that a claim is an intent and the
+/// claimer moves on. That reasoning holds mid-day and fails at a deadline,
+/// because at a deadline the claimer does not move on — it is walking home too
+/// and stops on the cell it claimed. Two roles whose only route crosses each
+/// other's claimed cell then freeze each other, and neither issues a command
+/// again.
+///
+/// The measurement is exactly that, and the log says so in its own column. A
+/// role frozen on one cell for eleven or twelve straight dusk rounds is listed
+/// by `wall_gate_open` with an EMPTY `stuck` list, and `stuck` is populated by
+/// `can_reach_any` — which is `step_toward_stands` over `blocked_for(-1)`, the
+/// pathfinder with every claim dropped. An empty `stuck` therefore *is* the
+/// hold branch's guard: the route home exists, the role is not walled off, it
+/// simply never takes a step. In 179 the dusk window names 20012 on (28,10)
+/// for eleven rounds; 178 does it twice over, 20011 on (24,16) for twelve and
+/// 20012 for eleven, and `wall_gate_forced` then seals the ring with BOTH of
+/// them outside. 176 and 182 are the same shape, and eight of the ten reports
+/// leave the gate open for 5-12 of the fifteen dusk rounds.
+///
+/// So under a deadline the hold is not a trade, it is the loss: survival is
+/// `10xday` for every day the station stands (任务书 ch.6, 550 over ten) and the
+/// ring is what the station stands behind.
+///
+/// `break_out` is deliberately NOT part of this: its other half cuts a
+/// wall, and by day a wall is the asset being defended rather than the
+/// obstacle — a role that is genuinely walled off keeps
+/// `walk_or_remove_wall`'s demolition hatch, which only ever cuts a cell whose
+/// removal reopens the route.
+///
+/// `claimed` is filled on the first rung and left alone afterwards, so a role
+/// that takes the ignoring-claims rung does not reserve the cell against a
+/// teammate's legal move.
+pub fn walk_home_or_reroute(
+    turn: &Turn,
+    role: &Unit,
+    stands: &[Pos],
+    claimed: &mut HashSet<Pos>,
+) -> Option<RoleCommand> {
+    if let Some(cmd) = walk_or_remove_wall(turn, role, stands, claimed) {
+        return Some(cmd);
+    }
+    // The round's reservations dropped. With no claims in the set, `walk_toward`
+    // and the claim-free pathfinder agree, so a role the hold branch would have
+    // parked instead takes the step it can already legally take.
+    let mut ignored = HashSet::new();
+    walk_or_remove_wall(turn, role, stands, &mut ignored)
+}
+
+/// Last resort for a role that produced no command: close on the station.
+/// Returns `None` when holding position is the right answer (already at a gun
+/// or already inside), so the deliberate dusk lock-in is never overridden.
+/// Moved out of `day.rs` by issue #221 phase 5c: the scheduler's backstop and
+/// the wall worker's per-person fallback share it.
+pub(crate) fn fallback_toward_station(turn: &Turn, role: &Unit) -> Option<RoleCommand> {
+    let station = turn.station()?;
+    let footprint = station.footprint();
+    if footprint_distance(role.pos, &footprint) <= 1 {
+        return None; // already home: standing still here is the plan
+    }
+    if turn
+        .towers()
+        .iter()
+        .any(|tower| chebyshev(role.pos, tower.pos) <= 1)
+    {
+        return None; // on post: holding the gun outranks everything
+    }
+    let stands = interior_cells(turn);
+    if stands.is_empty() {
+        return None;
+    }
+    // Demolish our own wall if that is the only way home — the same escape
+    // hatch the night recall keeps (P0-3). A role sealed out holds still
+    // forever otherwise: `walk_toward` finds no route, this returns nothing,
+    // and since it is `away` from home the dusk seal never fires either, so
+    // the ring stays open all night with the role on the wrong side of it.
+    //
+    // The ladder rather than `walk_or_remove_wall` alone, because a role the
+    // backstop reaches has already been declined by every step above it, and
+    // the demolition hatch still refuses when no SINGLE cut reopens the route
+    // (issues #176-#185: 20011 on (24,16) for twelve straight dusk rounds).
+    walk_home_or_reroute(turn, role, &stands, &mut HashSet::new())
 }
