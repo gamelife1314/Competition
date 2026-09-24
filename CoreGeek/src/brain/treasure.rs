@@ -150,6 +150,39 @@ pub fn holds_altar(turn: &Turn, state: &BotState, pioneer: &Unit) -> bool {
     }
 }
 
+/// The answer to a 传闻类 task, when the treasure hunt has the evidence for it.
+///
+/// Issue #221 comment 2 splits the task lanes: a Rumor task is the folk
+/// legends' own question — where the altar is, what it consumes, when it
+/// opens — and the treasure line answers it by DOING the hunt, not by asking
+/// the sandbox LLM (the sandbox has never seen the legends; this module has).
+/// `brain::task::plan_pioneer` calls this on every Planning round of a Rumor
+/// session and skips the LLM prompt loop entirely while it returns `None`.
+///
+/// `None` until the summon has actually gone out: an un-summoned plan is a
+/// hypothesis the LLM inferred from the legends, and submitting it early
+/// would bank a guess that the summon verdict might still falsify (code 3 =
+/// wrong items → the plan is re-derived, `time_feedback` = wrong day). Once
+/// the phase is `Summoned` or `Done` with a plan in hand, the altar position,
+/// the sacrifice list and the opening day are facts this session paid gold
+/// for, and they are the answer. The judger's rejection feedback remains the
+/// loop's correction path if the schema it wants is shaped differently.
+pub fn rumor_task_answer(state: &BotState) -> Option<String> {
+    let plan = state.treasure.plan.as_ref()?;
+    if !matches!(
+        state.treasure.phase,
+        TreasurePhase::Summoned { .. } | TreasurePhase::Done
+    ) {
+        return None;
+    }
+    serde_json::to_string(&serde_json::json!({
+        "altar": { "x": plan.pos.x, "y": plan.pos.y },
+        "items": plan.items,
+        "open_day": plan.open_day,
+    }))
+    .ok()
+}
+
 // ---------------------------------------------------------------------------
 // The window: 「宝藏只能召唤一次要抢」
 // ---------------------------------------------------------------------------
@@ -554,5 +587,39 @@ pub fn plan_pioneer(
             }
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn altar_plan() -> TreasurePlan {
+        TreasurePlan {
+            pos: Pos { x: 3, y: 4 },
+            items: vec!["Medicine".to_string(), "Bomb".to_string()],
+            open_day: 2,
+        }
+    }
+
+    #[test]
+    fn rumor_answer_waits_for_the_summon() {
+        let mut state = BotState::default();
+        assert_eq!(rumor_task_answer(&state), None, "no plan, no answer");
+        state.treasure.plan = Some(altar_plan());
+        assert_eq!(
+            rumor_task_answer(&state),
+            None,
+            "an un-summoned plan is a hypothesis the verdict can still falsify"
+        );
+        state.treasure.phase = TreasurePhase::HavePlan;
+        assert_eq!(rumor_task_answer(&state), None);
+        state.treasure.phase = TreasurePhase::Summoned { round: 5 };
+        let answer = rumor_task_answer(&state).expect("summoned: the plan is fact");
+        assert!(answer.contains("\"x\":3") && answer.contains("\"y\":4"), "{answer}");
+        assert!(answer.contains("Medicine") && answer.contains("Bomb"), "{answer}");
+        assert!(answer.contains("\"open_day\":2"), "{answer}");
+        state.treasure.phase = TreasurePhase::Done;
+        assert!(rumor_task_answer(&state).is_some(), "Done keeps answering");
     }
 }

@@ -125,12 +125,6 @@ pub struct TaskSession {
     /// into it and burned both timeouts to zero points — so two in a row end
     /// the session locally instead of re-planning into the same closed door.
     pub judger_window_errors: i32,
-    /// Round in which a fresh `llmResp` was consumed. `executeCmd` sent in
-    /// that same round comes back
-    /// `[JUDGER_ERROR] executeCmd 仅在自进化任务执行期间可用` — see
-    /// `brain::task::plan_pioneer` for the evidence — so the command is held
-    /// back until the round after it.
-    pub llm_resp_round: Option<i64>,
     /// The command whose sandbox run produced an answer. That is the only
     /// script worth caching for the next task of the same kind: it demonstrably
     /// reached the sandbox and ran to completion, whereas an unrun command (a
@@ -143,8 +137,26 @@ pub struct TaskSession {
     /// A cached script from a previous successful task of the same kind, shown
     /// to the LLM as reference so it can adapt the script to this task instead
     /// of re-reading the task file and re-exploring from scratch. Set once at
-    /// session open by `find_sop`; cleared when the session ends.
+    /// session open by `find_sop_with_skill`; cleared when the session ends.
     pub sop_reuse_script: Option<String>,
+    /// The cached SKILL of that same entry (issue #221 comment 2, Q3): the
+    /// successful commands plus the per-field explanation of the answer, sent
+    /// alongside the reference script so the model adapts both instead of
+    /// re-exploring from scratch.
+    pub sop_reuse_skill: Option<String>,
+    /// The full command sequence of the session that produced the cached
+    /// entry, shown as "Full Command Sequence" steps beside the template so
+    /// the model can see every stage that led to the answer — not just the
+    /// winning last command.
+    pub sop_reuse_history: Vec<String>,
+    /// The `<<<SKILL>>>` block the model emitted next to its `<<<ANSWER>>>`
+    /// (issue #221 comment 2; Q3: 产生答案的必须总结SKILL). Held on the session
+    /// and written into the SOP entry when the session ends on a SCORED
+    /// answer — Q3's 提交正确才缓存 — so a rejected answer's skill never
+    /// poisons the cache. Cleared on every judger rejection: the approach it
+    /// summarised just failed, and persisting it would hand the next session
+    /// a skill that does not work.
+    pub sop_skill: Option<String>,
     /// Consecutive sandbox runs that returned without an `ANSWER:` line.
     ///
     /// The population issues #113-#115 are made of: sessions that spent their
@@ -188,6 +200,18 @@ pub struct SopEntry {
     /// every strike, eviction and `last_rejected` comparison is made against
     /// this string.
     pub template: String,
+    /// The model's own `<<<SKILL>>>` summary from the session that scored this
+    /// entry (comment 2 note 5): the commands that worked plus a detailed
+    /// explanation of every field of the answer, which is what lets the NEXT
+    /// similar task judge its own output instead of re-deriving the schema.
+    /// Empty for entries cached before the tag protocol.
+    pub skill: String,
+    /// The full `cmd_history` of the session that scored this entry. The
+    /// template alone is the winning LAST command; the history shows every
+    /// step that led to it (file discovery, exploratory queries, the final
+    /// aggregation), which is what "Full Command Sequence" in the prompt
+    /// replays. Empty for entries cached before the tag protocol.
+    pub history: Vec<String>,
     /// Consecutive rejections charged against answers this template produced.
     /// One strike keeps the entry — reuse with feedback, because a single
     /// rejection can be the task's input differing, not the script's logic;
@@ -936,10 +960,10 @@ impl BotState {
                 && cmd_key != self.task.cmd_consumed_request_round;
             if llm_new {
                 self.task.llm_consumed_request_round = llm_key;
-                // The round the ANSWER arrives in is the one round the judger
-                // will not run a command for (see `task::plan_pioneer`), so it
-                // has to be remembered: a round number is all the planner gets.
-                self.task.llm_resp_round = Some(turn.round_no);
+                // The same-round `executeCmd` hold this consumption used to
+                // record (`llm_resp_round`) was removed by issue #221 comment
+                // 2: the judger accepts `executeCmd` in the same round as the
+                // `llmResp`, and saving one round per iteration matters.
                 crate::log::event(
                     "llm_resp",
                     serde_json::json!({"session": self.task.session_id, "requestRound": llm_key, "chars": turn.llm_resp.len()}),
@@ -952,10 +976,13 @@ impl BotState {
                 // this record exists for. Issues #111-#115 each carry 11-17
                 // `cmd_result` lines that say a script returned 2.4k-5.5k
                 // characters and not one of them says WHAT it returned, so
-                // "the model never printed an `ANSWER:` line" — the mechanism
+                // "the script never printed a `TOKEN:` line" — the mechanism
                 // behind 13 `task_cmd_failed` in #115 and every session in the
                 // batch ending at zero submissions — was invisible. `answer`
-                // is the verdict and `head` is the evidence for it.
+                // is the verdict and `head` is the evidence for it. Under the
+                // tag protocol (issue #221 comment 2) the LLM reads this output
+                // and returns `<<<ANSWER>>>` itself; the `TOKEN:` fast path is
+                // what this boolean now tracks.
                 let output = crate::brain::task::strip_status_line(&turn.last_cmd_result);
                 crate::log::event(
                     "cmd_result",
@@ -1004,6 +1031,11 @@ impl BotState {
                 self.task.submitted_round = None;
                 self.task.phase_missing_rounds = 0;
                 self.task.point_closed_round = None;
+                // The SKILL summarised the approach that just scored a
+                // rejection. Dropping it means a wrong approach is never
+                // persisted as a "skill" even if a later answer in this same
+                // session scores (issue #221 comment 2, on_llm_resp).
+                self.task.sop_skill = None;
                 self.charge_sop_rejection();
                 // Fast abandon, unchanged in kind. The opponent's edge in issue
                 // #15 was that it dropped a failing task immediately and
@@ -1397,6 +1429,8 @@ impl BotState {
             keywords,
             description: self.task.description.clone(),
             template: script,
+            skill: self.task.sop_skill.clone().unwrap_or_default(),
+            history: self.task.cmd_history.clone(),
             ..Default::default()
         })
     }
@@ -1423,9 +1457,11 @@ impl BotState {
         }
     }
 
-    /// A cached script template for a similar task, to be passed to the LLM as
-    /// reference. The LLM adapts it to the new task description instead of
-    /// re-reading the task file and re-exploring from scratch.
+    /// A cached script template AND SKILL summary for a similar task, to be
+    /// passed to the LLM as reference (comment 2 note 4: 处理过相似的问题时，
+    /// 直接将上次总结的SKILL一并提交给大模型). The LLM adapts them to the new
+    /// task description instead of re-reading the task file and re-exploring
+    /// from scratch.
     ///
     /// Matching is two-dimensional:
     /// 1. **Text similarity** — Jaro-Winkler between the cached entry's
@@ -1439,7 +1475,15 @@ impl BotState {
     /// Both must pass. The entry with the highest text similarity wins.
     const SOP_SIMILARITY_THRESHOLD: f64 = 0.7;
 
-    pub fn find_sop(&self, task_type: &str, description: &str) -> Option<String> {
+    /// Returns `(template, skill, history)` — the winning script, the SKILL
+    /// summary cached beside it (`None` for entries cached before the tag
+    /// protocol, so the prompt's Skill Summary section simply does not
+    /// appear), and the full command sequence of the session that produced it.
+    pub fn find_sop_with_skill(
+        &self,
+        task_type: &str,
+        description: &str,
+    ) -> Option<(String, Option<String>, Vec<String>)> {
         let keywords = keywords_of(description);
         if keywords.is_empty() {
             return None;
@@ -1496,9 +1540,15 @@ impl BotState {
                         "similarity": similarity,
                         "overlap": overlap,
                         "bound": true,
+                        "hasSkill": !entry.skill.is_empty(),
+                        "historySteps": entry.history.len(),
                     }),
                 );
-                Some(entry.template.clone())
+                Some((
+                    entry.template.clone(),
+                    (!entry.skill.is_empty()).then(|| entry.skill.clone()),
+                    entry.history.clone(),
+                ))
             })
     }
 
@@ -1812,4 +1862,93 @@ pub fn keywords_of(text: &str) -> Vec<String> {
         out.truncate(40);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A finished-session-shaped task: one that ran commands, got an answer
+    /// and carries the model's own `<<<SKILL>>>` summary.
+    fn scored_session() -> BotState {
+        let mut state = BotState::default();
+        state.task.active = true;
+        state.task.session_id = 3;
+        state.task.task_type = "自进化类1".to_string();
+        state.task.description = "查询北京的文化遗产数量 task_1_alpha.md".to_string();
+        state.task.cmd_history = vec!["find /tmp".to_string(), "curl api".to_string()];
+        state.task.sop_cmd = Some("curl api".to_string());
+        state.task.sop_skill = Some("COMMAND: curl api\nGOTCHA: location= not city=".to_string());
+        state.task.best_answer = "{\"count\": 8}".to_string();
+        state
+    }
+
+    #[test]
+    fn sop_cache_roundtrip_carries_skill_and_history() {
+        let mut state = scored_session();
+        state.finish_task(true, "confirmed_success");
+        assert_eq!(state.sop_cache.len(), 1);
+        let entry = &state.sop_cache[0];
+        assert_eq!(entry.template, "curl api");
+        assert!(entry.skill.contains("GOTCHA"), "{}", entry.skill);
+        assert_eq!(
+            entry.history,
+            vec!["find /tmp".to_string(), "curl api".to_string()]
+        );
+        // The reuse lookup hands all three to the next session's prompt.
+        let (template, skill, history) = state
+            .find_sop_with_skill("自进化类1", "查询北京的文化遗产数量 task_1_alpha.md")
+            .expect("identical description matches");
+        assert_eq!(template, "curl api");
+        assert!(skill.expect("skill rides along").contains("GOTCHA"));
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn skill_less_entry_reuses_with_no_skill_summary() {
+        // Entries cached before the tag protocol have an empty skill: the
+        // triple must carry None so the prompt's Skill Summary section is
+        // skipped rather than rendered empty.
+        let mut state = scored_session();
+        state.task.sop_skill = None;
+        state.finish_task(true, "confirmed_success");
+        let (_, skill, _) = state
+            .find_sop_with_skill("自进化类1", "查询北京的文化遗产数量 task_1_alpha.md")
+            .expect("match");
+        assert!(skill.is_none());
+    }
+
+    #[test]
+    fn failed_session_caches_nothing() {
+        // Q3: 提交正确才缓存 — a script that produced a REJECTED answer is not
+        // reusable, and neither is the skill that summarised it.
+        let mut state = scored_session();
+        state.finish_task(false, "timeout");
+        assert!(state.sop_cache.is_empty());
+    }
+
+    #[test]
+    fn rejection_clears_the_pending_skill() {
+        // The skill summarised the approach that just scored a rejection; it
+        // must not survive into a later success of the same session.
+        let mut state = scored_session();
+        state.task.timeout_round = 100; // still open at round 10
+        state.task.stage = TaskStage::WaitingSubmit { attempts: 0 };
+        state.task.submitted_round = Some(9);
+        let req: crate::protocol::Request = serde_json::from_value(serde_json::json!({
+            "roundNo": 10,
+            "errors": [{"errorCode": 2, "description": "字段缺失: total_count"}],
+        }))
+        .expect("payload parses");
+        let turn = Turn::from_request(req);
+        state.observe(&turn);
+        assert!(
+            state.task.sop_skill.is_none(),
+            "rejected approach cleared, got {:?}",
+            state.task.sop_skill
+        );
+        assert!(matches!(state.task.stage, TaskStage::Planning));
+        assert_eq!(state.task.rejection_feedback.len(), 1);
+        assert!(state.sop_cache.is_empty(), "nothing cached on rejection");
+    }
 }
