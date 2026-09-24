@@ -27,7 +27,7 @@
 /// range band (3 cells) robots occupy when they reach our wall ring. The rocket
 /// stays first for long-range early picks; the railgun stays second for
 /// medium-range pierce; the gatling rounds out the coverage at the wall line.
-pub const TOWER_BUILD_ORDER: &[&str] = &["rocket", "railgun", "gatling"];
+pub const TOWER_BUILD_ORDER: &[&str] = &["rocket", "rocket", "rocket"];
 
 /// Hard cap on towers (game rule: 3 total). Never build past it, whatever
 /// [`TOWER_BUILD_ORDER`] says.
