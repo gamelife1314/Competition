@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use crate::brain::{
-    economy, news, route, stand_cells, task, tower_stand_cells, treasure,
+    economy, news, stand_cells, task, tower_stand_cells, treasure,
     walk_or_remove_wall, walk_toward, Plan,
 };
 use crate::model::{
@@ -18,10 +18,8 @@ use crate::state::{BotState, TaskSession};
 // the build/tower/wall-geometry cluster moved to `action::{build,tower_site,
 // geometry}` (phase 2c). Everything the test crates used to import from here is
 // re-exported under its old name until phase 5 flips the paths once.
-use super::action::build::{
-    build_or_walk, gate_clear_stands, open_door, repair_flow, update_wall_gate, wall_gate,
-};
-use super::action::geometry::{ring_cells, ring_open_cells, wall_layer};
+use super::action::build::{build_or_walk, repair_flow};
+use super::action::geometry::{ring_open_cells, wall_layer};
 use super::action::mine::{mine_flow, stone_covered};
 use super::action::shop::{
     burn_summon_order, buyer_flow, self_provision, shop_round_trip, shop_trip_decision,
@@ -29,10 +27,9 @@ use super::action::shop::{
 };
 pub(crate) use super::action::shop::use_medicine;
 use super::action::sell::sell_flow;
-pub use super::action::build::{gate_open_record, repair_target};
+pub use super::action::build::repair_target;
 pub use super::action::geometry::{
-    far_edge_cutoff, far_shoulder, primary_wall_gaps, ring_gap_split, tower_build_reserve,
-    wall_daily_cap, wall_gaps, D1_WALL_CAP, LATER_WALL_CAP,
+    primary_wall_gaps, tower_build_reserve, wall_daily_cap, wall_gaps, D1_WALL_CAP, LATER_WALL_CAP,
 };
 pub use super::action::tower_site::tower_gaps;
 
@@ -223,57 +220,26 @@ pub(crate) struct RoundCtx {
     pub(crate) pairs: Vec<(i64, i64)>,
 }
 
-/// Compute the [`RoundCtx`]. Split out of `plan_owned` with zero behaviour
-/// change (issue #221 phase 4a): the side effects — the daybreak gate latch,
-/// the dusk seal checkpoint, the ring-completion memory, the buy deadline and
-/// the per-round telemetry — run here exactly once, in the order they always
-/// ran. `owned` is the CONTEXT roster: the units invisible to the pairing, the
-/// gate record, the trap vetoes and the buyer pick. It stays `[B]` in phase
-/// 4a — the wall worker's day still delegates to the legacy dispatch, so the
-/// context must keep counting A.
+/// Compute the [`RoundCtx`]. Split out of `plan_owned` (issue #221 phase 4a):
+/// the side effects — the ring-completion memory, the buy deadline and the
+/// per-round telemetry — run here exactly once, in the order they always ran.
+/// `owned` is the CONTEXT roster: the units invisible to the pairing, the trap
+/// vetoes and the buyer pick. It stays `[B]` in phase 4a — the wall worker's
+/// day still delegates to the legacy dispatch, so the context must keep
+/// counting A.
 pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) -> RoundCtx {
-    // THE ENTRANCE IS CHOSEN BEFORE ANYTHING ELSE IS PLANNED.
-    //
-    // Every walk this day is priced through it: which mine is worth working,
-    // which ring cell is built next, whether a role inside can reach the ore at
-    // all. It is latched once per day (`observe` clears it at rollover) so the
-    // hole cannot move under a crew that is building around it.
-    if state.gate_cell.is_none() {
-        // The gap list is not readable yet — it is defined in terms of the
-        // entrance being chosen here — so the daybreak pick is made with "stone
-        // if any cell of the shell still carries no wall", which is true on
-        // every day the wall line has work to do, and false on the day the ring
-        // stands complete, when the only errand left is ore that sells.
-        let demand = if route::open_ring_cells(turn, 2).is_empty() {
-            0
-        } else {
-            1
-        };
-        state.gate_cell = route::entrance(turn, state, demand);
-        crate::log::event(
-            "gate_planned",
-            serde_json::json!({
-                "round": turn.round_no,
-                "day": turn.day,
-                "gate": state.gate_cell.or_else(|| route::legacy_entrance(turn)),
-                "planned": state.gate_cell.is_some(),
-            }),
-        );
-    }
-
     let tower_gaps = tower_gaps(turn, state);
     // Owned-aware: units dispatched by a role mainline (the economy worker)
     // are NOT in these pairs. B stays outside the ring after dark on purpose
-    // (comment 1 §6), so B's position must neither hold the gate open nor veto
-    // the last wall as a "trap" — issues #111/#112/#115 sealed the ring with
-    // everyone inside; the new B is deliberately not everyone.
+    // (comment 1 §6), so B's position must not veto the last wall as a "trap" —
+    // issues #111/#112/#115 sealed the ring with everyone inside; the new B is
+    // deliberately not everyone.
     let pairs = super::action::fight::stable_pairs_owned(turn, state, owned);
-    update_wall_gate(turn, state, &pairs, owned);
     let wall_gaps = wall_gaps(turn, state);
     // Ring integrity, remembered across days. An EMPTY gap list with walls
-    // standing means the shell is closed — the door the economy cut this
-    // morning is filtered out of `wall_gaps` while it is still light, so this
-    // does not read a deliberate door as a hole. From then on `wall_daily_cap`
+    // standing means the shell is closed — the permanent entrance is not part
+    // of the count (comment 1 §4: the back four cells are open by design), so
+    // this never reads the entrance as a hole. From then on `wall_daily_cap`
     // treats holes as breach repair (see `BotState::ring_ever_complete`).
     //
     // Measured on the PRIMARY ring alone. The second layer (P2-1) is a later,
@@ -281,8 +247,7 @@ pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) ->
     // question would mean the ring's own breach-repair budget never latched,
     // and a ring the night tore open would be repaired on the six-cell
     // maintenance budget that cannot re-close it (issue #21).
-    let (ring_owed, ring_shoulder) = ring_gap_split(turn, state);
-    let primary_open = ring_owed.len();
+    let primary_open = ring_open_cells(turn, state);
     if primary_open == 0 && !turn.walls().is_empty() {
         state.ring_ever_complete = true;
     }
@@ -292,52 +257,11 @@ pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) ->
     // still open, not the shortfall against what is already carried: stone in a
     // backpack is committed to those gaps, and treating it as "demand already
     // met" made the carrier sell the ring's own stone out from under itself.
-    // ...and the far shoulder is counted only when it IS the day's work
-    // (issue #206 §6). 「有条件全部建造好」 does not mean "dig for a cell you were
-    // told you may skip": `wall_gaps` returns the arc while any of it is open
-    // and the shoulder only once none of it is, so this line is the arc's own
-    // count for as long as a robot could walk in through it, and the shoulder's
-    // count only on a day the arc is already complete — which is precisely the
-    // day that can afford it.
+    // There is no gate term and no door term any more (design D17): the
+    // permanent entrance is never built, so every cell of `wall_gaps` is a cell
+    // the day intends to wall, and the demand is exactly that list, capped.
     let wall_demand = (wall_gaps.len() as i64).min(wall_cap);
-    // P0-3 门重封的石头保障：白天 `open_door` 切开的门在黄昏前不计入
-    // `wall_gaps`（白天它是通道，不是缺口），但黄昏必须重封。门不计入采石
-    // 需求时，一个"除门之外完好"的环会让全天 `want_stone=false`——没人备石，
-    // 黄昏 step 3 的封门分支要求包里有石头，于是门整夜敞开（v1 §5.5 的机制性
-    // 漏洞，与机器人打洞叠加后就是"墙环夜间重新开口"）。把门计入需求、但不
-    // 计入白天的 build 目标（wall_gaps 的过滤不动）。D1 无门机制，不动。
-    let open_doors = if turn.day > 1 {
-        state
-            .door_cells
-            .iter()
-            .filter(|door| !wall_gaps.contains(door))
-            .count() as i64
-    } else {
-        0
-    };
-    // THE GATE'S OWN STONE. `wall_demand` counts the gaps the sweep still owes
-    // the ring, and the gate is deliberately not one of them — it is the hole
-    // the day works through. But at dusk the gate becomes a wall like any
-    // other, and a wall needs a stone: the old accounting stopped the
-    // collecting one stone short, so the seal round found every pack empty and
-    // the day's own entrance stayed open all night — the exact hole
-    // issues #121-#125 measured (`wall_gate_open` for the whole dusk window).
-    // The gate's stone is therefore counted exactly the way the door's is
-    // above: in the demand all afternoon, never in the day's build list. The
-    // `sell_command`/`should_sell` reserve reads the same demand, so the stone
-    // survives the dusk cash-out; once the gate is actually walled the demand
-    // drops the extra stone and the purse is free of it.
-    let gate_stone = match wall_gate(turn, state) {
-        Some(gate)
-            if turn.is_land(gate)
-                && !state.door_cells.contains(&gate)
-                && !turn.walls().iter().any(|wall| wall.pos == gate) =>
-        {
-            1
-        }
-        _ => 0,
-    };
-    let stone_demand = wall_demand + open_doors + gate_stone;
+    let stone_demand = wall_demand;
     // Gold reserved for finishing the tower build-out is untouchable by the
     // shopping list — defenses come before consumables, but only for the 1-2
     // towers we actually build (never all three slots at once).
@@ -412,12 +336,12 @@ pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) ->
     // be sent to while the ring is still open.
     //
     // The debt is counted on the ring itself, not on `wall_gaps`: the sweep's
-    // list drops the gate, the economy's door, a cell a teammate is standing on
-    // and a cell whose only approach is blocked, and those dropped cells are
-    // exactly the ones that end a day at 16/20 (the day-1 board closed its last
-    // four from the dusk seal alone, R56 → R65, with the whole crew idle inside
-    // the ring and 3 iron in a backpack). What the night finds open is the debt
-    // that matters, so the debt is what this reads.
+    // list drops a cell a teammate is standing on and a cell whose build the
+    // judger has blacklisted, and those dropped cells are exactly the ones that
+    // end a day at 16/20 (the day-1 board closed its last four from the dusk
+    // seal alone, R56 → R65, with the whole crew idle inside the ring and 3
+    // iron in a backpack). What the night finds open is the debt that matters,
+    // so the debt is what this reads.
     let ring_debt = ring_open_cells(turn, state) as i64;
     let ring_at_risk = turn.day == 1 && ring_debt > 0 && wall_gaps.is_empty();
     let wall_work_done = wall_gaps.is_empty() && !shared_wall_duty;
@@ -472,48 +396,6 @@ pub(crate) fn round_context(turn: &Turn, state: &mut BotState, owned: &[i64]) ->
             "teamStone": economy::team_ores(turn, STONE),
             "mayBuild": economy::may_build_weapon(turn, state),
             "upgradeReachable": economy::upgrade_reachable(turn, state),
-        }),
-    );
-    // THE FAR SHOULDER, ONCE A ROUND (issue #206 §6).
-    //
-    // 「围墙不一定得全部建造起来，后边的门，背向机器人的方向可以开着」 is a rule
-    // about what the day OWES, and the whole point of it is that a day which
-    // stops at the enemy-facing arc is not a day that failed. That verdict is
-    // invisible in a wall count: `wallGaps: 0` above reads the same whether the
-    // ring is whole or the shoulder was written off, and a batch that cannot
-    // tell those apart cannot tell "the owner's rule is working" from "the
-    // crew stopped early".
-    //
-    // Written every day round for the same reason `tower_plan` is: "how many
-    // rounds was the shoulder left open, and on how many of them was it because
-    // the arc was still going up" is a ratio over rounds, and a record that only
-    // fires on change cannot answer it. `reason` is the verdict, `open` is the
-    // set the day is leaving for last, and `owed` is what it is doing instead.
-    let far_reason = if turn.in_day_round >= far_edge_cutoff() {
-        // Past the cutoff the shoulder is required, so it is in `ring_owed` and
-        // not in `open` — the ring has to hold the night.
-        "dusk_required"
-    } else if !ring_owed.is_empty() {
-        // The arc first: while a cell a robot can walk in through is open, the
-        // shoulder is not even in the day's build list.
-        "enemy_first"
-    } else if !ring_shoulder.is_empty() {
-        // The arc is finished and this is the day's remaining wall work — the
-        // 「有条件全部建造好」 half, on the day that can afford it.
-        "spare_rounds"
-    } else {
-        "none"
-    };
-    crate::log::event(
-        "wall_far_edge",
-        serde_json::json!({
-            "round": turn.round_no,
-            "day": turn.day,
-            "owed": ring_owed.len(),
-            "open": ring_shoulder.iter().map(|cell| crate::log::xy(*cell)).collect::<Vec<_>>(),
-            "reason": far_reason,
-            "teamStone": economy::team_ores(turn, STONE),
-            "stoneDemand": stone_demand,
         }),
     );
     // With two workers, the LAST one is the dedicated economy worker: it skips
@@ -821,121 +703,11 @@ fn worker_day(
         plan.push(role.id, cmd);
         return;
     }
-    // 3. Once everyone has retreated at dusk, a stone carrier closes what is
-    //    left of the ring — the intentionally-last gate first, then any other
-    //    cell the sweep had to skip because a teammate was standing on it when
-    //    it went past (that is the hole that left the ring at 19/20 with the
-    //    stone already in a backpack). This is the only wall action allowed to
-    //    outrank the hard pre-position lock, and the errand is bounded to the
-    //    dusk window so a gun is never abandoned at nightfall.
-    if state.wall_gate_sealed && role.count_item(STONE) > 0 {
-        // The intentionally-last gate FIRST: it is the hole the whole day was
-        // planned around and the one cell the night must not find open. The
-        // old distance-only sort sealed a nearer skipped cell instead and left
-        // the entrance itself for a stone that was never reserved (the gate's
-        // stone is in the demand now — see `plan`).
-        let gate = wall_gate(turn, state);
-        let mut gaps = wall_gaps.to_vec();
-        gaps.sort_by_key(|site| (Some(*site) != gate, chebyshev(role.pos, *site)));
-        if let Some(site) = gaps.into_iter().find(|site| {
-            !wall_would_trap(turn, pairs, state, *site, owned)
-                || turn.in_day_round >= HARD_SEAL_ROUND
-        }) {
-            let gate = gate == Some(site);
-            if chebyshev(role.pos, site) == 1 {
-                state.walls_built_today = state.walls_built_today.saturating_add(1);
-                state.walled_cells_today.insert(site);
-                crate::log::event(
-                    if gate {
-                        "wall_gate_build"
-                    } else {
-                        "wall_seal_build"
-                    },
-                    serde_json::json!({"round": turn.round_no, "role": role.id, "target": site}),
-                );
-                plan.push(role.id, RoleCommand::build(site, "wall"));
-                return;
-            }
-            // The seal cell may be walked to until the day ends, not only until
-            // `SEAL_GRACE`. The grace bounds the ordinary wall sweep, which has
-            // the whole afternoon; this step only ever runs once the flag is up,
-            // and across issues #121-#125 that was late or never. Three of the
-            // five matches had a stone carrier on the wrong side of a sealed
-            // gate when the day ran out.
-            if turn.in_day_round < crate::model::DAY_ROUNDS {
-                if let Some(cmd) = build_or_walk(turn, role, site, "wall", claimed) {
-                    claimed.insert(site);
-                    plan.push(role.id, cmd);
-                    return;
-                }
-            }
-        }
-    }
-    // 3b. 黄昏封门（D2+，P0-3）：`open_door` 为白天经济切开的门，从黄昏起就是
-    //    普通缺口。step 3 要等 `wall_gate_sealed` 旗标（散兵未归队时不封），
-    //    step 5 受每日预算与批量闸限制——两条路都可能让门整夜敞开。带石工人从
-    //    黄昏起直接把门砌上，不必等散兵：他们还有指定的 gate 可以归队。窗口
-    //    延到白天最后一回合：封门若因绕路错过 SEAL_GRACE，门会整夜敞开（be 的
-    //    复核意见 C）；操炮由夜间无条件召回兜底（night.rs 的红线不动）。
-    if turn.day > 1
-        && role.count_item(STONE) > 0
-        && turn.in_day_round >= economy::DUSK_ROUND
-        && turn.in_day_round < crate::model::DAY_ROUNDS
-    {
-        // THE DESIGNATED GATE IS A DOOR TOO (issues #121-#125).
-        //
-        // This step only ever saw `door_cells`, and on day 2+ that set is
-        // usually EMPTY: `open_door` returns early when the role can already
-        // reach the outside, which it can — through the gate the previous
-        // night's seal built and the morning `open_door`/rebuild left open. So
-        // the one hole the ring actually has was the one cell this step never
-        // offered, and it stayed open all night in every match of the batch.
-        // Step 3 covers it only once `wall_gate_sealed` is set, which is
-        // exactly the flag a straggler keeps down.
-        let mut doors: Vec<Pos> = state.door_cells.iter().copied().collect();
-        if let Some(gate) = wall_gate(turn, state) {
-            if !doors.contains(&gate) {
-                doors.push(gate);
-            }
-        }
-        // Total order, not distance alone: `door_cells` is a HashSet, so two
-        // doors at the same distance would be tried in hash-iteration order and
-        // the day's plan would differ between two runs on the same board. The
-        // coordinate tiebreak is the one the rest of the planner uses.
-        doors.sort_by_key(|site| (chebyshev(role.pos, *site), site.x, site.y));
-        // Doors are economy cuts, not structural gaps. A door that would trap
-        // a controller outside is left open: the controller walks through it
-        // instead of demolishing a wall cell that the last round can never
-        // re-wall (measured in day1_sim: R198 sealed the door at (12,26),
-        // the trapped controller demolished (11,26) at R198 and R200, and the
-        // R200 removal was never re-walled). Step 3's forced seal still
-        // closes structural gaps; doors are the one opening that is never
-        // forced.
-        if let Some(site) = doors.into_iter().find(|site| {
-            turn.is_land(*site)
-                && !claimed.contains(site)
-                && !turn.walls().iter().any(|wall| wall.pos == *site)
-                && !wall_would_trap(turn, pairs, state, *site, owned)
-        }) {
-            claimed.insert(site);
-            if chebyshev(role.pos, site) == 1 {
-                state.walls_built_today = state.walls_built_today.saturating_add(1);
-                state.walled_cells_today.insert(site);
-                state.door_cells.remove(&site);
-                crate::log::event(
-                    "door_reseal",
-                    serde_json::json!({"round": turn.round_no, "role": role.id, "target": site}),
-                );
-                plan.push(role.id, RoleCommand::build(site, "wall"));
-                return;
-            }
-            if let Some(cmd) = build_or_walk(turn, role, site, "wall", claimed) {
-
-                plan.push(role.id, cmd);
-            }
-            return;
-        }
-    }
+    // Steps 3/3b of the legacy dispatch — the dusk seal of the day's gate and
+    // the re-seal of the morning's doors — are deleted with the gate itself
+    // (design D17): the permanent entrance is never walled, so there is no
+    // cell whose seal must be timed, forced or waited for. Any ring cell still
+    // open at dusk is an ordinary gap the wall sweep below keeps offering.
     // 4. Pre-position near the assigned tower. This outranks walls, weapons
     //    and the economy once the deadline hits: a tower with no operator by
     //    dusk is a weapon that never fires (battle pk575060 lost 17/20 night
@@ -1011,16 +783,14 @@ fn worker_day(
             // PRE-POSITION round, which is dusk minus the walk minus the detour
             // slack — on the day-1 board that is round 46, nine rounds before
             // dusk. A stone carrier locked there stops being a carrier: the two
-            // cells the sweep could still reach sat bare until the gate seal
-            // released them at dusk, and the ring closed at R65 — 「第一天只挖
-            // 石头」's own ring, with the dusk at 55. The exception is the same
-            // one step 3 already takes for the gate, and it is bounded the same
-            // way: a role carrying stone for gaps that are still open keeps the
-            // wall sweep available to it until `HARD_SEAL_ROUND`, and the
-            // moment the gaps are filled (or the hard deadline passes) this
-            // falls through and the lock has the last word. The gun is not
-            // abandoned — `night::plan`'s unconditional recall is the backstop,
-            // and the sweep's errand is inside the ring.
+            // cells the sweep could still reach sat bare until dusk released
+            // them, and the ring closed at R65 — 「第一天只挖石头」's own ring,
+            // with the dusk at 55. So a role carrying stone for gaps that are
+            // still open keeps the wall sweep available to it until dusk, and
+            // the moment the gaps are filled this falls through and the lock
+            // has the last word. The gun is not abandoned — `night::plan`'s
+            // unconditional recall is the backstop, and the sweep's errand is
+            // inside the ring.
             let ring_tail = role.count_item(STONE) > 0
                 && !wall_gaps.is_empty()
                 && turn.in_day_round < economy::DUSK_ROUND;
@@ -1029,18 +799,12 @@ fn worker_day(
                 // one within a chebyshev cell of it. A gun's diagonal
                 // neighbours sit on the radius-2 wall ring: a controller that
                 // parks on one of them is standing in the wall line, outside
-                // the base. `update_wall_gate` then never sees "everyone has
-                // retreated", the gate is never sealed, and since the gate seal
-                // is the only wall action that outranks this lock the stone the
-                // crew is carrying never becomes wall — the ring ends the day at
-                // 0/20 with nine stone in two backpacks. It is also issue #15's
-                // "操控者在墙的外侧": the gun is manned from in front of the
-                // wall it is supposed to be behind. Walking on until a real
-                // operating cell is reached (or, when none can be reached,
-                // sheltering inside) is what lets the ring close around the
-                // crew.
+                // the base — issue #15's "操控者在墙的外侧": the gun is manned
+                // from in front of the wall it is supposed to be behind.
+                // Walking on until a real operating cell is reached (or, when
+                // none can be reached, sheltering inside) is what keeps the
+                // crew behind the ring it spends the day building.
                 let stands = tower_stand_cells(turn, tower.pos);
-                let stands = gate_clear_stands(turn, state, stands);
                 if !stands.iter().any(|stand| *stand == role.pos) {
                     // Walk there — but never by demolishing the wall line. The
                     // ring is the day's whole product (issues #12/#13/#14: "420
@@ -1050,7 +814,7 @@ fn worker_day(
                     // its demolition escape hatch, where being locked out is
                     // fatal; here the fallback is to shelter inside, which is
                     // one of the three valid night duties (operate / heal /
-                    // retreat) and the exact set the gate seal waits for.
+                    // retreat).
                     if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
                         plan.push(role.id, cmd);
                         return;
@@ -1468,16 +1232,10 @@ fn worker_day(
             return;
         }
     }
-    // 7c. Cut a door in our own wall line. Everything the economy needs — ore,
-    //     the vendor, the shop — is OUTSIDE the ring, and a ring with no door is
-    //     a base nobody can leave: the day after the wall line closes, every
-    //     role stands inside with an empty pack and issues no command at all
-    //     (issue #14's frozen economy, in its final form). Runs before selling
-    //     and mining because with the door shut there is no point trying either.
-    if let Some(cmd) = open_door(turn, state, role, claimed) {
-        plan.push(role.id, cmd);
-        return;
-    }
+    // Step 7c — cutting a door in our own wall line — is deleted (design D17):
+    // the permanent entrance (comment 1 §4) is never built, so a closed ring
+    // always has its four-cell way out and issue #14's frozen economy cannot
+    // arise structurally.
     // 8. Patch the wall line. Before selling and before mining: a 10-gold kit
     //    buys back 1000 HP of wall, and a wall left at 200 HP is the cell the
     //    next wave comes through. Issue #16 lost the ring that way — D2 rebuilt
@@ -1799,13 +1557,11 @@ fn pioneer_day(
                 // As for the workers: the post is a cell the gun can be
                 // operated from, and a diagonal neighbour of a gun is a cell of
                 // the radius-2 wall ring — a pioneer parked there is outside
-                // the ring and keeps the gate seal from ever completing.
+                // the ring it is supposed to shelter behind.
                 let stands = tower_stand_cells(turn, tower.pos);
-                let stands = gate_clear_stands(turn, state, stands);
                 // If the pioneer is already inside the ring (dist <= 1 from
-                // the station), hold there — walking to a stand cell that
-                // `gate_clear_stands` filtered to the outer ring would take
-                // it back outside, breaking the dusk latch.
+                // the station), hold there — walking out to an outer-ring
+                // stand cell would undo the dusk latch.
                 let station = turn.station();
                 let inside = station.map_or(false, |s| {
                     footprint_distance(pioneer.pos, &s.footprint()) <= 1
@@ -2172,16 +1928,14 @@ fn loiter_at_task_point(
 /// inside is reachable at all, so a genuinely boxed-in role holds rather than
 /// paces. "Reachable" now includes demolishing one of our own walls on the way
 /// in (`walk_or_remove_wall`, P0-3): the ring was built to keep robots out, and
-/// a role the crew accidentally sealed on the wrong side of it is a hole in the
-/// gate seal for the whole night, which costs more than one wall cell.
+/// a role the crew accidentally sealed on the wrong side of it is a role the
+/// night cannot use, which costs more than one wall cell. With the permanent
+/// entrance (design D17) the wrong side is a pathing accident, not a daily
+/// certainty, and the entrance column is always walkable.
 ///
-/// The shelter obeys the same rule as the pre-position posts
-/// (`gate_clear_stands`): a role that hugs the station on the gate's own
-/// approach cells jams the one door the stone carrier needs at dusk. Measured
-/// on the day-2 board: the pioneer sheltered on the gate's inner shoulder, the
-/// carrier with eleven stone could not reach either open cell, and the ring
-/// spent the night at 18/20 with the reserve in hand.
-fn retreat_inside(turn: &Turn, state: &BotState, role: &Unit, claimed: &mut HashSet<Pos>) -> Option<RoleCommand> {
+/// `_state` is vestigial: the shelter list used to be filtered off the day's
+/// gate approach cells (`gate_clear_stands`), and the gate died with D17.
+fn retreat_inside(turn: &Turn, _state: &BotState, role: &Unit, claimed: &mut HashSet<Pos>) -> Option<RoleCommand> {
     let station = turn.station()?;
     let footprint = station_footprint(station.pos);
     if footprint_distance(role.pos, &footprint) <= 1 {
@@ -2191,7 +1945,6 @@ fn retreat_inside(turn: &Turn, state: &BotState, role: &Unit, claimed: &mut Hash
     if stands.is_empty() {
         return None;
     }
-    let stands = gate_clear_stands(turn, state, stands);
     walk_home_or_reroute(turn, role, &stands, claimed)
 }
 
@@ -2345,8 +2098,8 @@ pub(crate) fn wall_would_trap(
         }
         // A role that cannot reach its post even WITHOUT this wall is not
         // what the wall would trap. Counting it anyway vetoes every remaining
-        // ring cell at once — the gate included — which is how day 1 ended at
-        // 19/20 with the last stone sitting in a backpack (issues #12/#13/#14).
+        // ring cell at once — which is how day 1 ended at 19/20 with the last
+        // stone sitting in a backpack (issues #12/#13/#14).
         if !crate::brain::can_reach_any(turn, role, &home) {
             continue;
         }
@@ -2390,18 +2143,14 @@ pub(crate) fn wall_would_trap(
 /// safety check — and a ring cell a role was standing on when the sweep went
 /// past is precisely the one that ends up walled off from the inside, with the
 /// stone on the wrong side. Day 1 finished 19/20 exactly that way.
+///
+/// The list is the fixed build order (comment 1 §4), so the four permanent
+/// entrance cells are not in it and never were "pending": the gate clause this
+/// function used to carry died with the gate (design D17).
 pub(crate) fn pending_ring(turn: &Turn, state: &BotState, ignore: Pos) -> Vec<Pos> {
-    let Some(station) = turn.station() else {
-        return Vec::new();
-    };
-    let footprint = station_footprint(station.pos);
-    let Some(gate) = wall_gate(turn, state) else {
-        return Vec::new();
-    };
     let walls: HashSet<Pos> = turn.walls().iter().map(|wall| wall.pos).collect();
-    ring_cells(&footprint, 2)
+    super::action::base_layout::wall_build_order(turn)
         .into_iter()
-        .filter(|pos| *pos != gate || state.wall_gate_sealed)
         .filter(|pos| {
             *pos != ignore
                 && turn.is_land(*pos)
@@ -2413,62 +2162,28 @@ pub(crate) fn pending_ring(turn: &Turn, state: &BotState, ignore: Pos) -> Vec<Po
         .collect()
 }
 
-/// Walkable cells outside the wall ring — everything at footprint distance 3
-/// or more: the mines, the vendors, the shops, the enemy half. "Can this role
-/// get out?" is exactly "can it reach one of these?".
-pub(crate) fn outside_cells(turn: &Turn, footprint: &[Pos]) -> Vec<Pos> {
-    let mut cells: Vec<Pos> = Vec::new();
-    for x in 0..turn.width {
-        for y in 0..turn.height {
-            let pos = Pos { x, y };
-            if turn.is_land(pos) && footprint_distance(pos, footprint) >= 3 {
-                cells.push(pos);
-            }
-        }
-    }
-    cells
-}
-
 // ---------------------------------------------------------------------------
 // Build site planning
 // ---------------------------------------------------------------------------
 
-/// The stone the day still owes: wall gaps inside today's budget, the doors
-/// the economy cut (day 2+), and the gate's own dusk stone. Same arithmetic
-/// `plan` runs inline, recomputed from pure queries so a role mainline (issue
-/// #221) can ask it without threading `plan`'s locals. Reads the STORED
-/// `ring_ever_complete`, which `plan` may set a round later — a one-round lag
-/// on the cap latch, never on the gap count.
+/// The stone the day still owes: wall gaps inside today's budget, and nothing
+/// else — the door and gate terms died with the gate (design D17), and the
+/// permanent entrance is never walled. Same arithmetic `plan` runs inline,
+/// recomputed from pure queries so a role mainline (issue #221) can ask it
+/// without threading `plan`'s locals. Reads the STORED `ring_ever_complete`,
+/// which `plan` may set a round later — a one-round lag on the cap latch,
+/// never on the gap count.
 pub(crate) fn stone_demand_of(turn: &Turn, state: &BotState) -> i64 {
     let wall_gaps = wall_gaps(turn, state);
-    let (ring_owed, _) = ring_gap_split(turn, state);
-    let wall_cap = wall_daily_cap(turn.day, state.ring_ever_complete, ring_owed.len());
-    let wall_demand = (wall_gaps.len() as i64).min(wall_cap);
-    let open_doors = if turn.day > 1 {
-        state
-            .door_cells
-            .iter()
-            .filter(|door| !wall_gaps.contains(door))
-            .count() as i64
-    } else {
-        0
-    };
-    let gate_stone = match wall_gate(turn, state) {
-        Some(gate)
-            if turn.is_land(gate)
-                && !state.door_cells.contains(&gate)
-                && !turn.walls().iter().any(|wall| wall.pos == gate) =>
-        {
-            1
-        }
-        _ => 0,
-    };
-    wall_demand + open_doors + gate_stone
+    let primary_open = ring_open_cells(turn, state);
+    let wall_cap = wall_daily_cap(turn.day, state.ring_ever_complete, primary_open);
+    (wall_gaps.len() as i64).min(wall_cap)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::brain::action::geometry::ring_cells;
     use crate::model::{neighbours, ORES};
 
     fn pos(x: i32, y: i32) -> Pos {
@@ -2581,99 +2296,6 @@ mod tests {
         assert!(
             !wall_would_trap(&turn, &[], &state, pos(20, 20), &[]),
             "a wall in the open, far from every role's way home, traps nobody"
-        );
-    }
-
-    /// The closed ring around the mid-map station: all twenty cells one layer
-    /// out from the footprint, which is the 19/20 the day-1 crew kept finishing
-    /// on. Everyone inside is walled away from the ore.
-    fn sealed_ring(extra: Vec<serde_json::Value>) -> Turn {
-        let mut roles = vec![unit(10001, "station", pos(10, 24))];
-        let footprint = station_footprint(pos(10, 24));
-        for (index, at) in ring_cells(&footprint, 2).iter().enumerate() {
-            roles.push(unit(20000 + index as i64, "wall", *at));
-        }
-        roles.extend(extra);
-        let payload = serde_json::json!({
-            // Day 2, in-day round 9: past the day-1 fortification rule, well
-            // before the dusk seal.
-            "roundNo": 140,
-            "mapInfo": {"width": 41, "height": 32, "zones": []},
-            "teamOur": {
-                "type": "challenger", "goldNum": 0, "totalScore": 0,
-                "playerTasks": [], "roles": roles
-            },
-            "teamEnemy": {"roles": []},
-            "robot": {"roles": []},
-        });
-        let req: crate::protocol::Request =
-            serde_json::from_value(payload).expect("payload parses");
-        Turn::from_request(req)
-    }
-
-    fn door_of(turn: &Turn, actor: i64) -> Option<RoleCommand> {
-        let state = &mut BotState::default();
-        let mut claimed = HashSet::new();
-        let role = turn.role_by_id(actor).expect("the actor exists");
-        open_door(turn, state, role, &mut claimed)
-    }
-
-    /// 「工人可以在第二天出不去的时候选择破墙而出，但是开拓者如果夹在武器、基地
-    /// 以及城墙之间，除非有人来救否则就出不去了」 — the worker has an escape
-    /// hatch and the pioneer does not (任务书 4.4: `remove` is 工人 only, and
-    /// `validate.rs` drops anyone else's). Here the ring is closed, every worker
-    /// is out on the ore, and the pioneer is the one inside. With nobody cutting
-    /// for it the pioneer spends the day behind the wall, which is the cage the
-    /// owner described; the crew is the rescue, and the worker standing beside
-    /// the line cuts the door from its own side.
-    #[test]
-    fn a_worker_cuts_the_ring_for_a_pioneer_sealed_inside() {
-        let turn = sealed_ring(vec![
-            unit(10002, "worker", pos(7, 24)),  // outside, beside the ring
-            unit(10004, "pioneer", pos(11, 25)), // inside, and going nowhere
-        ]);
-        let pioneer = turn.role_by_id(10004).expect("the pioneer exists");
-        assert!(
-            !crate::brain::can_reach_any(&turn, pioneer, &outside_cells(&turn, &station_footprint(pos(10, 24)))),
-            "test setup: the pioneer is not actually sealed in"
-        );
-        let cmd = door_of(&turn, 10002).expect("the crew cut the ring for the pioneer");
-        assert_eq!(cmd.action, "remove", "a door is cut with `remove`: {cmd:?}");
-        let target = cmd.targetPos.expect("a removal names its wall")[0];
-        assert_eq!(
-            footprint_distance(target, &station_footprint(pos(10, 24))),
-            2,
-            "{target:?} is not a cell of our ring"
-        );
-        // …and it is the right cell: with that one wall gone the pioneer walks
-        // out. A removal anywhere else leaves it caged for the day.
-        let mut blocked = turn.blocked_for(pioneer.id);
-        blocked.remove(&target);
-        assert!(
-            crate::path::step_toward_stands(
-                &turn,
-                pioneer.pos,
-                &outside_cells(&turn, &station_footprint(pos(10, 24))),
-                &blocked
-            )
-            .is_some(),
-            "the cell the crew cut is not the one that lets the pioneer out"
-        );
-    }
-
-    /// The control for the test above: the same board with the pioneer OUTSIDE
-    /// the ring. Nobody is caged, so nobody cuts — the door costs a stone and a
-    /// hole the dusk has to re-seal, and it is only ever opened for a role that
-    /// cannot open it for itself.
-    #[test]
-    fn no_door_is_cut_when_the_pioneer_is_already_out() {
-        let turn = sealed_ring(vec![
-            unit(10002, "worker", pos(7, 24)),
-            unit(10004, "pioneer", pos(6, 24)),
-        ]);
-        assert!(
-            door_of(&turn, 10002).is_none(),
-            "a sealed-in pioneer is the only reason to cut a door from outside"
         );
     }
 

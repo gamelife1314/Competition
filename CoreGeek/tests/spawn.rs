@@ -6,13 +6,16 @@
 //! right. There the radius-2 shell runs off the board: those cells need no wall
 //! because the map edge itself is the seal, and a ring that quietly dropped
 //! ON-board cells instead would leave the base open at exactly one corner.
-//! So the invariant is set equality against the in-bounds shell — no missing
-//! wall where a robot could walk, no phantom wall off the board.
+//! Since issue #221 phase 4b the invariant is set equality against the
+//! in-bounds shell MINUS the four permanent entrance cells (comment 1 §4) —
+//! no missing wall where a robot could walk, no phantom wall off the board,
+//! and never a wall across the crew's own door.
 
 use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
+use coregeek::brain::action::base_layout;
 use coregeek::brain::day::{plan as day_plan, tower_gaps, wall_gaps};
 use coregeek::model::{footprint_distance, station_footprint, Turn};
 use coregeek::protocol::{Pos, Request};
@@ -100,15 +103,19 @@ fn shell(station_pos: (i32, i32), radius: i32) -> Vec<Pos> {
 }
 
 #[test]
-fn the_day_one_ring_is_exactly_the_on_board_shell() {
+fn the_day_one_ring_is_the_shell_minus_the_permanent_entrance() {
     for (name, base) in BASES {
         let turn = turn_from(world(base));
-        let mut state = BotState::default();
-        state.wall_gate_sealed = true;
+        let state = BotState::default();
 
+        let entrance: HashSet<Pos> = base_layout::entrance_cells(&turn)
+            .into_iter()
+            .filter(|cell| turn.in_bounds(*cell))
+            .collect();
         let expected: HashSet<Pos> = shell(base, 2)
             .into_iter()
             .filter(|cell| turn.in_bounds(*cell))
+            .filter(|cell| !entrance.contains(cell))
             .collect();
         let ring = wall_gaps(&turn, &state);
         let actual: HashSet<Pos> = ring.iter().copied().collect();
@@ -121,6 +128,13 @@ fn the_day_one_ring_is_exactly_the_on_board_shell() {
             actual.difference(&expected).collect::<Vec<_>>()
         );
         assert_eq!(ring.len(), actual.len(), "{name} repeated a ring cell");
+        // …and in comment 1 §4's fixed one-direction order, not merely as a
+        // set: front column, top row, bottom row.
+        let order: Vec<Pos> = base_layout::wall_build_order(&turn)
+            .into_iter()
+            .filter(|cell| turn.is_land(*cell))
+            .collect();
+        assert_eq!(ring, order, "{name}: the gap list is not the fixed order");
         let footprint = footprint_of(base);
         for cell in &ring {
             assert_eq!(
@@ -133,15 +147,15 @@ fn the_day_one_ring_is_exactly_the_on_board_shell() {
 }
 
 #[test]
-fn only_the_map_edge_may_leave_a_shell_cell_unwalled() {
+fn only_the_map_edge_or_the_entrance_may_leave_a_shell_cell_unwalled() {
     for (name, base) in BASES {
         let turn = turn_from(world(base));
-        let mut state = BotState::default();
-        state.wall_gate_sealed = true;
+        let state = BotState::default();
+        let entrance: HashSet<Pos> = base_layout::entrance_cells(&turn).into_iter().collect();
 
         let actual: HashSet<Pos> = wall_gaps(&turn, &state).into_iter().collect();
         for cell in shell(base, 2) {
-            if actual.contains(&cell) {
+            if actual.contains(&cell) || entrance.contains(&cell) {
                 continue;
             }
             assert!(
@@ -152,63 +166,82 @@ fn only_the_map_edge_may_leave_a_shell_cell_unwalled() {
     }
 }
 
+/// Design D17 in one assert: the back four cells are the crew's permanent way
+/// out — never offered to the wall line on any day, sealed or not, so no gate
+/// latch, dusk seal or morning door-cut can ever wall the economy in (issue
+/// #14's structural answer).
 #[test]
-fn the_gate_withholds_at_most_one_ring_cell_until_the_dusk_seal() {
+fn the_permanent_entrance_is_never_offered() {
     for (name, base) in BASES {
         let turn = turn_from(world(base));
-        let mut open = BotState::default();
-        open.wall_gate_sealed = false;
-        let mut sealed = BotState::default();
-        sealed.wall_gate_sealed = true;
-
-        let before: HashSet<Pos> = wall_gaps(&turn, &open).into_iter().collect();
-        let after: HashSet<Pos> = wall_gaps(&turn, &sealed).into_iter().collect();
+        let state = BotState::default();
+        let entrance = base_layout::entrance_cells(&turn);
+        let gaps: HashSet<Pos> = wall_gaps(&turn, &state).into_iter().collect();
         assert!(
-            before.is_subset(&after),
-            "{name}: sealing must not move the other walls"
-        );
-        assert!(
-            after.len() - before.len() <= 1,
-            "{name}: the seal may admit only the gate cell"
+            entrance.iter().all(|cell| !gaps.contains(cell)),
+            "{name}: the entrance must never be a wall gap"
         );
         if base == (10, 24) {
-            // Mid-map the gate is always a real ring cell, so the difference is
-            // exactly the one cell the open ring withholds.
-            assert_eq!(after.len(), before.len() + 1, "{name}: gate never opened");
+            // Mid-map nothing runs off the board: 20 shell cells = 16 walls
+            // + 4 entrance, exactly.
+            assert_eq!(gaps.len(), 16, "{name}: the ring is not 16 cells");
+            assert_eq!(
+                entrance,
+                vec![
+                    Pos { x: 8, y: 22 },
+                    Pos { x: 8, y: 23 },
+                    Pos { x: 8, y: 24 },
+                    Pos { x: 8, y: 25 }
+                ],
+                "{name}: the entrance is not the back column"
+            );
         }
     }
 }
 
 #[test]
-fn the_three_tower_sites_sit_on_the_inner_ring_from_every_base() {
+fn the_tower_sites_are_the_l_cells_that_fit_on_the_board() {
     for (name, base) in BASES {
         let turn = turn_from(world(base));
         let footprint = footprint_of(base);
         let state = BotState::default();
 
         let gaps = tower_gaps(&turn, &state);
+        // Comment 1 §1: the sites are the FIXED L cells around the operator
+        // stand — every one of them that is actually on the board, in layout
+        // order. A base pressed so far into a corner that the L runs off the
+        // map simply has fewer (here: zero) sites; nothing is invented.
+        let expected: Vec<Pos> = base_layout::weapon_sites(&turn)
+            .into_iter()
+            .filter(|pos| turn.is_land(*pos))
+            .collect();
+        let actual: Vec<Pos> = gaps.iter().map(|(pos, _)| *pos).collect();
+        assert_eq!(actual, expected, "{name}: the sites are not the L");
+        // Issue #206 §5's positional line, read off the config: slot i builds
+        // `TOWER_BUILD_ORDER[i]` (ABSOLUTE indexing — the pk616181/pk616182
+        // second-rocket bug is what this pins).
         let kinds: Vec<&str> = gaps.iter().map(|(_, kind)| kind.as_str()).collect();
-        // Issue #206 §5 replaced the per-kind build order with a positional
-        // line: slot i of the empty-slot list builds `TOWER_BUILD_ORDER[i]`, so
-        // the kinds are the configured line, read off the config rather than
-        // restated here. Reverting to per-kind `have[]` counting makes this red
-        // (`gatling` reappears / repeats disappear).
+        let expected_kinds: Vec<&str> = coregeek::config::TOWER_BUILD_ORDER
+            .iter()
+            .take(kinds.len())
+            .map(|kind| kind.as_str())
+            .collect();
         assert_eq!(
-            kinds,
-            coregeek::config::TOWER_BUILD_ORDER,
+            kinds, expected_kinds,
             "{name}: the tower line is not the configured one"
         );
-        let unique: HashSet<Pos> = gaps.iter().map(|(pos, _)| *pos).collect();
-        assert_eq!(
-            unique.len(),
-            kinds.len(),
-            "{name} stacked two towers on one cell"
-        );
-        for (pos, _) in &gaps {
-            assert!(
-                turn.is_land(*pos),
-                "{name} tower site off the board: {pos:?}"
+        if base == (10, 24) {
+            assert_eq!(
+                actual,
+                vec![
+                    Pos { x: 9, y: 22 },
+                    Pos { x: 10, y: 22 },
+                    Pos { x: 9, y: 24 }
+                ],
+                "{name}: the L does not sit where the spec puts it"
             );
+        }
+        for (pos, _) in &gaps {
             assert_eq!(
                 footprint_distance(*pos, &footprint),
                 1,

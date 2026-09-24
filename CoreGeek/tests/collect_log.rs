@@ -222,8 +222,8 @@ fn caps(text: &str) -> Vec<(String, usize)> {
 
 #[test]
 fn every_event_the_collector_reads_is_an_event_we_actually_emit() {
-    // The failure this exists for: rename `wall_gate_open` in day.rs and the
-    // gate table keeps printing, in the same shape, with "（0 行）" where the
+    // The failure this exists for: rename `night_debug` in night.rs and the
+    // night tables keep printing, in the same shape, with "（0 行）" where the
     // answer was. A dropped `round` field reads as a fact about the match; a
     // dropped event name reads as a fact about the match too, and neither
     // raises anything.
@@ -257,7 +257,6 @@ fn the_collector_still_carries_every_section() {
         "表 3a",
         "表 4a",
         "表 4c · 每条沙盒命令",
-        "表 5a · 封门",
         "表 6a · 夜间沉默",
         "表 7 · 对手建造节奏",
         "表 8 · 我方分数三块",
@@ -278,10 +277,12 @@ fn the_row_budget_lives_in_the_script_and_adds_up() {
     // judgement, because the driver is not the one who pays when the issue body
     // is a file dump. A cap that truncates silently would be worse than no cap,
     // so the script also has to declare the real length — and the caps have to
-    // stay inside the lines §7.3 and §8 promise (700 since v18; v19's 表 10 added
-    // twelve more rows to a 664-line total, and v22's 表 11/表 12 add twelve each
-    // to the 676 v21 left — 676 + 12 + 12 = 700, so the promise still does not
-    // move and there is now NO headroom left in it).
+    // stay inside the lines §7.3 and §8 promise (700 since v18, reached exactly
+    // at v22). Issue #221 4b retired the seal tables (表 5a/5b/5c, 200 lines)
+    // and the far-edge table (表 13, 12) together with their events — the
+    // entrance is permanent and the wall order is fixed, so "was the gate
+    // sealed" and "which shoulder closed" are no longer things that can
+    // happen — and the budget went with them: seventeen tables, 488 lines.
     let text = collector();
     assert!(
         text.contains("本表共"),
@@ -291,7 +292,7 @@ fn the_row_budget_lives_in_the_script_and_adds_up() {
     let table = caps(&text);
     assert_eq!(
         table.len(),
-        21,
+        17,
         "expected one budget per section, got {table:?}"
     );
     assert!(
@@ -308,7 +309,7 @@ fn the_row_budget_lives_in_the_script_and_adds_up() {
     }
     assert_eq!(
         text.matches("CAPS[\"").count(),
-        21,
+        17,
         "a section is spending a budget that is not in the CAPS table"
     );
 
@@ -450,24 +451,20 @@ fn the_fields_the_new_tables_join_on_are_actually_emitted() {
     // silent failure; a table that prints a column of blanks because the EVENT is
     // there but the FIELD is not is the other, and it looks like a fact about the
     // match. 表 12 joins the news ask to its answer by the round each happened on,
-    // 表 13 reads the far-edge verdict per day, and 表 12's `问给谁` column reads
-    // the consumer that won the round's prompt slot — so each of those fields has
-    // to be in the record, not merely intended.
+    // and 表 12's `问给谁` column reads the consumer that won the round's prompt
+    // slot — so each of those fields has to be in the record, not merely intended.
     //
     // v22's whole point is that these were the blind spots: `news_read` and
     // `news_read_failed` carried a `day` and no `round`, so "asked at X, answered
     // at Y" could not be asked of the log at all; `prompt_sent` did not say who
-    // asked; and neither `day_earn` nor `wall_far_edge` existed.
+    // asked; and `day_earn` did not exist. (`wall_far_edge` joined this list at
+    // v22 and left again with issue #221 4b, which fixed the wall order.)
     let payloads = emitted_payloads();
     for (event, fields) in [
         ("news_read_ask", &["day", "round"][..]),
         ("news_read", &["day", "round", "readings"][..]),
         ("news_read_failed", &["day", "round"][..]),
         ("prompt_sent", &["round", "day", "purpose", "chars"][..]),
-        (
-            "wall_far_edge",
-            &["round", "day", "owed", "open", "reason", "teamStone", "stoneDemand"][..],
-        ),
     ] {
         let body = payloads
             .iter()
@@ -518,7 +515,7 @@ fn interpreter() -> Option<String> {
 }
 
 #[test]
-fn the_two_new_tables_print_the_rows_the_events_carry() {
+fn the_earning_table_prints_the_rows_the_events_carry() {
     // The budget test above holds the SCRIPT'S TEXT against the promise; this
     // one runs it. The two are not the same check: a section can be present,
     // spent, counted and spelled right and still print the wrong column, crash
@@ -527,9 +524,10 @@ fn the_two_new_tables_print_the_rows_the_events_carry() {
     // is an empty cell and an empty cell reads as a fact about the match.
     //
     // The fixture is one day-round per day, hand-written from the emitters'
-    // payloads in `src/`: 表 12 joins `day_earn` to the news events by day, 表 13
-    // reads the day's last `wall_far_edge`, and both drills read `prompt_sent` /
-    // `cmd_sent` / the news events back by round.
+    // payloads in `src/`: 表 12 joins `day_earn` to the news events by day, and
+    // both drills read `prompt_sent` / `cmd_sent` / the news events back by
+    // round. (The `wall_far_edge` rows this fixture used to carry left with
+    // issue #221 4b, which fixed the wall order and deleted the event.)
     let Some(python) = interpreter() else {
         eprintln!("（没有可用的 python3/python，跳过：这一格查的是脚本跑起来的样子）");
         return;
@@ -546,13 +544,9 @@ fn the_two_new_tables_print_the_rows_the_events_carry() {
             "\n",
             r#"{"event":"day_earn","data":{"round":70,"day":1,"mined":["stone",21],"sold":[],"soldGold":0,"gold":25,"unlabelled":0}}"#,
             "\n",
-            r#"{"event":"wall_far_edge","data":{"round":70,"day":1,"owed":0,"open":["2,0","3,0"],"reason":"spare_rounds","teamStone":0,"stoneDemand":6}}"#,
-            "\n",
             r#"{"event":"news_read_failed","data":{"day":2,"round":131,"attempts":1,"head":"not json"}}"#,
             "\n",
             r#"{"event":"day_earn","data":{"round":200,"day":2,"mined":["iron",4],"sold":["iron",4],"soldGold":32,"gold":57,"unlabelled":2}}"#,
-            "\n",
-            r#"{"event":"wall_far_edge","data":{"round":200,"day":2,"owed":2,"open":[],"reason":"enemy_first","teamStone":1,"stoneDemand":2}}"#,
             "\n",
         ),
     )
@@ -600,20 +594,6 @@ fn the_two_new_tables_print_the_rows_the_events_carry() {
         rows.iter().any(|row| row.split('\t').nth(7) == Some("-")),
         "表 12 does not say `-` for a day whose news was never asked about — a \
          blank cell there would read as a fact about the match:\n{earn}"
-    );
-
-    // 表 13: the day's last verdict, reason and all. Day 1 finished on the far
-    // shoulder (`spare_rounds`); day 2 was still on the enemy-facing arc
-    // (`enemy_first`), which is the row that has to be visible.
-    let far = text.split("表 13 ·").nth(1).expect("表 13 is in the output");
-    assert!(
-        far.contains("spare_rounds") && far.contains("enemy_first"),
-        "表 13 lost a day's reason:\n{far}"
-    );
-    assert!(
-        far.lines().any(|row| row.starts_with("1\t70\t0\t2\t")),
-        "表 13's day-1 row does not carry the owed/open counts `wall_far_edge` \
-         wrote:\n{far}"
     );
 
     // And the per-round half, which only `--day` prints: the purpose the prompt

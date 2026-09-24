@@ -1255,24 +1255,31 @@ fn dying_worker_heals_first() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn wall_gaps_builds_inner_box_first_and_leaves_gate_open() {
-    // A tight box (the distance-2 inner ring) must close around the base before
-    // the outer ring scatters far away — battle pk575557 left walls scattered
-    // with no enclosure. The entrance corridor stays open either way.
+fn wall_gaps_follow_the_fixed_order_and_never_offer_the_entrance() {
+    // Battle pk575557 left walls scattered with no enclosure, and issue #3
+    // sealed a worker in behind a line that closed on the wrong cells. Comment
+    // 1 §4 replaced both failure modes with ONE fixed order — the enemy-facing
+    // front column first, then the top row, then the bottom row — and the four
+    // back-column entrance cells are never offered as gaps at all, so the plan
+    // can no longer wall the base shut.
     let probe = turn_from(day_world_at(5, vec![station(10, 20, 1)], 0, vec![], vec![]));
     let state = BotState::default();
     let gaps = coregeek::brain::day::wall_gaps(&probe, &state);
-    assert!(!gaps.is_empty(), "wall gaps exist");
-    let gate = [Pos { x: 13, y: 18 }, Pos { x: 14, y: 18 }];
+    let order = coregeek::brain::action::base_layout::wall_build_order(&probe);
+    assert_eq!(
+        gaps, order,
+        "an untouched board owes the whole 16-cell order, head first"
+    );
+    let entrance = coregeek::brain::action::base_layout::entrance_cells(&probe);
     assert!(
-        gate.iter().all(|cell| !gaps.contains(cell)),
-        "gate cells stay open"
+        entrance.iter().all(|cell| !gaps.contains(cell)),
+        "the permanent entrance is never a build gap"
     );
     let footprint = coregeek::model::station_footprint(Pos { x: 10, y: 20 });
     assert_eq!(
         coregeek::model::footprint_distance(gaps[0], &footprint),
         2,
-        "inner box (distance 2) builds before the outer ring"
+        "the order's head is a ring cell"
     );
 }
 
@@ -1689,8 +1696,8 @@ fn breach_roles() -> Vec<Value> {
 }
 
 /// Ring cells left open in the breach fixtures: the one the carrier is next to
-/// (13,19) plus seven others. The gate (13,18) is left standing so the fixture
-/// is about the breach and nothing else.
+/// (13,19) plus seven others — every one a cell of the fixed build order, so
+/// the fixture is about the breach and nothing else.
 fn breach_holes() -> Vec<(i32, i32)> {
     vec![
         (13, 19),
@@ -2337,7 +2344,7 @@ fn batch_buy_must_fit_remaining_backpack_capacity() {
 }
 
 // ---------------------------------------------------------------------------
-// P0: dynamic pairing, wall sealing, task closure, defense arbitration
+// P0: dynamic pairing, task closure, defense arbitration
 // ---------------------------------------------------------------------------
 
 /// Payload builder that also sets `playerTasks` and this round's errors.
@@ -2456,42 +2463,6 @@ fn pairing_covers_every_tower_when_controllers_are_available() {
     let mut towers: Vec<i64> = pairs.iter().map(|(_, tower)| *tower).collect();
     towers.sort_unstable();
     assert_eq!(towers, vec![10020, 10021], "no tower is left unmanned");
-}
-
-#[test]
-fn wall_gate_seals_after_the_dusk_retreat() {
-    // The gate stays open only while somebody is still outside; once every role
-    // has retreated, the last ring cell is admitted and the ring closes.
-    let payload = day_world_at(
-        66, // in_day 65 >= DUSK_ROUND
-        vec![
-            station(10, 20, 1),
-            worker(10010, 11, 21),
-            worker(10012, 10, 21),
-        ],
-        0,
-        vec![],
-        vec![],
-    );
-    let turn = turn_from(payload);
-    let mut state = BotState::default();
-    // Station station(10,20) has footprint x in 10..=11, y in 19..=20, so the
-    // gate cell is (xmax + 2, ymin - 1) = (13, 18).
-    let gate = Pos { x: 13, y: 18 };
-    assert!(
-        !coregeek::brain::day::wall_gaps(&turn, &state).contains(&gate),
-        "the gate stays open while roles may still be outside"
-    );
-
-    coregeek::brain::day::plan(&turn, &mut state);
-    assert!(
-        state.wall_gate_sealed,
-        "everyone retreated, so the gate seals"
-    );
-    assert!(
-        coregeek::brain::day::wall_gaps(&turn, &state).contains(&gate),
-        "the final seal cell is planned once sealed"
-    );
 }
 
 #[test]

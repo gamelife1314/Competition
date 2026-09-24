@@ -2,18 +2,23 @@
 //! §5/§6, pinned per person instead of per time of day.
 //!
 //! One priority chain, walked every round: robot distance → HP → day-1
-//! weapon help → stone delivery / gate watch / camp → sell triggers (T1-T5,
-//! deferred by the day-1 ring hunger) → the ROI vein loop with its latch.
+//! weapon help → stone delivery / camp → sell triggers (T1-T5, deferred by
+//! the day-1 ring hunger) → the ROI vein loop with its latch.
 //! `is_day` is a threat parameter (the 4-cell robot clearance), never a fork:
 //! the night does NOT recall B — comment 1 §6 keeps the economy worker out
 //! among the veins and makes distance its only defence.
 //!
 //! The boards are minimal synthetic payloads driven through the real
-//! scheduler (`brain::orchestrate::plan`), so the legacy Worker-A planner
-//! runs alongside exactly as it does in a match. The full multi-round ring
-//! dynamics (the seal board, the spare board's trap-veto oscillation) live in
-//! `day1_sim.rs`; the tests here pin the single-round decisions those
-//! dynamics are built from.
+//! scheduler (`brain::orchestrate::plan`), so the Worker-A planner runs
+//! alongside exactly as it does in a match. The full multi-round ring
+//! dynamics (the spare board's trap-veto oscillation) live in `day1_sim.rs`;
+//! the tests here pin the single-round decisions those dynamics are built
+//! from.
+//!
+//! The station stands at (10,20) on these boards, so comment 1's fixed L
+//! puts the weapon sites at (9,18),(10,18),(9,20), the operator stand at
+//! (9,19), the wall order on the front column x=13 and the rows y=22/y=17,
+//! and the permanent entrance at (8,18)..(8,21).
 
 use serde_json::{json, Value};
 
@@ -516,7 +521,6 @@ fn day1_ring_hunger_defers_the_vendor_errand_to_the_stone_run() {
         SHOP_PRICES,
     ));
     let mut state = BotState::default();
-    state.gate_cell = Some(pos(13, 17)); // legacy corner entrance, already walled
     state.d1_weapon_helped = true; // the help already fired this morning
     let plan = orchestrate::plan(&turn, &mut state);
     let cmd = cmd_of(&plan, B);
@@ -534,15 +538,16 @@ fn day1_ring_hunger_defers_the_vendor_errand_to_the_stone_run() {
 #[test]
 fn day1_weapon_help_outranks_the_money_loop_and_fires_once() {
     // Day 1 round 10, 75 gold, no towers: the one-time weapon help must own
-    // B even with copper adjacent at (10,23) — the money loop would collect
-    // it. A is across the map and claims at most one build site, so B keeps
-    // a site of its own to walk or build to.
+    // B even with copper adjacent at (10,17) — the money loop would collect
+    // it. B stands at (9,17), one cell from the L's first two sites (9,18)
+    // and (10,18); A is across the map and claims at most one site, so B
+    // keeps an adjacent one to build on.
     let turn = turn_from(world_at(
         10,
         75,
-        vec![station(10, 20), worker(A, 40, 31), worker(B, 10, 22)],
+        vec![station(10, 20), worker(A, 40, 31), worker(B, 9, 17)],
         vec![],
-        vec![zone(10, 23, "copper")],
+        vec![zone(10, 17, "copper")],
         VENDOR_PRICES,
         SHOP_PRICES,
     ));
@@ -555,8 +560,8 @@ fn day1_weapon_help_outranks_the_money_loop_and_fires_once() {
         assert!(state.d1_weapon_helped, "the help flag latches on the build round");
         let t = first_target(cmd).unwrap();
         assert!(
-            matches!((t.x, t.y), (10, 21) | (11, 21)),
-            "B builds one of its adjacent sites, got {:?}",
+            matches!((t.x, t.y), (9, 18) | (10, 18)),
+            "B builds one of its adjacent L sites, got {:?}",
             t
         );
         assert!(
@@ -567,7 +572,7 @@ fn day1_weapon_help_outranks_the_money_loop_and_fires_once() {
     }
 
     // Round 2: the help has fired (flag set) — the money loop takes over and
-    // collects the copper that has been sitting next to B the whole time.
+    // collects the copper sitting next to B.
     let turn = turn_from(world_at(
         11,
         50,
@@ -590,82 +595,6 @@ fn day1_weapon_help_outranks_the_money_loop_and_fires_once() {
     assert_eq!(first_target(cmd), Some(pos(10, 23)));
 }
 
-// ---------------------------------------------------------------------------
-// The gate: the intentionally-last cell (comment 1 §5 step 3).
-// ---------------------------------------------------------------------------
-
-#[test]
-fn gate_watch_walks_to_the_open_gate_holds_then_seals_it() {
-    // Day-1 dusk, round 56: the ring is complete except the gate (12,22),
-    // which `ring_gap_split` hides until the seal flips — so the visible
-    // debt is EMPTY and ordinary delivery cannot fire. A is still outside,
-    // which is what keeps the gate open. B carries the gate's stone: the
-    // watch owns it — walk to the gate's mouth, hold there with no command
-    // at all, and build the round the seal lands.
-    let walls = ring_walls(&[pos(12, 22)]);
-    let seed = |state: &mut BotState| {
-        state.gate_cell = Some(pos(12, 22));
-        state.d1_weapon_helped = true;
-    };
-
-    // Round 1: B is three cells out — the watch walks it in.
-    let mut roles = vec![
-        station(10, 20),
-        worker(A, 30, 30),
-        worker_items(B, 15, 24, 100, vec!["stone"]),
-    ];
-    roles.extend(walls.clone());
-    let turn = turn_from(world_at(56, 0, roles, vec![], vec![], VENDOR_PRICES, SHOP_PRICES));
-    let mut state = BotState::default();
-    seed(&mut state);
-    let plan = orchestrate::plan(&turn, &mut state);
-    let cmd = cmd_of(&plan, B);
-    assert_eq!(cmd.action, "move");
-    let t = first_target(cmd).unwrap();
-    assert!(
-        chebyshev(t, pos(12, 22)) < 3,
-        "the watch must close on the gate, got {:?}",
-        t
-    );
-    assert!(!state.wall_gate_sealed, "A outside keeps the gate open");
-
-    // Round 2: B at the gate's mouth — holding means NO command. Stepping
-    // off would only re-walk the stand, and releasing to the money loop is
-    // how the seal board spent the night at 19/20.
-    let mut roles = vec![
-        station(10, 20),
-        worker(A, 30, 30),
-        worker_items(B, 13, 23, 100, vec!["stone"]),
-    ];
-    roles.extend(walls.clone());
-    let turn = turn_from(world_at(57, 0, roles, vec![], vec![], VENDOR_PRICES, SHOP_PRICES));
-    let mut state = BotState::default();
-    seed(&mut state);
-    let plan = orchestrate::plan(&turn, &mut state);
-    assert!(
-        !plan.commands.contains_key(&B),
-        "at the gate's mouth B holds: no command at all"
-    );
-
-    // Round 3: A came home, the seal flipped — the gate is ordinary debt now
-    // and B's stone closes the ring from the stand it camped on.
-    let mut roles = vec![
-        station(10, 20),
-        worker(A, 11, 21),
-        worker_items(B, 13, 23, 100, vec!["stone"]),
-    ];
-    roles.extend(walls);
-    let turn = turn_from(world_at(58, 0, roles, vec![], vec![], VENDOR_PRICES, SHOP_PRICES));
-    let mut state = BotState::default();
-    seed(&mut state);
-    state.wall_gate_sealed = true;
-    let plan = orchestrate::plan(&turn, &mut state);
-    let cmd = cmd_of(&plan, B);
-    assert_eq!(cmd.action, "build");
-    assert_eq!(first_target(cmd), Some(pos(12, 22)));
-    assert_eq!(cmd.name.as_deref(), Some("wall"));
-}
-
 #[test]
 fn batched_stone_builds_the_gap_when_the_trap_check_passes() {
     // Day 1 round 50: one open cell (8,22), five rounds to dusk. A is home
@@ -681,8 +610,6 @@ fn batched_stone_builds_the_gap_when_the_trap_check_passes() {
     roles.extend(ring_walls(&[pos(8, 22)]));
     let turn = turn_from(world_at(50, 0, roles, vec![], vec![], VENDOR_PRICES, SHOP_PRICES));
     let mut state = BotState::default();
-    state.gate_cell = Some(pos(12, 22)); // walled by ring_walls: no gate debt
-    state.wall_gate_sealed = true;
     state.d1_weapon_helped = true;
     let plan = orchestrate::plan(&turn, &mut state);
     let cmd = cmd_of(&plan, B);
@@ -693,9 +620,10 @@ fn batched_stone_builds_the_gap_when_the_trap_check_passes() {
 
 #[test]
 fn camp_holds_b_at_a_vetoed_gap_instead_of_releasing_the_money_loop() {
-    // Day 1 round 60: the ring is complete except (8,22); the sealed gate
-    // (12,22) is walled. A is outside to the north and (8,22) is its ONLY
-    // way home — `wall_would_trap` vetoes the build until A gets in or the
+    // Day 1 round 60: the ring is complete except (8,22) — this synthetic
+    // board walled even the permanent entrance, so the last open cell really
+    // is the last way in. A is outside to the north and (8,22) is its ONLY
+    // route home — `wall_would_trap` vetoes the build until A gets in or the
     // HARD_SEAL override lands at round 66. The old code released B to the
     // money loop here and it paced between the vetoed gap and a distant
     // vein for the rest of the day (the spare-board oscillation). Now B
@@ -703,8 +631,6 @@ fn camp_holds_b_at_a_vetoed_gap_instead_of_releasing_the_money_loop() {
     // with a copper vein in plain view.
     let walls = ring_walls(&[pos(8, 22)]);
     let seed = |state: &mut BotState| {
-        state.gate_cell = Some(pos(12, 22));
-        state.wall_gate_sealed = true;
         state.d1_weapon_helped = true;
     };
     // Far south-east: the other end of the old oscillation.

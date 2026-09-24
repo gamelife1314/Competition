@@ -22,7 +22,7 @@
     所以读到的一定是完整的一页，或一句诚实的截断声明。
   * **只读不写。** 不改日志、不在日志旁边留中间文件。原始日志自己留着（§1）。
   * **不认识的东西要说出来。** 解不开的压缩包、读不了的编码、解析不了的行，都计数并在
-    开头声明——二十一张空表绝不能被读成「这场什么都没发生」。
+    开头声明——十七张空表绝不能被读成「这场什么都没发生」。
 
 输入格式：`.jsonl`、`.jsonl.gz`、`.zip`（Windows 上多半是压缩包）都行。BOM、CRLF、
 UTF-16、GBK 都能读，都是 Windows 上真的会遇到的东西。
@@ -56,9 +56,6 @@ CAPS = {
     "judger_errors": 40,   # 出错回合数
     "cmd_results": 40,     # 沙盒命令数（一场 10-20 条，留足余量）
     "cmd_reasons": 20,     # 聚合式，恒定
-    "gate_rounds": 160,    # 每天最多 15 行，10 天 150 + 封门行
-    "gate_nights": 20,     # 一天一行
-    "gate_culprit": 20,    # 聚合式，恒定
     "night_reasons": 20,   # 聚合式，恒定
     "night_towers": 40,    # 塔数 × 原因数
     "score_attr": 12,      # 一天一行，10 天 + 余量
@@ -66,11 +63,13 @@ CAPS = {
     "enemy_build": 12,     # 一天一行，10 天 + 余量
     "dawn_clear": 12,      # 一天一行，10 天 + 余量（v19 §17）
     "day_earn": 12,        # 一天一行，10 天 + 余量（v22 §20）
-    "far_shoulder": 12,    # 一天一行，10 天 + 余量（v22 §20）
 }
+# issue #221 4b：封门三张表（原表 5a/5b/5c，200 行）和远肩一张表（原表 13，12 行）
+# 连同它们的事件一起删了——入口四格永久不砌、墙序固定，「门开没开」「远肩收没收」
+# 不再是能发生的事。预算总量 700 → 488。
 CAP_TOTAL = sum(CAPS.values())
 
-# `--day N` 点名的逐回合明细。**不计入 700**：那二十一张是每批都要贴的，这个是点了名才印的。
+# `--day N` 点名的逐回合明细。**不计入 700**：那十七张是每批都要贴的，这个是点了名才印的。
 DRILL_CAP = 160
 
 # 一天/一夜的回合数，用来把 round 换算成「第几天、当天第几回合」。
@@ -278,7 +277,7 @@ title, lines, cap):
 
 def drill(title, lines, cap):
     """`--day N` 时加印的逐回合明细。和 section 分开只是为了封顶预算好核对：
-    这二十一张是每次都要贴的，drill 是点了名才印的。"""
+    这十七张是每次都要贴的，drill 是点了名才印的。"""
     _emit(title, lines, cap)
 
 
@@ -371,18 +370,18 @@ def main(argv):
         build_tables(records, day)
         out("")
         # 结尾这句是给司机看的最后一句，所以它得说清「贴到哪为止」。带 --day 时后面还有
-        # 几节 drill，笼统写「以上即二十一张表」会让他只贴前半段。
+        # 几节 drill，笼统写「以上即十七张表」会让他只贴前半段。
         if day is None:
-            out("===== 以上即 §7.3 的二十一张表，整段贴进 issue 就行 =====")
+            out("===== 以上即 §7.3 的十七张表，整段贴进 issue 就行 =====")
         else:
-            out("===== 以上整段贴进 issue：先是二十一张表，后面是第 %d 天的逐回合明细 =====" % day)
+            out("===== 以上整段贴进 issue：先是十七张表，后面是第 %d 天的逐回合明细 =====" % day)
     return 0
 
 
 def coach_block(records):
     """`--coach`：回执里 `coach` 那一块（§5），以及 issue 头部的教练汇总行。
 
-    单独一个模式，不混进那二十一张表里，因为**去向不同**：表是贴进 issue 正文的，
+    单独一个模式，不混进那十七张表里，因为**去向不同**：表是贴进 issue 正文的，
     这一块是填进 `receipt.json` 的。混在一起，司机就得在一页输出里挑挑拣拣。
     """
     moves = []
@@ -670,37 +669,8 @@ def build_tables(records, day):
                 lambda t: sorted(t)), CAPS["cmd_reasons"],
     )
 
-    # ---------------------------------------------------------------- 表 5 封门
-    # `wall_gate_forced` (v17) 是"期限到了、没等散兵就封门"那一回合，单独一行事件：
-    # 表 5b 数的是 `wall_gate_open`（"门开着"），不能把它算进去，否则
-    # "最后一天硬封"会被读成"门又开了"。
-    gate = pick(records, "wall_gate_seal", "wall_gate_open", "wall_gate_forced")
-    section(
-        "表 5a · 封门逐回合　列：回合 第几天 当天第几回合 事件 没归队的 走不回岗位的",
-        [tsv([data(r).get("round"), day_of(data(r).get("round") or 0),
-              in_day(data(r).get("round") or 0),
-              r.get("event"), tostring(data(r).get("away") or []),
-              tostring(data(r).get("stuck") or [])])
-         for r in gate], CAPS["gate_rounds"],
-    )
-    open_nights = Counter(day_of(data(r).get("round") or 0)
-                          for r in pick(records, "wall_gate_open"))
-    section(
-        "表 5b · 每天开了几回合（15 = 那一夜整夜没封）　列：回合数 第几天",
-        ["%d %d" % (n, d) for d, n in sorted(open_nights.items())], CAPS["gate_nights"],
-    )
-    stuck_on = {}
-    for r in pick(records, "wall_gate_open"):
-        for who in data(r).get("away") or []:
-            if isinstance(who, list) and who:
-                entry = stuck_on.setdefault(who[0], [0, ""])
-                entry[0] += 1
-                entry[1] = ",".join(str(v) for v in who[1:])
-    section(
-        "表 5c · 卡在谁身上　列：角色 没归队的回合数 最后一次位置",
-        ["%s %d %s" % (who, n, last) for who, (n, last)
-         in sorted(stuck_on.items(), key=lambda kv: (-kv[1][0], str(kv[0])))], CAPS["gate_culprit"],
-    )
+    # 表 5（封门 5a/5b/5c）已删除：issue #221 4b 把入口四格改成永久不砌，
+    # `wall_gate_*` 事件在 src/ 里不存在了，表 5 永远只能是三张（0 行）。
 
     # ------------------------------------------------------------ 表 6 夜间塔况
     section(
@@ -808,31 +778,9 @@ def build_tables(records, day):
         earn_rows, CAPS["day_earn"],
     )
 
-    # ------------------------------------------- 表 13 远肩收在哪（v22 §20）
-    # issue #206 §6 「围墙不一定得全部建造起来……0 的位置可以选择性缺口，有条件全部
-    # 建造好」把环分成了两半，而两半的差别只有 `wall_far_edge` 说得清：`还欠` 是今天
-    # 必须砌的（朝向敌人 / 被突破过 / 机器人已经到环上 / 过了 `far_edge_cutoff`），
-    # `可开` 是可以留到最后的。一天取**当天最后一个回合**：那时的 `原因` 就是这一天
-    # 收工时的状态——`enemy_first` 说明到天黑还在补正面（应当报警），`spare_rounds`
-    # 说明正面砌完了、正在补远肩（「有条件全部建造好」在发生），`none` 说明环已经收口。
-    far_rows, far_last = [], {}
-    for r in pick(records, "wall_far_edge"):
-        d = data(r)
-        if isinstance(d.get("day"), int):
-            far_last[d["day"]] = d
-    for which in sorted(far_last):
-        d = far_last[which]
-        far_rows.append(tsv([
-            which, d.get("round"), d.get("owed"),
-            len(d.get("open") or []), d.get("reason"),
-            d.get("teamStone"), d.get("stoneDemand"),
-        ]))
-    section(
-        "表 13 · 远肩每天收在哪（每天最后一个回合）　列：第几天 回合 还欠 可开 原因 队石 石需"
-        "（`原因` = dusk_required 到点了必须全砌 / enemy_first 正面还没砌完 / "
-        "spare_rounds 正面砌完了、在补远肩 / none 环已收口）",
-        far_rows, CAPS["far_shoulder"],
-    )
+    # 表 13（远肩每天收在哪）已删除：issue #221 4b 把墙序改成固定单向
+    # （正面→顶行→底行，尾部天然留到最后），`wall_far_edge` 事件在 src/ 里
+    # 不存在了。「收在哪」现在由墙序本身回答，不再需要一天一行的判决。
 
     if day is not None:
         drill_day(records, day)
@@ -854,14 +802,6 @@ def drill_day(records, day):
               data(r).get("stoneDemand"), data(r).get("teamStone"),
               data(r).get("mayBuild"), data(r).get("upgradeReachable")])
          for r in pick(records, "tower_plan") if on_day(r)],
-        DRILL_CAP,
-    )
-    drill(
-        "drill · 第 %d 天封门逐回合　列：回合 第几回合 事件 没归队的 走不回岗位的" % day,
-        [tsv([data(r).get("round"), in_day(data(r).get("round") or 0),
-              r.get("event"), tostring(data(r).get("away") or []),
-              tostring(data(r).get("stuck") or [])])
-         for r in pick(records, "wall_gate_seal", "wall_gate_open") if on_day(r)],
         DRILL_CAP,
     )
     drill(

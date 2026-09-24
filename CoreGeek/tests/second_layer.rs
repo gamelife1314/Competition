@@ -6,12 +6,14 @@
 //! layer that exists only where the robots demonstrably come through, bounded
 //! so that it can never close into a ring of its own. These tests pin all four
 //! of those properties: the arc is chosen from damage statistics, it is capped,
-//! it keeps the gate's doorway clear, and with no evidence it is not built.
+//! it keeps the permanent entrance's doorway clear, and with no evidence it is
+//! not built.
 
 use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
+use coregeek::brain::action::base_layout;
 use coregeek::brain::day::{primary_wall_gaps, tower_gaps, wall_gaps};
 use coregeek::model::{footprint_distance, station_footprint, Turn};
 use coregeek::protocol::{Pos, Request};
@@ -84,20 +86,24 @@ fn ring(radius: i32) -> Vec<Pos> {
     cells
 }
 
-/// The station's gate cell, as `day::wall_gate` computes it: two cells past the
-/// footprint's east edge, one below its south edge.
-fn gate() -> Pos {
-    Pos {
-        x: BASE.0 + 3,
-        y: BASE.1 - 2,
-    }
+/// The ring's four permanent entrance cells (comment 1 §4), as the planner
+/// computes them for this base: the back column, never built at any layer.
+fn entrance() -> Vec<Pos> {
+    let turn = turn_from(board(vec![station()], 1));
+    base_layout::entrance_cells(&turn)
 }
 
-/// Every ring-2 cell but the gate — a ring the day considers closed.
+fn entrance_set() -> HashSet<Pos> {
+    entrance().into_iter().collect()
+}
+
+/// Every ring-2 cell but the permanent entrance — a ring the day considers
+/// closed.
 fn closed_ring() -> Vec<Value> {
+    let entrance = entrance_set();
     ring(2)
         .into_iter()
-        .filter(|pos| *pos != gate())
+        .filter(|pos| !entrance.contains(pos))
         .enumerate()
         .map(|(index, pos)| wall(20000 + index as i64, pos))
         .collect()
@@ -260,36 +266,43 @@ fn the_arc_is_capped_so_a_second_ring_can_never_close() {
 }
 
 #[test]
-fn the_layer_never_walls_the_gate_into_a_pocket() {
-    // The gate is the only way out of the ring for the ore, the vendor and the
-    // shop, and `open_door` only ever cuts through the RADIUS-2 ring. A ring-3
+fn the_layer_never_walls_the_entrance_into_a_pocket() {
+    // The permanent entrance is the only way out of the ring for the ore, the
+    // vendor and the shop, and it is never walled at ANY layer (comment 1 §4
+    // — the legacy rule measured this from the day's gate cell; since issue
+    // #221 phase 4b it measures from the four fixed entrance cells). A ring-3
     // wall across its mouth would seal the base's own doorway with no way to
-    // reopen it, so a clearance around the gate is kept clear.
+    // reopen it, so a clearance around the entrance column is kept clear.
     let mut state = BotState::default();
-    // Threat from the east, which is where the gate is.
+    // Threat from the west, which is where the entrance is.
     let center = Pos {
         x: BASE.0,
         y: BASE.1,
     };
-    let east = arc_sector(
+    let west = arc_sector(
         center,
         Pos {
-            x: BASE.0 + 5,
-            y: BASE.1 - 2,
+            x: BASE.0 - 5,
+            y: BASE.1,
         },
     );
-    state.threat_sectors[east] = 800;
+    state.threat_sectors[west] = 800;
     let turn = turn_from(board(ready_day_two(), DAY_TWO));
 
+    let entrance = entrance();
     let open: HashSet<Pos> = ring(3)
         .into_iter()
-        .filter(|pos| coregeek::model::chebyshev(*pos, gate()) <= 2)
+        .filter(|pos| {
+            entrance
+                .iter()
+                .any(|cell| coregeek::model::chebyshev(*pos, *cell) <= 2)
+        })
         .collect();
     assert!(!open.is_empty(), "the clearance set is not empty");
     for site in wall_gaps(&turn, &state) {
         assert!(
             !open.contains(&site),
-            "{site:?} walls the gate's own doorway"
+            "{site:?} walls the entrance's own doorway"
         );
     }
 }
@@ -318,9 +331,10 @@ fn the_batch_is_bounded_so_the_economy_is_not_starved() {
 fn the_second_layer_waits_for_the_first_ring_that_holds_the_night() {
     // One ring-2 cell missing: the day's stone belongs to the ring that stands
     // between the robots and the station, not to a layer outside it.
+    let entrance = entrance_set();
     let hole = ring(2)
         .into_iter()
-        .find(|pos| *pos != gate())
+        .find(|pos| !entrance.contains(pos))
         .expect("the ring has cells");
     let mut roles = ready_day_two();
     roles.retain(|unit| {
@@ -385,9 +399,10 @@ fn day_one_belongs_to_the_first_ring() {
 fn wall_damage_is_charged_to_the_sector_it_landed_in() {
     // The evidence the arc is chosen from is damage actually taken, not
     // proximity. A wall cell that loses HP this round charges its sector.
+    let entrance = entrance_set();
     let target = ring(2)
         .into_iter()
-        .find(|pos| *pos != gate())
+        .find(|pos| !entrance.contains(pos))
         .expect("the ring has cells");
     let center = Pos {
         x: BASE.0,
@@ -399,7 +414,7 @@ fn wall_damage_is_charged_to_the_sector_it_landed_in() {
     roles.extend(
         ring(2)
             .into_iter()
-            .filter(|pos| *pos != target && *pos != gate())
+            .filter(|pos| *pos != target && !entrance.contains(pos))
             .enumerate()
             .map(|(index, pos)| wall(21000 + index as i64, pos)),
     );
@@ -421,7 +436,7 @@ fn wall_damage_is_charged_to_the_sector_it_landed_in() {
     roles.extend(
         ring(2)
             .into_iter()
-            .filter(|pos| *pos != target && *pos != gate())
+            .filter(|pos| *pos != target && !entrance.contains(pos))
             .enumerate()
             .map(|(index, pos)| wall(21000 + index as i64, pos)),
     );
@@ -491,9 +506,10 @@ fn robots_closing_on_the_base_are_a_weaker_signal_than_damage() {
 fn damage_arcs_reach_the_wall_blueprint_through_the_planner() {
     // End to end: the day planner reads the statistics `observe` filled and
     // puts the outer layer on that arc.
+    let entrance = entrance_set();
     let target = ring(2)
         .into_iter()
-        .find(|pos| *pos != gate())
+        .find(|pos| !entrance.contains(pos))
         .expect("the ring has cells");
     let center = Pos {
         x: BASE.0,
@@ -515,7 +531,7 @@ fn damage_arcs_reach_the_wall_blueprint_through_the_planner() {
     roles.extend(
         ring(2)
             .into_iter()
-            .filter(|pos| *pos != target && *pos != gate())
+            .filter(|pos| *pos != target && !entrance.contains(pos))
             .enumerate()
             .map(|(index, pos)| wall(21000 + index as i64, pos)),
     );
@@ -538,7 +554,7 @@ fn damage_arcs_reach_the_wall_blueprint_through_the_planner() {
     roles.extend(
         ring(2)
             .into_iter()
-            .filter(|pos| *pos != target && *pos != gate())
+            .filter(|pos| *pos != target && !entrance.contains(pos))
             .enumerate()
             .map(|(index, pos)| wall(21000 + index as i64, pos)),
     );

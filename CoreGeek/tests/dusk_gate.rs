@@ -1,10 +1,10 @@
-//! The dusk gate seal (P1) and the build-site oscillation behind it.
+//! The dusk return home (P1) and the build-site oscillation behind it.
 //!
-//! `docs/FAILURE-ANALYSIS-2026-09-14-b.md` §2.4: across five matches the wall
-//! gate never once sealed on the first try — `wall_gate_open` for the whole
-//! fifteen-round dusk window in #111 day 1, #112 both days and #115 day 1 — and
-//! the base was destroyed on night 2 in three of them. `score_3` (survival) is
-//! worth 550 and we scored 30.
+//! `docs/FAILURE-ANALYSIS-2026-09-14-b.md` §2.4: across five matches the crew
+//! never once got inside the ring before nightfall — a role outside for the
+//! whole fifteen-round dusk window in #111 day 1, #112 both days and #115 day
+//! 1 — and the base was destroyed on night 2 in three of them. `score_3`
+//! (survival) is worth 550 and we scored 30.
 //!
 //! The record named the same role every round and its `stuck` list was always
 //! empty, which is the whole diagnosis: the role could reach its post, it was
@@ -14,14 +14,20 @@
 //! straight through every deadline and kept running economy errands outside the
 //! ring. Measured on the board below: the unpaired worker walked to the weapon
 //! shop and issued `buy Medicine` on every round of the whole dusk window while
-//! the gate stayed open, and the ring kept a robot-sized hole all night.
+//! the night closed in on it outside the walls.
+//!
+//! (This file used to also pin the wall-gate SEAL — the last ring cell held
+//! open until everyone was inside, then closed. Issue #221 phase 4b deleted the
+//! gate outright: the ring's back four cells are a permanent entrance, never
+//! built, so there is nothing left to seal. What survives is the behaviour the
+//! seal existed to enforce: every role the night needs inside IS inside before
+//! the day ends.)
 
 use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
-use coregeek::brain::day::{gate_open_record, plan as day_plan, tower_gaps};
-use coregeek::brain::night;
+use coregeek::brain::day::{plan as day_plan, tower_gaps};
 use coregeek::model::{chebyshev, footprint_distance, station_footprint, Turn};
 use coregeek::protocol::{Pos, Request};
 use coregeek::state::BotState;
@@ -99,8 +105,6 @@ struct Day {
     template: Value,
     round: i64,
     units: Vec<(i64, Pos)>,
-    /// Per round: `None` when the gate may close, `Some(record)` when it may not.
-    gates: Vec<Option<Value>>,
     positions: Vec<(i64, i64, Pos)>,
     state: BotState,
 }
@@ -125,13 +129,13 @@ impl Day {
             template,
             round: 1,
             units,
-            gates: Vec::new(),
             positions: Vec::new(),
             state: BotState::default(),
         }
     }
 
-    /// The station's four cells — the ring the gate seal is measured against.
+    /// The station's four cells — "inside the ring" means within one cell of
+    /// this footprint.
     fn footprint(&self) -> Vec<Pos> {
         let pos = Pos {
             x: STATION.0,
@@ -163,18 +167,6 @@ impl Day {
             .unwrap_or_default();
 
         let turn = turn_from(payload);
-        let footprint = turn
-            .station()
-            .map(|station| station.footprint().to_vec())
-            .unwrap_or_default();
-        let pairs = night::stable_pairs(&turn, &mut self.state);
-        // The same owned list `orchestrate::plan` computes: the economy worker
-        // sleeps outside the ring by design (issue #221 comment 1 §6), so the
-        // production seal never waits on it — the harness must recompute the
-        // record the same way or it measures a gate nobody is waiting for.
-        let owned: Vec<i64> =
-            coregeek::brain::role::Roles::of(&turn).economy_worker.into_iter().collect();
-        self.gates.push(gate_open_record(&turn, &pairs, &footprint, &owned));
         for unit in turn.controllable() {
             self.positions.push((self.round, unit.id, unit.pos));
         }
@@ -222,14 +214,6 @@ impl Day {
             .map(|(_, _, pos)| *pos)
     }
 
-    /// Was the gate free to close on `round`?
-    fn sealed(&self, round: i64) -> bool {
-        self.gates
-            .get((round - 1) as usize)
-            .map(Option::is_none)
-            .unwrap_or(false)
-    }
-
     fn outside_on(&self, round: i64) -> Vec<(i64, Pos)> {
         let footprint = self.footprint();
         self.positions
@@ -268,18 +252,16 @@ fn every_role_is_inside_the_ring_before_nightfall() {
     // role has no tower to man and `preposition_round` never fires for it. It
     // used to spend the whole dusk window on a shopping trip (measured: settled
     // at the weapon shop issuing `buy Medicine` every round from r52 on) while
-    // `wall_gate_open` named it — the gate is the last ring cell and it does not
-    // close while any role is outside.
+    // the night walked in with it still outside the walls.
     //
     // Issue #221 exempts ONE role from this roll call: the economy worker
     // (10003) sleeps outside among the veins by design (comment 1 §6 —
-    // distance is its only defence), and the owned-aware seal never waits on
-    // it. The wall crew and the pioneer still must be home before nightfall,
-    // and stay home — a role that steps back out re-opens the gate it just
-    // closed.
+    // distance is its only defence), and the night plan never waits on it. The
+    // wall crew and the pioneer still must be home before nightfall, and stay
+    // home — the night finds a role outside with no wall between it and the
+    // robots.
     const ECONOMY: i64 = 10003;
     let day = Day::play_day(two_guns_board());
-    let footprint = day.footprint();
     let outside = |round: i64| {
         day.outside_on(round)
             .into_iter()
@@ -300,33 +282,8 @@ fn every_role_is_inside_the_ring_before_nightfall() {
         assert!(
             outside.is_empty(),
             "the crew was inside on R{settled} and back outside on R{round}: \
-             {outside:?} — the gate re-opens and the ring keeps a robot-sized \
-             hole all night (#111/#112/#115: 15/15 open rounds)"
-        );
-    }
-    let _ = footprint;
-}
-
-#[test]
-fn the_dusk_gate_seals_inside_the_window_and_stays_sealed() {
-    let day = Day::play_day(two_guns_board());
-    let first_sealed = (COMMIT_IN_DAY + 1..=DAY_END + 20)
-        .map(|in_day| in_day + 1)
-        .find(|round| day.sealed(*round))
-        .expect(
-            "issue #111/#112/#115: the gate never sealed — every round of the \
-             dusk window recorded `wall_gate_open`",
-        );
-    assert!(
-        first_sealed <= DAY_END,
-        "the gate only sealed at R{first_sealed}, after the day had ended"
-    );
-    for round in first_sealed..=DAY_END {
-        assert!(
-            day.sealed(round),
-            "the gate re-opened on R{round} after sealing on R{first_sealed}: a \
-             committed role left the ring again, which is the two-cell \
-             oscillation §2.4 measured"
+             {outside:?} — the dusk commitment is not a one-way door \
+             (#111/#112/#115: a role outside for 15/15 dusk rounds)"
         );
     }
 }
@@ -339,7 +296,7 @@ fn the_walk_home_never_oscillates() {
     // (x falling, y rising) for the whole window. The property that rules both
     // out is that the walk home is a PATH and not a CYCLE: from the round a
     // role's day outside the ring is over, it never returns to a cell it has
-    // already left, and it ends inside the band the gate measures against.
+    // already left, and it ends inside the ring's inner band.
     //
     // (Consecutive repeats are collapsed first: a role that has arrived and is
     // holding still legitimately reports the same cell every round.)
@@ -402,8 +359,8 @@ fn a_role_sealed_out_by_our_own_ring_still_gets_in() {
             index += 1;
         }
     }
-    // Three cells out on the west side, beside the ring — and the crew built the
-    // ring's gate cell too, so there is no way back in.
+    // Three cells out on the west side, beside the ring — and this synthetic
+    // board walled even the permanent entrance, so there is no way back in.
     ours.push(role(10003, "worker", 7, 24));
     let turn = turn_from(world(60, ours, Vec::new()));
     let closed = turn.role_by_id(10003).expect("the outside role exists");
@@ -463,17 +420,16 @@ fn the_dusk_commitment_is_latched_for_the_rest_of_the_day() {
 #[test]
 fn the_build_site_does_not_depend_on_where_the_crew_is_standing() {
     // The two-cell oscillation has a second source, and it is the one that kept
-    // the third gun off the board. `tower_gaps` tested a candidate site's
+    // the third gun off the board. `tower_gaps` used to test a candidate site's
     // standing room against EVERY unit's footprint, the crew included — so a
-    // site whose only standing cells are the cells a role happens to occupy
-    // stopped being legal the moment that role walked toward it, and was legal
-    // again the round after. On the day-1 board below (two guns, the wall line
-    // as it stood at R40, three roles) the second worker at (9,23) — the cell
-    // the trace shows it bouncing to — moved the chosen site from (10,22) to
-    // (10,25), and walking there moved it back. Measured over the whole inner
-    // band, three of the worker's cells flipped the choice; with the fix only
-    // the one it is literally standing on does, which is the correct answer
-    // (a gun cannot be built under a unit).
+    // site stopped being legal the moment a role walked toward it, and was
+    // legal again the round after, and the crew bounced between two cells
+    // around a gun that was never built. Since issue #221 phase 4b the sites
+    // are FIXED (comment 1 §1's L around the operator stand), which removes
+    // the footrace by construction: the only way a role can move the offer is
+    // by literally standing ON a site — the correct answer, since a gun cannot
+    // be built under a unit. This test pins that the answer is stable from
+    // either side of the band.
     let board = |worker_at: (i32, i32)| {
         let ours = vec![
             station(),
@@ -523,81 +479,13 @@ fn the_build_site_does_not_depend_on_where_the_crew_is_standing() {
     );
 }
 
-/// `HARD_SEAL_ROUND` in `brain::day`: the day-round past which the gate is
-/// sealed whether or not the crew is home.
-const HARD_SEAL_IN_DAY: i64 = coregeek::brain::economy::DUSK_ROUND + 11;
-
-/// A complete ring around the station with one role locked outside it.
-fn ring_with_a_role_locked_out() -> Value {
-    let footprint = station_footprint(Pos {
-        x: STATION.0,
-        y: STATION.1,
-    });
-    let mut ours = vec![
-        station(),
-        gatling(10020, 11, 22),
-        role(10002, "worker", 12, 24),
-        role(10004, "pioneer", 10, 23),
-    ];
-    let mut index = 0;
-    for x in -2..WIDTH + 2 {
-        for y in -2..HEIGHT + 2 {
-            let pos = Pos { x, y };
-            if pos.x < 0 || pos.y < 0 || pos.x >= WIDTH || pos.y >= HEIGHT {
-                continue;
-            }
-            if footprint.contains(&pos) || footprint_distance(pos, &footprint) != 2 {
-                continue;
-            }
-            ours.push(wall(20000 + index, pos.x, pos.y));
-            index += 1;
-        }
-    }
-    // Nine cells out on the west side, and the ring is complete: there is no
-    // route home and the night recall can only cut one.
-    ours.push(role(10003, "worker", 1, 24));
-    world(1, ours, Vec::new())
-}
-
-#[test]
-fn the_ring_is_closed_even_when_a_role_never_makes_it_home() {
-    // Issues #121-#125: across five matches the gate never sealed on ANY day
-    // after the first — `wall_gate_open` for 5, 7, 10, 11 and 15 of the fifteen
-    // dusk rounds (#121 day 2, #122 day 2, #124 day 2, #123 day 2, #125 days 1
-    // and 2), the last of those being the whole window. The seal waits for
-    // every role, the day ends, and nothing revisits it: the ring then keeps a
-    // robot-sized hole for the whole night, every night, while `score_3` pays
-    // 10×day for a station that is still standing.
-    let mut day = Day::new(ring_with_a_role_locked_out());
-    let mut sealed_at: Option<i64> = None;
-    while day.round <= DAY_END {
-        let round = day.round;
-        day.step();
-        if day.state.wall_gate_sealed && sealed_at.is_none() {
-            sealed_at = Some(round);
-        }
-    }
-    // Issue #221 moved the deadline's meaning: the locked-out role is the
-    // economy worker, and B sleeps outside BY DESIGN (comment 1 §6) — the
-    // owned-aware seal does not wait for it at all, so the ring now closes at
-    // the first dusk checkpoint instead of being forced at the deadline. What
-    // must still never happen (#121-#125) is the seal not landing: a ring
-    // that stays open all night is the hole the night walks through.
-    assert!(
-        matches!(sealed_at, Some(at) if at < HARD_SEAL_IN_DAY + 1),
-        "the gate never sealed ahead of its deadline while the economy worker \
-         was locked out: sealed_at = {sealed_at:?}"
-    );
-}
-
 #[test]
 fn a_far_role_is_home_before_the_day_ends() {
     // The measured shape of #122 and #124 day 2: a worker was still nineteen to
     // twenty cells out when the dusk window opened, walked one cell per round
-    // for the whole of it, and `wall_gate_open` named it on the LAST day round
-    // — the gate sealed a round too late to matter. `dusk_recall_round` was a
-    // flat `DUSK_ROUND - 8`, which is the right lead only for a role one
-    // ordinary walk from home.
+    // for the whole of it, and was still outside on the LAST day round — one
+    // walk too late to matter. `dusk_recall_round` was a flat `DUSK_ROUND - 8`,
+    // which is the right lead only for a role one ordinary walk from home.
     let far = world(
         1,
         vec![
@@ -619,186 +507,8 @@ fn a_far_role_is_home_before_the_day_ends() {
     assert!(
         last.is_empty(),
         "the far worker was still outside the ring on the last day round: \
-         {last:?} — the gate it holds open is the one the night comes through"
-    );
-}
-
-/// The cell `brain::day::wall_gate` designates: `(xmax + 2, ymin - 1)` of the
-/// station footprint.
-fn gate_cell() -> Pos {
-    let footprint = station_footprint(Pos {
-        x: STATION.0,
-        y: STATION.1,
-    });
-    Pos {
-        x: footprint.iter().map(|pos| pos.x).max().unwrap() + 2,
-        y: footprint.iter().map(|pos| pos.y).min().unwrap() - 1,
-    }
-}
-
-#[test]
-fn the_day_two_gate_is_a_door_the_stone_crew_can_close() {
-    // Between the night's seal and the morning's `open_door` there is exactly
-    // one hole in the ring, and on day 2+ it is the designated gate. This is
-    // the day-2 half of the batch's defect: `wall_gate_open` named a straggler
-    // on 5-15 rounds of the dusk window in every one of issues #121-#125, and
-    // the ring kept that hole for the night.
-    //
-    // The property guarded here is the outcome, not one branch of it: at the
-    // first dusk round of day 2, with the crew home and stone in a backpack
-    // beside the gate, the gate cell is built.
-    let gate = gate_cell();
-    let footprint = station_footprint(Pos {
-        x: STATION.0,
-        y: STATION.1,
-    });
-    assert_eq!(
-        footprint_distance(gate, &footprint),
-        2,
-        "test setup: the designated gate must be a ring cell"
-    );
-    let mut ours = vec![
-        station(),
-        gatling(10020, 11, 22),
-        // Inside, with stone, next to the gate.
-        json!({
-            "id": 10002, "pos": {"x": gate.x - 1, "y": gate.y}, "roleType": "worker",
-            "health": 220, "attackPower": 0, "attackRange": 0,
-            "level": 1, "backPackCapability": 100,
-            "backpack": ["stone", "stone", "stone", "stone", "stone", "stone"]
-        }),
-        role(10004, "pioneer", 10, 23),
-    ];
-    let mut index = 0;
-    for x in -2..WIDTH + 2 {
-        for y in -2..HEIGHT + 2 {
-            let pos = Pos { x, y };
-            if pos.x < 0 || pos.y < 0 || pos.x >= WIDTH || pos.y >= HEIGHT {
-                continue;
-            }
-            if footprint.contains(&pos) || footprint_distance(pos, &footprint) != 2 {
-                continue;
-            }
-            if pos == gate {
-                continue; // the hole the branch is supposed to close
-            }
-            ours.push(wall(20000 + index, pos.x, pos.y));
-            index += 1;
-        }
-    }
-    // Day 2, in-day 55: the first round of the dusk window.
-    let turn = turn_from(world(130 + 55, ours, Vec::new()));
-    assert_eq!(turn.day, 2, "test setup: this is the day-2 dusk");
-    assert_eq!(turn.in_day_round, 55);
-    assert!(!turn.walls().iter().any(|unit| unit.pos == gate));
-
-    let mut state = BotState::default();
-    let plan = day_plan(&turn, &mut state);
-    let cmd = plan
-        .commands
-        .get(&10002)
-        .expect("the stone carrier must be given a command at dusk");
-    assert_eq!(
-        (cmd.action.as_str(), cmd.targetPos.clone()),
-        ("build", Some(vec![gate])),
-        "the day-2 dusk left the gate open (got {cmd:?}): the ring keeps a \
-         robot-sized hole for the whole night"
-    );
-}
-
-#[test]
-fn two_equidistant_doors_are_closed_in_coordinate_order() {
-    // `door_cells` is a `HashSet`. `worker_day` step 3b sorts the day's doors
-    // by the walk from the carrier and then takes the first one it can build —
-    // so when two doors are the same distance away, the sort key alone leaves
-    // the choice to hash iteration, and the same board yields a different plan
-    // on a different run. The planner's tiebreak everywhere else is the
-    // coordinate pair, and the door list must use it too.
-    //
-    // `the_day_two_gate_is_a_door_the_stone_crew_can_close` sets this board up
-    // with one hole; here the gate (13,22) has a twin at (11,21), both exactly
-    // one step from the carrier. The lexicographically smaller one must win.
-    let gate = gate_cell();
-    let twin = Pos { x: 13, y: 23 };
-    let other = Pos { x: 11, y: 21 };
-    let footprint = station_footprint(Pos {
-        x: STATION.0,
-        y: STATION.1,
-    });
-    for door in [gate, twin, other] {
-        assert_eq!(
-            footprint_distance(door, &footprint),
-            2,
-            "test setup: {door:?} must be a ring cell"
-        );
-    }
-    let carrier = Pos {
-        x: gate.x - 1,
-        y: gate.y,
-    };
-    assert_eq!(
-        chebyshev(carrier, twin),
-        chebyshev(carrier, other),
-        "test setup: the two doors must be equidistant from the carrier"
-    );
-    assert!(other.x < twin.x, "test setup: `other` sorts first");
-
-    let mut ours = vec![
-        station(),
-        gatling(10020, 11, 22),
-        json!({
-            "id": 10002, "pos": {"x": carrier.x, "y": carrier.y}, "roleType": "worker",
-            "health": 220, "attackPower": 0, "attackRange": 0,
-            "level": 1, "backPackCapability": 100,
-            "backpack": ["stone", "stone", "stone", "stone", "stone", "stone"]
-        }),
-        role(10004, "pioneer", 10, 23),
-    ];
-    let mut index = 0;
-    for x in -2..WIDTH + 2 {
-        for y in -2..HEIGHT + 2 {
-            let pos = Pos { x, y };
-            if pos.x < 0 || pos.y < 0 || pos.x >= WIDTH || pos.y >= HEIGHT {
-                continue;
-            }
-            if footprint.contains(&pos) || footprint_distance(pos, &footprint) != 2 {
-                continue;
-            }
-            if pos == twin || pos == other {
-                continue; // both holes belong to the branch under test
-            }
-            ours.push(wall(20000 + index, pos.x, pos.y));
-            index += 1;
-        }
-    }
-    let turn = turn_from(world(130 + 55, ours, Vec::new()));
-    assert_eq!(turn.day, 2, "test setup: this is the day-2 dusk");
-    assert_eq!(turn.in_day_round, 55);
-
-    // One fresh `BotState` per attempt: Rust seeds every `HashSet` instance
-    // separately, so a 32-run sweep is what turns "usually the same" into
-    // "always the same". Without the tiebreak the choice is roughly a coin
-    // flip per run, and one differing run fails this test.
-    let mut targets: Vec<Option<Vec<Pos>>> = Vec::new();
-    for _ in 0..32 {
-        let mut state = BotState::default();
-        state.door_cells.insert(twin);
-        state.door_cells.insert(other);
-        let plan = day_plan(&turn, &mut state);
-        targets.push(
-            plan.commands
-                .get(&10002)
-                .and_then(|cmd| cmd.targetPos.clone()),
-        );
-    }
-    assert!(
-        targets.iter().all(|target| target == &targets[0]),
-        "the same board closed a different door on different runs: {targets:?}"
-    );
-    assert_eq!(
-        targets[0],
-        Some(vec![other]),
-        "two equidistant doors must be closed in coordinate order, smallest first"
+         {last:?} — a role outside when the night starts is a role the robots \
+         find first"
     );
 }
 
@@ -831,13 +541,16 @@ fn corridor_board() -> Value {
 /// role holding the claim is walking home too and stops on the cell it took.
 ///
 /// The ten reports measure the result: a role frozen on one cell for eleven or
-/// twelve consecutive dusk rounds, named by `wall_gate_open` every round with an
-/// EMPTY `stuck` list — and an empty `stuck` is exactly this branch's guard,
-/// since `stuck` is filled by `can_reach_any`, the pathfinder with every claim
-/// dropped. 179 freezes 20012 on (28,10) for eleven rounds; 178 freezes 20011 on
-/// (24,16) for twelve and 20012 for eleven and then `wall_gate_forced` seals the
-/// ring with both outside. Eight of the ten leave the gate open for 5-12 of the
-/// fifteen dusk rounds, and the gate is the hole the night walks through.
+/// twelve consecutive dusk rounds, with the reachability probe reporting it as
+/// NOT stuck — an empty `stuck` list is exactly this branch's guard, since
+/// `stuck` is filled by `can_reach_any`, the pathfinder with every claim
+/// dropped. 179 freezes 20012 on (28,10) for eleven rounds; 178 freezes 20011
+/// on (24,16) for twelve and 20012 for eleven. Eight of the ten still had a
+/// role outside for 5-12 of the fifteen dusk rounds, and the night walks in on
+/// whoever is standing there. (The freeze was surfaced back then by the
+/// `wall_gate_open` log line; the gate itself is deleted since issue #221
+/// phase 4b, but the hold it exposed is a property of the walk, not of the
+/// gate.)
 #[test]
 fn a_reserved_cell_does_not_park_a_role_at_dusk() {
     let turn = turn_from(corridor_board());

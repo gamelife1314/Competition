@@ -24,8 +24,8 @@
 
 use std::collections::HashSet;
 
-use super::super::action::build::{build_or_walk, wall_gate};
-use super::super::action::geometry::{ring_gap_split, wall_gaps};
+use super::super::action::build::build_or_walk;
+use super::super::action::geometry::wall_gaps;
 use super::super::action::mine::stone_covered;
 use super::super::action::sell::sell_flow;
 use super::super::action::shop::{max_hp, self_provision, use_medicine};
@@ -33,7 +33,7 @@ use super::super::action::tower_site::tower_gaps;
 use super::super::day::{stone_demand_of, wall_would_trap, HARD_SEAL_ROUND, SEAL_GRACE};
 use super::super::action::fight::stable_pairs_owned;
 use super::super::route::trip_rounds;
-use super::super::{economy, interior_cells, stand_cells, treasure, walk_toward, Plan};
+use super::super::{economy, stand_cells, treasure, walk_toward, Plan};
 use crate::model::{chebyshev, Turn, Unit, STONE};
 use crate::protocol::{Pos, RoleCommand};
 use crate::state::BotState;
@@ -135,9 +135,9 @@ fn mainline(
     let wall_hunger = day1_wall_hunger(turn, state, stone_demand, role);
     // Delivery outranks every money errand while the team still wants stone
     // for walls — on ANY day, in daylight only (after dark B keeps its
-    // distance from the ring: comment 1 §6's night is the robots'). The door
-    // the economy cut only re-enters `wall_gaps` at dusk, so the day-2
-    // re-seal lands in exactly the window the door's own demand carved out.
+    // distance from the ring: comment 1 §6's night is the robots'). The
+    // permanent entrance (design D17) is never in `wall_gaps`, so every cell
+    // the delivery walks to is a cell the day intends to wall.
     let stone_in_pack = role.count_item(STONE);
     if turn.is_day && stone_in_pack > 0 && stone_wanted(turn, stone_demand, wall_hunger) {
         // Batch the errand: the row is walked once per haul, not once per
@@ -157,7 +157,7 @@ fn mainline(
             // release B to the money loop here: see `camp_at_gap`. The hold
             // must RETURN, not fall through — falling through ends in the
             // mine walk, whose latched vein is the other direction, and the
-            // oscillation is back with B pacing the gate instead of the row.
+            // oscillation is back with B pacing between the row and the vein.
             match camp_at_gap(turn, state, role, claimed) {
                 Some(Some(cmd)) => return Some(cmd),
                 Some(None) => return None, // at the mouth: hold
@@ -165,45 +165,11 @@ fn mainline(
             }
         }
     }
-    // Day-1 gate watch: the gate is the intentionally-last cell —
-    // `ring_gap_split` hides it until `update_wall_gate` seals it at
-    // `HARD_SEAL_ROUND`, so the visible debt empties HOURS before the seal
-    // flips. The legacy planner survived that because the dusk recall put a
-    // stone carrier inside the ring and `worker_day`'s gate-first step closed
-    // it; B does not come home (comment 1 §6), and a B released to the money
-    // loop is 13 cells away at (26,17) when the seal flips — which is exactly
-    // how the seal board spent the night at 19/20 with six stones in B's own
-    // pack. So while the gate is pending and B carries its stone, B camps at
-    // the gate's mouth and builds the round the seal lands.
-    if turn.day == 1 && turn.is_day && stone_in_pack > 0 {
-        let (owed_now, shoulder_now) = ring_gap_split(turn, state);
-        if owed_now.is_empty() && shoulder_now.is_empty() {
-            if let Some(gate) = gate_watch_cell(turn, state) {
-                if chebyshev(role.pos, gate) == 1 {
-                    // Hold the mouth — from OUTSIDE the ring if an outside
-                    // stand exists: the seal checkpoint skips B, the build is
-                    // one round the moment it flips, and B is already where
-                    // comment 1 §6 wants it when the night comes. No command:
-                    // stepping off would only re-walk the stand.
-                    return None;
-                }
-                // Standing ON the gate hides it from the split (the occupied
-                // filter), so the mouth is watched from a neighbour — prefer
-                // the outside ones, fall back to the band inside the ring.
-                let interior = interior_cells(turn);
-                let stands = stand_cells(turn, gate);
-                let outside: Vec<Pos> = stands
-                    .iter()
-                    .copied()
-                    .filter(|pos| !interior.contains(pos))
-                    .collect();
-                let stands = if outside.is_empty() { stands } else { outside };
-                if let Some(cmd) = walk_toward(turn, role, &stands, claimed) {
-                    return Some(cmd);
-                }
-            }
-        }
-    }
+    // The legacy day-1 gate watch — B camping at the pending gate's mouth so
+    // the seal round finds its stone — is deleted with the gate (design D17).
+    // The fixed build order has no cell that is owed but hidden: every gap B
+    // can see is a gap B may build, so the delivery step above is the whole
+    // of B's wall duty and the permanent entrance needs no watch at all.
     if let Some(trigger) = sell_trigger(turn, state, role, stone_demand) {
         // While the day-1 ring is hungry, only the structural triggers keep
         // their rank: a full pack (T4 — no free slot to carry stone with) and
@@ -246,14 +212,13 @@ fn day1_wall_hunger(turn: &Turn, state: &BotState, stone_demand: i64, role: &Uni
     if turn.day != 1 || !turn.is_day {
         return false;
     }
-    // The WHOLE debt, not the slice `wall_gaps` currently serves: while the
-    // enemy arc is open the split hides the far shoulder, and a release
-    // priced on the arc alone lets B leave in the morning for a shoulder
-    // nobody will ever staff (the control board's west edge died exactly
-    // this way — issue #206's 「有条件全部建造好」: a day that CAN afford the
-    // whole ring builds the whole ring).
-    let (owed, shoulder) = ring_gap_split(turn, state);
-    let n = (owed.len() + shoulder.len()) as i64;
+    // The WHOLE debt, in one list: the fixed build order (comment 1 §4) has
+    // no hidden shoulder and no pending gate — the permanent entrance is
+    // never owed — so `wall_gaps` IS the day's wall work, front column to
+    // far corner, and a release priced on it cannot strand a cell nobody
+    // staffs.
+    let gaps = wall_gaps(turn, state);
+    let n = gaps.len() as i64;
     if n <= 0 {
         return false;
     }
@@ -270,8 +235,7 @@ fn day1_wall_hunger(turn: &Turn, state: &BotState, stone_demand: i64, role: &Uni
         .into_iter()
         .find(|mate| mate.id != role.id && mate.alive())
         .map(|mate| {
-            owed.iter()
-                .chain(shoulder.iter())
+            gaps.iter()
                 .map(|gap| chebyshev(mate.pos, *gap) as i64)
                 .min()
                 .unwrap_or(0)
@@ -279,18 +243,6 @@ fn day1_wall_hunger(turn: &Turn, state: &BotState, stone_demand: i64, role: &Uni
         .unwrap_or(i64::MAX / 4);
     let ring_fits_without_me = a_walk.saturating_add(n * SOLO_RING_CELL_ROUNDS) <= remaining;
     !stone_covered(turn, stone_demand) || !ring_fits_without_me
-}
-
-/// The gate cell while it is still PENDING: planned, unsealed, unbuilt,
-/// buildable. Once `wall_gate_sealed` flips the cell re-enters `wall_gaps`
-/// and the ordinary delivery step owns it.
-fn gate_watch_cell(turn: &Turn, state: &BotState) -> Option<Pos> {
-    let gate = wall_gate(turn, state)?;
-    let pending = !state.wall_gate_sealed
-        && turn.is_land(gate)
-        && !turn.walls().iter().any(|wall| wall.pos == gate)
-        && !state.blacklisted_builds.contains(&(gate, "wall".to_string()));
-    pending.then_some(gate)
 }
 
 /// Can B still contribute to the ring at all? A hunger B cannot feed — no

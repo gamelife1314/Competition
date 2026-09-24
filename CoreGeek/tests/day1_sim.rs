@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
-use coregeek::brain::day::{far_edge_cutoff, far_shoulder, ring_gap_split};
+use coregeek::brain::action::base_layout;
 use coregeek::model::{chebyshev, footprint_distance, Turn};
 use coregeek::protocol::{Pos, Request};
 
@@ -108,7 +108,8 @@ struct World {
     zones: HashMap<Pos, String>,
     /// Every wall build the planner issued, in round order.
     wall_builds: Vec<(i64, Pos)>,
-    /// Walls the planner demolished to open a door in its own ring.
+    /// Walls the planner demolished — a trapped role's escape cut through its
+    /// own ring.
     removed_walls: Vec<(i64, Pos)>,
     tower_builds: Vec<(i64, Pos, String)>,
     /// Rounds on which each role produced no command at all.
@@ -128,9 +129,9 @@ struct World {
     positions: HashMap<i64, Vec<(i64, Pos, i64)>>,
     /// The enemy station, on the boards that have one.
     ///
-    /// `far_shoulder` needs a bearing to be far FROM: with no enemy base on the
-    /// board every ring cell faces it and the whole ring is owed, so the day-1
-    /// tests that predate issue #206 §6 run without one and are unchanged.
+    /// Since issue #221 phase 4b the wall order no longer reads the enemy's
+    /// bearing — it is fixed off our OWN corner (comment 1 §4) — so the enemy
+    /// station only matters to the boards that were measured with one.
     enemy_station: Option<Pos>,
     /// This match's own cross-round memory. Private on purpose: the planner's
     /// decisions on round N depend on rounds 1..N-1, so a test that shares it
@@ -477,9 +478,9 @@ impl World {
                 }
             }
             "remove" => {
-                // Demolishing our own wall — the door the economy cuts when the
-                // ring has closed around it. The judger only allows it from an
-                // adjacent cell, so the sim does too.
+                // Demolishing our own wall — a trapped role's escape cut when
+                // the ring has closed around it. The judger only allows it
+                // from an adjacent cell, so the sim does too.
                 let Some(target) = target else { return };
                 let Some(role) = self.units.iter().find(|unit| unit.id == id) else {
                     return;
@@ -576,7 +577,18 @@ impl World {
         }
     }
 
-    /// Day 1's ring: the radius-2 shell around the station footprint.
+    /// The ring's four permanent entrance cells (comment 1 §4) — open by
+    /// design, never walled, never owed.
+    fn entrance(&self) -> HashSet<Pos> {
+        base_layout::entrance_cells(&self.turn_at(1))
+            .into_iter()
+            .collect()
+    }
+
+    /// Day 1's ring: the cells the wall line OWES — the radius-2 shell around
+    /// the station footprint, minus the off-board cells, minus zone cells, and
+    /// minus the permanent entrance (issue #221 phase 4b: 16 cells on the
+    /// mid-map board, not 20).
     fn ring(&self) -> Vec<Pos> {
         let station = self
             .units
@@ -584,6 +596,7 @@ impl World {
             .find(|unit| unit.kind == "station")
             .unwrap();
         let footprint = station.footprint();
+        let entrance = self.entrance();
         let xs: Vec<i32> = footprint.iter().map(|cell| cell.x).collect();
         let ys: Vec<i32> = footprint.iter().map(|cell| cell.y).collect();
         let (xmin, xmax) = (*xs.iter().min().unwrap(), *xs.iter().max().unwrap());
@@ -598,6 +611,9 @@ impl World {
                 if footprint.contains(&pos) || self.zones.contains_key(&pos) {
                     continue;
                 }
+                if entrance.contains(&pos) {
+                    continue;
+                }
                 let dist = footprint
                     .iter()
                     .map(|cell| (pos.x - cell.x).abs().max((pos.y - cell.y).abs()))
@@ -609,6 +625,17 @@ impl World {
             }
         }
         cells
+    }
+
+    /// The ring's cells in comment 1 §4's fixed build order: front column,
+    /// top row, bottom row. A scarce day leaves the TAIL of this list open.
+    fn ordered_ring(&self) -> Vec<Pos> {
+        let turn = self.turn_at(1);
+        let ring: HashSet<Pos> = self.ring().into_iter().collect();
+        base_layout::wall_build_order(&turn)
+            .into_iter()
+            .filter(|cell| ring.contains(cell))
+            .collect()
     }
 
     fn wall_count(&self) -> usize {
@@ -729,8 +756,10 @@ fn report(label: &str, world: &World) {
 fn day_one_closes_the_wall_ring_before_nightfall() {
     // P0 acceptance: "两边出生点均在 R71 前至少形成可承伤闭环". A ring with a
     // robot-sized hole in it is not closed, so this asserts the real thing —
-    // every ring cell but the deliberate gate is walled BEFORE dusk, and the
-    // gate itself is sealed by the dusk checkpoint.
+    // every one of the ring's 16 wall cells is walled BEFORE dusk. The four
+    // permanent entrance cells are not owed and never were (comment 1 §4):
+    // they are how the crew reaches the ore, and the ring is built around
+    // them, not across them.
     let world = run_day_one();
     report("day 1", &world);
     let ring = world.ring().len();
@@ -741,7 +770,7 @@ fn day_one_closes_the_wall_ring_before_nightfall() {
         "issue #12/#13/#14: the day-1 ring never got built ({built} walls, ring is {ring})"
     );
     // At most the single cell a teammate was standing on when the sweep went
-    // past may still be open; the deliberate gate has to be walled by then.
+    // past may still be open.
     assert!(
         open <= 1,
         "{open} ring cells were still open at nightfall: {:?}",
@@ -760,28 +789,31 @@ fn day_one_closes_the_wall_ring_before_nightfall() {
 }
 
 #[test]
-fn the_day_one_ring_is_sealed_before_the_night() {
-    // Hard constraint, and the one the whole defence rests on: the ring is
-    // SEALED before nightfall. A shell at 19/20 is not a ring — the cell that
-    // is missing is the day's own entrance, and an entrance left open is the
-    // exact hole issues #111/#112/#115 fought the whole of night 1 through
-    // (`wall_gate_open` for 15 of the 15 dusk rounds, base destroyed on night
-    // 2). `day_one_closes_the_wall_ring_before_nightfall` allows one open cell
-    // because a teammate can be standing on the last one when the sweep goes
-    // past; this pins the other half — the seal itself has to happen.
+fn the_day_one_ring_is_whole_and_the_entrance_stays_open() {
+    // Hard constraint, and the one the whole defence rests on: at nightfall
+    // every OWED cell is walled — `day_one_closes_the_wall_ring_before_nightfall`
+    // allows one open cell because a teammate can be standing on the last one
+    // when the sweep goes past; this pins the finished state — and the
+    // permanent entrance is still open. Issues #111/#112/#115 fought night 1
+    // through a hole the day left behind; issue #221's answer is structural:
+    // the entrance is never a wall cell at all, so there is no last cell to
+    // forget, and no seal to wait for stragglers.
     let world = run_day_one();
-    report("seal", &world);
-    assert!(
-        world.state.wall_gate_sealed,
-        "the day-1 gate never sealed: the ring spent the night with its own \
-         entrance open, which is the hole the robots walk through"
-    );
+    report("ring", &world);
     assert_eq!(
         world.open_cells(),
         Vec::new(),
-        "the gate sealed but the shell is still open: {:?}",
+        "the ring is still open at nightfall: {:?}",
         world.open_cells()
     );
+    let walls: HashSet<Pos> = world.wall_cells().into_iter().collect();
+    for cell in world.entrance() {
+        assert!(
+            !walls.contains(&cell),
+            "the permanent entrance was walled at {cell:?} — the crew's own \
+             door is how the economy reaches the ore (comment 1 §4)"
+        );
+    }
 }
 
 #[test]
@@ -866,8 +898,8 @@ fn no_controller_is_ever_marooned_from_its_gun() {
     // Issue #13: "0 角色站桩闲置" — three roles standing still with nothing to
     // do. A controller whose tower it cannot reach spends the whole day
     // walking into a wall (the planner returns no command once every route is
-    // gone), and it also blocks the ring: `wall_would_trap` refuses to seal
-    // while a role would still be cut off. Pairing must therefore only hand a
+    // gone), and it also blocks the ring: `wall_would_trap` refuses to build
+    // the cell that would cut a role off. Pairing must therefore only hand a
     // controller a gun it can actually get to.
     //
     // Holding a post is not idling. From `preposition_round` the planner
@@ -962,18 +994,21 @@ fn stone_out_of_reach_becomes_a_day_of_ore_that_sells() {
 }
 
 #[test]
-fn a_door_cut_in_the_morning_is_resealed_before_night() {
-    // P0-3: day 2's economy lives outside the ring, so `open_door` cuts a cell
-    // through it in the morning. That cell used to stay open all night whenever
-    // nobody happened to carry a stone at dusk: the seal step waits for the
-    // `wall_gate_sealed` flag (stragglers keep it down) and the daily wall
-    // budget may already be spent — so the door was a robot-sized hole until
-    // the next morning (v1 §5.5). With the door now counted in the day's stone
-    // demand, a carrier keeps a stone back and walls the cell from dusk.
+fn a_wall_cut_for_a_trapped_role_is_rebuilt_before_night() {
+    // The escape hatch's other half. `walk_or_remove_wall` lets a role the
+    // ring closed over demolish one cell of its own wall (the hard constraint
+    // pinned in `dusk_gate.rs`); this pins that the cut does not survive the
+    // day. It used to: the morning `open_door` and the dusk seal both treated
+    // the cut cell as special, and whenever nobody happened to carry a stone
+    // at dusk the hole stood open all night (v1 §5.5). Since issue #221 phase
+    // 4b there is nothing special left — a cut ring cell is an ordinary cell
+    // of the fixed build order, so it is owed stone like any other gap and
+    // the daily budget re-walls it. The permanent entrance, by contrast, is
+    // never cut at all: it was never built.
     //
     // A StationUpgradeVoucher1 is seeded into the starting backpack so the
     // Day 1 station-fund guard (issues #201-#205) does not defer the third
-    // tower — this test is about the door-sealing mechanism, not the tower
+    // tower — this test is about the rebuild mechanism, not the tower
     // budget, and the 3-tower state is what the Day 2 economy was tuned for.
     let mut world = World::new();
     world.units.iter_mut().find(|u| u.id == 10002).unwrap().backpack.push("StationUpgradeVoucher1".into());
@@ -983,24 +1018,24 @@ fn a_door_cut_in_the_morning_is_resealed_before_night() {
     let ring = world.ring().len();
     assert!(
         world.wall_count() >= ring - 1,
-        "day 1 did not finish the ring, so the door question is not being tested"
+        "day 1 did not finish the ring, so the rebuild question is not being tested"
     );
     run_day(&mut world, 2);
     let open = world.open_cells();
     assert!(
         open.len() <= 1,
-        "the ring — door included — must be closed again at nightfall: {open:?}"
+        "the ring — cut cells included — must be closed again at nightfall: {open:?}"
     );
-    // Direct evidence for the mechanism: every cell the economy cut open has
-    // been walled again by the end of the day it was cut on.
-    for (cut_round, door) in world.removed_walls.clone() {
-        let sealed = world
+    // Direct evidence for the mechanism: every cell a trapped role cut open
+    // has been walled again by the end of the day it was cut on.
+    for (cut_round, cut) in world.removed_walls.clone() {
+        let rebuilt = world
             .wall_builds
             .iter()
-            .any(|(round, pos)| *round > cut_round && *pos == door);
+            .any(|(round, pos)| *round > cut_round && *pos == cut);
         assert!(
-            sealed,
-            "the door at {door:?} cut on R{cut_round} was never re-walled; \
+            rebuilt,
+            "the wall at {cut:?} cut on R{cut_round} was never rebuilt; \
              wall builds: {:?}",
             world.wall_builds
         );
@@ -1047,13 +1082,14 @@ fn the_workers_build_the_ring_from_their_own_stone() {
 #[test]
 fn the_same_board_produces_the_same_plan_twice() {
     // Determinism (hard constraint): the same board must yield the same plan.
-    // `BotState::door_cells` and `blacklisted_builds` are `HashSet`s, and a
-    // `sort_by_key` that reads only the DISTANCE to a role leaves two
-    // equidistant doors ordered by hash iteration — a different plan on the
-    // same board. Rust seeds each `HashSet` instance separately, so playing
-    // the same two days twice in one process is enough to expose an order that
-    // leaked into a decision. Day 2 is the day under test because that is when
-    // `open_door` cuts doors and the dusk reseal chooses between them.
+    // `BotState::blacklisted_builds` and the threat tallies are `HashSet`/
+    // `HashMap`s, and a `sort_by_key` that reads only the DISTANCE to a role
+    // leaves two equidistant candidates ordered by hash iteration — a
+    // different plan on the same board. Rust seeds each `HashSet` instance
+    // separately, so playing the same two days twice in one process is enough
+    // to expose an order that leaked into a decision. Day 2 is the day under
+    // test because that is when the repair line, the second layer's sector
+    // ranking and the vein picks all have history to reorder.
     let plan_of = || {
         let mut world = run_day_one();
         world.commands.clear();
@@ -1218,24 +1254,28 @@ fn day_one_mines_ore_the_vendor_buys_and_still_closes_the_ring() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #206 §6 — 「后边的门，背向机器人的方向可以开着」
+// The fixed build order on real days (comment 1 §4; replaces issue #206 §6's
+// enemy-bearing far-shoulder rule — 「后边的门，背向机器人的方向可以开着」 is
+// now structural: the back four cells are a permanent entrance, never built,
+// and the order itself puts the enemy-facing front column first).
 // ---------------------------------------------------------------------------
 //
 // The two ends of the rule, on real days rather than on a single board read.
-// `tests/wall_far_shoulder.rs` pins *which* cell is optional; these pin what the
-// two kinds of day actually end up looking like, which is the half a unit test
-// on a predicate cannot see.
+// `spawn.rs` pins *which* cells the order contains; these pin what the two
+// kinds of day actually end up looking like, which is the half a unit test on
+// a list cannot see.
 
 /// The enemy base, in the corner opposite ours (任务书 §4.1) and on the other
-/// side of the base from the stone — so the ring's far shoulder is the side the
-/// crew works from all day, which is the tension the issue is about.
+/// side of the base from the stone — the board the #206 measurements were
+/// taken on, kept so the scarce day is still scarce WITH the enemy watching.
 const ENEMY_BASE: (i32, i32) = (38, 4);
 
 #[test]
 fn a_day_with_stone_to_spare_still_builds_the_whole_ring() {
-    // 「有条件全部建造好」. The licence to skip the far shoulder is for a day
-    // that cannot afford it. The standard opening can, and this is the control
-    // that keeps the rule from quietly becoming "the far side is never built".
+    // 「有条件全部建造好」. The licence to leave the order's tail open is for a
+    // day that cannot afford it. The standard opening can, and this is the
+    // control that keeps the rule from quietly becoming "the tail is never
+    // built".
     let mut world = World::new().with_enemy(ENEMY_BASE);
     while world.round <= DAY_END {
         world.step();
@@ -1248,63 +1288,56 @@ fn a_day_with_stone_to_spare_still_builds_the_whole_ring() {
          and it left {:?} open",
         world.open_cells()
     );
-    assert!(
-        world.state.wall_gate_sealed,
-        "the gate never sealed"
-    );
 }
 
 #[test]
-fn a_scarce_day_leaves_the_far_shoulder_open_and_the_enemy_arc_complete() {
-    // The other end: one stone vein, so the day has to choose. What it must
-    // never choose is a hole on the bearing the robots come from.
-    // The distant-vein board closes the whole ring on its own when no enemy
-    // bears on it — so what this test measures is the enemy's bearing and
-    // nothing else. The trip out and back is what the far shoulder costs, and
-    // it is the first thing a day short of rounds gives up.
+fn a_scarce_day_leaves_the_orders_tail_open_and_the_front_complete() {
+    // The other end: distant stone, so the day has to choose. Since issue
+    // #221 phase 4b it does not choose by bearing — the order chooses for it.
+    // What a scarce day must never leave open is the FRONT: the enemy-facing
+    // column is the head of the order, so a day that runs out of stone or
+    // rounds runs out at the TAIL, the cells farthest from the robots.
     let mut world = stone_eight_cells_out().with_enemy(ENEMY_BASE);
     while world.round <= DAY_END {
         world.step();
     }
     report("day 1 (enemy, distant stone)", &world);
 
-    let open = world.open_cells();
+    let open: HashSet<Pos> = world.open_cells().into_iter().collect();
     assert!(
         !open.is_empty(),
         "this board is not scarce enough to exercise the rule: the ring closed \
-         completely, so nothing was skipped"
+         completely, so nothing was left for last"
     );
-    // Read the ring as the planner read it, on the last round before the cutoff
-    // — past `far_edge_cutoff` the whole ring is owed again by design, so a
-    // later reading would call every one of these cells a failure.
-    let turn = world.turn_at(far_edge_cutoff());
-    let state = coregeek::state::BotState::default();
-    for cell in &open {
-        assert!(
-            far_shoulder(&turn, &state, *cell),
-            "{cell:?} was left unwalled and it is not a far shoulder — the day \
-             skipped a cell that faces the enemy"
-        );
-    }
-    // ...and the arc that does face the enemy is finished: nothing owed is
-    // still standing open.
-    let (owed, shoulder) = ring_gap_split(&turn, &state);
-    let walls = world.wall_cells();
-    for cell in &owed {
+    let ordered = world.ordered_ring();
+    let walls: HashSet<Pos> = world.wall_cells().into_iter().collect();
+    // The front column — the order's first six cells, x=13 facing the enemy —
+    // is complete no matter how scarce the day was.
+    for cell in &ordered[..6.min(ordered.len())] {
         assert!(
             walls.contains(cell),
-            "the day ended owing {cell:?}: 「朝向敌人的三个方向城墙一定是完整的」"
+            "the day ended with the front column open at {cell:?}: \
+             「朝向敌人的城墙一定是完整的」"
         );
     }
+    // ...and the open cells sit in the order's TAIL: what got built is a
+    // prefix of the list, so the day built front-first and ran out at the
+    // back, exactly as the order intends. (Tolerance of two: a cell a
+    // teammate was standing on when the sweep went past is skipped that
+    // round, which can leave an isolated hole just ahead of the tail.)
+    let first_open = ordered
+        .iter()
+        .position(|cell| !walls.contains(cell))
+        .expect("an open ring cell must be on the order");
+    let last_wall = ordered
+        .iter()
+        .rposition(|cell| walls.contains(cell))
+        .unwrap_or(0);
     assert!(
-        !shoulder.is_empty(),
-        "the shoulder is what this board should have left for last, and it is \
-         not there at all"
-    );
-    // And it is still a ring: the gate is sealed before the night.
-    assert!(
-        world.state.wall_gate_sealed,
-        "the far shoulder was skipped and the entrance was left open with it"
+        first_open + 2 >= last_wall,
+        "the day skipped ahead: cells open from order #{first_open} but still \
+         building at #{last_wall} — a scarce day must run out at the TAIL, \
+         never leave a hole in its own front"
     );
 }
 

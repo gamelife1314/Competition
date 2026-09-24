@@ -17,6 +17,7 @@ use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
+use coregeek::brain::action::base_layout;
 use coregeek::brain::day::{plan, tower_gaps};
 use coregeek::model::{footprint_distance, station_footprint, Turn};
 use coregeek::protocol::{Pos, Request};
@@ -58,7 +59,9 @@ fn wall(id: i64, x: i32, y: i32) -> Value {
 }
 
 /// Every on-board cell exactly two rings out from the station footprint — the
-/// radius-2 shell `wall_gaps` wants filled on day 1.
+/// radius-2 shell. Sixteen of these cells are the fixed build order; the other
+/// four (the back column) are the permanent entrance, which the order never
+/// covers ([`coregeek::brain::action::base_layout`]).
 fn ring_two(base: (i32, i32)) -> Vec<Pos> {
     let footprint = station_footprint(Pos {
         x: base.0,
@@ -80,30 +83,28 @@ fn ring_two(base: (i32, i32)) -> Vec<Pos> {
     cells
 }
 
-/// The complete day-1 ring, minus `holes`.
-fn ring_walls(base: (i32, i32), holes: &[Pos]) -> Vec<Value> {
+/// All twenty shell cells walled — the permanent entrance included. Our own
+/// crew never walls the entrance (it is not in the build order since issue
+/// #221), but the demolition tests below need a genuinely sealed box: a role
+/// walled into a pocket must still be able to cut its way home.
+fn sealed_shell(base: (i32, i32)) -> Vec<Value> {
     ring_two(base)
         .into_iter()
-        .filter(|pos| !holes.contains(pos))
         .enumerate()
         .map(|(index, pos)| wall(20000 + index as i64, pos.x, pos.y))
         .collect()
 }
 
-/// The station's gate cell: the one ring cell the wall crew leaves open until
-/// the dusk seal (`wall_gate`). A shell with only this cell missing is a closed
-/// ring as far as the day is concerned — `wall_gaps` filters it out — which is
-/// exactly the "19/20 and the gate" state day 1 finishes on.
-fn gate_cell(base: (i32, i32)) -> Pos {
-    Pos {
-        x: base.0 + 3,
-        y: base.1 - 2,
-    }
-}
-
-/// The complete day-1 shell but for its gate.
+/// The complete day-1 ring: all sixteen fixed build-order cells walled. The
+/// four entrance cells stay open — they are not part of the ring, the day
+/// counts no debt for them, and nothing seals them at dusk any more.
 fn closed_ring(base: (i32, i32)) -> Vec<Value> {
-    ring_walls(base, &[gate_cell(base)])
+    let turn = turn_from(board(vec![station(base.0, base.1)], 0, 1));
+    base_layout::wall_build_order(&turn)
+        .into_iter()
+        .enumerate()
+        .map(|(index, pos)| wall(20000 + index as i64, pos.x, pos.y))
+        .collect()
 }
 
 fn board(roles: Vec<Value>, gold: i64, round_no: i64) -> Value {
@@ -246,13 +247,12 @@ fn the_third_weapon_goes_up_on_day_one_once_the_ring_stands() {
 /// of our walls to get home — but only a wall whose removal actually reopens
 /// the way. Without that condition the day-2 simulation demolished two ring
 /// cells, opened nothing (each led to a gun, its operator, or another teammate)
-/// and ended the day three cells short with the gate still waiting on the role
-/// outside.
+/// and ended the day three cells short with two fresh holes in the ring.
 #[test]
 fn a_demolition_that_opens_nothing_is_not_worth_a_wall() {
     let base = (10, 24);
     let mut roles = vec![station(base.0, base.1), tower(10020, "gatling", 10, 22)];
-    roles.extend(ring_walls(base, &[]));
+    roles.extend(sealed_shell(base));
     // The ring is complete, so the worker at (14,23) is outside a closed box —
     // and every cell its adjacent walls open on to is taken: the towers and the
     // teammates fill the whole x=12 column it would have to enter through.
@@ -284,7 +284,7 @@ fn a_demolition_that_opens_nothing_is_not_worth_a_wall() {
 fn a_sealed_out_role_demolishes_the_wall_that_lets_it_home() {
     let base = (10, 24);
     let mut roles = vec![station(base.0, base.1), tower(10020, "gatling", 10, 22)];
-    roles.extend(ring_walls(base, &[]));
+    roles.extend(sealed_shell(base));
     // One teammate in the doorway cell, the rest of the inner column free: the
     // wall at (13,24) opens on to (12,25), so it is worth a ring cell.
     roles.push(worker(10010, 14, 23));
@@ -311,10 +311,10 @@ fn a_sealed_out_role_demolishes_the_wall_that_lets_it_home() {
 /// `sellable_ores` has always defined the sellable part of a pack as the
 /// surplus over `stone_demand + STONE_BUFFER`, and `should_sell` decides
 /// "there is something to sell" on that basis — but `sell_command` then handed
-/// the vendor the WHOLE stack. On the day whose only stone demand is a gap
-/// (day 2, one door) that is the whole wall budget: the crew mines stone all
-/// day, the dusk cash-out sells it, and the door a role cut that morning is
-/// still open at nightfall because no carrier has one left to close it with.
+/// the vendor the WHOLE stack. On a day whose only stone demand is an open
+/// ring cell that is the whole wall budget: the crew mines stone all day, the
+/// dusk cash-out sells it, and the gap the line still owes is still a gap at
+/// nightfall because no carrier has a stone left to close it with.
 #[test]
 fn a_sale_keeps_the_stone_the_ring_still_owes() {
     let base = (10, 24);

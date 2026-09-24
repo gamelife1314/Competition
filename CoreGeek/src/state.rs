@@ -370,14 +370,6 @@ pub struct BotState {
     /// open for the rest of the day with the budget "used up".
     pub walled_cells_today: HashSet<Pos>,
 
-    /// Ring cells the economy deliberately cut open today so a role inside the
-    /// wall line could reach the ore. The ring is a closed box — once the last
-    /// wall is up, nothing inside can get out and the ore is all outside — so
-    /// the day needs a door and the night needs it shut. Honoured only while the
-    /// sun is up: from dusk these cells are ordinary gaps again and the seal
-    /// crew fills them. Cleared at day rollover.
-    pub door_cells: HashSet<Pos>,
-
     /// Roles that have turned for home for tonight's dusk lock-in.
     ///
     /// Latched rather than recomputed each round, because every dusk deadline in
@@ -493,21 +485,6 @@ pub struct BotState {
     /// The hysteresis uses this to tell "chronically threatened" (stay in
     /// holdout) from "the danger has passed" (eligible to man a gun again).
     pub withdraw_last_threat: HashMap<i64, i64>,
-
-    /// D1 gate stays open until every controller has reached an inside/tower
-    /// stand, then remains sealed for the rest of the half.
-    pub wall_gate_sealed: bool,
-
-    /// The ring cell this day leaves open — `brain::route`'s planned entrance,
-    /// latched at daybreak.
-    ///
-    /// `None` means "the planner had no evidence" (a board with no zones on it)
-    /// and every reader falls back to `route::legacy_entrance`, the fixed
-    /// `(xmax + 2, ymin - 1)` cell. Latched rather than recomputed per round
-    /// because the errand set moves during the day — the stone demand falls as
-    /// the ring goes up, and a mine can go on outage — and an entrance that
-    /// moved mid-afternoon would re-open a cell the crew had just walled.
-    pub gate_cell: Option<Pos>,
 
     /// Set the first time the radius-2 ring around the station has no holes.
     ///
@@ -694,13 +671,6 @@ impl BotState {
             self.walls_built_today = 0;
             self.walled_cells_today.clear();
             self.harass_done_today = false;
-            // Yesterday's door was sealed at dusk; today may need a new one.
-            self.door_cells.clear();
-            self.wall_gate_sealed = false;
-            // A new day, a new entrance: the errand set is re-read from the
-            // board (ore prices move, veins go on outage) and the opening is
-            // placed where TODAY's work is. See `brain::route::entrance`.
-            self.gate_cell = None;
             // Every dusk commitment was discharged by last night's recall.
             self.dusk_home.clear();
             // Yesterday's buy plan is discharged; today's planner recomputes.
